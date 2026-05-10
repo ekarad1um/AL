@@ -1126,7 +1126,7 @@ mod tests {
         );
     }
 
-    /// Loading the bundled `00000000-default` head from
+    /// Loading the bundled default head from
     /// `misc/heads/` gives a head whose class count matches the
     /// shipped `labels.txt`.  Marked `#[ignore]` because the test
     /// is path-fragile (depends on repo layout) and does file
@@ -1138,8 +1138,8 @@ mod tests {
     #[ignore = "depends on bundled fixture assets; --include-ignored"]
     fn reference_head_loads() {
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
-        let head_mpk = crate_root.join("misc/heads/00000000-default/head.mpk");
-        let labels = crate_root.join("misc/heads/00000000-default/labels.txt");
+        let head_mpk = crate_root.join("misc/heads/default/head.mpk");
+        let labels = crate_root.join("misc/heads/default/labels.txt");
         let h = HotHead::load(&head_mpk, &labels, HeadId::new()).expect("load reference head");
         let snap = h.snapshot();
         assert!(snap.n_classes >= 1);

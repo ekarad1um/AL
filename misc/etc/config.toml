@@ -1,12 +1,10 @@
 workspace_root = "misc/workspace"
 
 [mic.mic]
-kind = "fixed"
-id = "mock:0"
+kind = "first_available"
 
 [mic.channel]
-kind = "fixed"
-channel = 0
+kind = "auto"
 
 [inference]
 hop_samples = 22050
@@ -16,9 +14,3 @@ top_k = 3
 epochs = 32
 batch_size = 16
 learning_rate_e6 = 100
-
-[stream]
-uds_path = "misc/share/acousticsd.sock"
-uds_mode = 438
-tcp_bind = "127.0.0.1:8787"
-broadcast_capacity = 64

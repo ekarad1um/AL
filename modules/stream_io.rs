@@ -832,7 +832,7 @@ pub async fn serve_uds(
 ///    daemon restart succeeds without operator intervention.
 ///    Multi-instance deployments must use distinct paths.
 ///
-/// `config::StreamCfg::validate_uds_path` is the *config-time*
+/// `config::StreamCfg::validate_uds_path` is the *launch-config-time*
 /// partner: it catches the same footguns at TOML-load time
 /// before the daemon ever attempts a bind.  Both layers fail
 /// closed; this function is the bind-time backstop.

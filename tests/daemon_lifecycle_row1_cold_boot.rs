@@ -42,28 +42,12 @@ use daemon_helpers::{CheckProfile, launch_check_mode};
 /// by hand.
 #[tokio::test]
 async fn lifecycle_row1_cold_boot_all_subsystems_healthy() {
-    let profile = CheckProfile {
-        // Tighter than the daemon CLI's default 5 s for CI budget;
-        // see the test docstring for the staleness-margin
-        // reasoning.
-        check_seconds: 3,
-        mock_audio: true,
-        no_inference: true,
-        timeout: Duration::from_secs(15),
-        // `127.0.0.1:0` lets the kernel pick an
-        // ephemeral port; required for parallel test binaries
-        // ( adds rows in their own files) so they don't
-        // race the production default port 8787.
-        tcp_bind: "127.0.0.1:0".into(),
-        // Row 1 takes the daemon's auto-created default launch
-        // config (mock mic + stock backbone candidates).  Rows
-        // 2-3 substitute custom launch fixtures.
-        launch_toml_override: None,
-        extra_args: Vec::new(),
-        cwd_override: None,
-    };
-
-    let run = launch_check_mode(profile)
+    // Row 1 = the bare default profile: mock audio, no inference,
+    // ephemeral TCP, daemon-auto-created launch config.  Per-field
+    // rationale (3 s check budget, 15 s boot budget, ephemeral port
+    // for parallel test binaries) lives on `CheckProfile`'s field
+    // docs; rows 2-3 deviate by setting `launch_toml_override`.
+    let run = launch_check_mode(CheckProfile::default())
         .await
         .expect("acousticsd --check launch must succeed");
 

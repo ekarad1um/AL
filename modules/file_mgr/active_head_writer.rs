@@ -39,6 +39,18 @@ use crate::file_mgr::schema::{
 };
 use crate::file_mgr::validate::{fsync_dir, hex_lowercase};
 
+/// Explicit source files for a deployment-bundled default head.
+///
+/// This is intentionally a file pair, not a directory, so launch
+/// configuration owns the exact artifact paths and the daemon does
+/// not assume filenames such as `head.mpk` / `labels.txt` outside
+/// the active-generation layout it writes itself.
+#[derive(Clone, Copy, Debug)]
+pub struct DefaultHeadSource<'a> {
+    pub path: &'a Path,
+    pub labels_path: &'a Path,
+}
+
 /// Origin descriptor for a pending activation; carries the
 /// sources the staging step needs to copy.  Mirrors the request
 /// surface (`{workspace_id, head_id}` or `{default: true}`).
@@ -56,9 +68,9 @@ pub enum ActivationOriginInput<'a> {
         /// equals this for `Head`-origin manifests.
         head_id: HeadId,
     },
-    /// Activate the bundled default.  Sources from
-    /// `<bundled_default_dir>/{head.mpk,labels.txt}`.
-    Default,
+    /// Activate the bundled default from explicit launch-owned
+    /// source files.
+    Default { source: DefaultHeadSource<'a> },
 }
 
 /// Inputs for [`stage_and_validate_activation`].
@@ -73,11 +85,6 @@ pub struct PendingActivation<'a> {
     /// Whether to source from a workspace head or the bundled
     /// default fixture.
     pub origin_input: ActivationOriginInput<'a>,
-    /// Path to the deployment-bundled default head dir
-    /// (`misc/heads/00000000-default/`).  Read only when
-    /// `origin_input` is [`ActivationOriginInput::Default`];
-    /// supplied unconditionally so the call sites stay uniform.
-    pub bundled_default_dir: &'a Path,
     /// RFC3339 wall-clock used for `manifest.activated_at`.
     /// Caller-supplied so tests can pin a deterministic value.
     pub now_rfc3339: String,
@@ -258,16 +265,14 @@ pub fn stage_and_validate_activation(
             workspace_id,
             head_id,
         } => stage_head_origin(workspace_dir, *workspace_id, *head_id, &staging_dir)?,
-        ActivationOriginInput::Default => {
-            stage_default_origin(pending.bundled_default_dir, &staging_dir)?
-        }
+        ActivationOriginInput::Default { source } => stage_default_origin(*source, &staging_dir)?,
     };
 
     // Build the manifest.  `validate()` fails closed on a
     // discriminator-vs-runtime_head_id drift.
     let runtime_head_id = match &pending.origin_input {
         ActivationOriginInput::Head { head_id, .. } => *head_id,
-        ActivationOriginInput::Default => default_runtime_head_id(),
+        ActivationOriginInput::Default { .. } => default_runtime_head_id(),
     };
     let manifest = ActiveHeadManifest {
         origin: staged.origin,
@@ -412,24 +417,24 @@ fn stage_head_origin(
 /// preserved verbatim so a deployment-managed file is not
 /// rewritten by the writer.
 fn stage_default_origin(
-    bundled_dir: &Path,
+    source: DefaultHeadSource<'_>,
     staging_dir: &Path,
 ) -> Result<StagedSource, ActivationError> {
-    let src_mpk = bundled_dir.join("head.mpk");
-    let src_labels = bundled_dir.join("labels.txt");
-    let mpk_bytes = std::fs::read(&src_mpk).map_err(|e| {
+    let src_mpk = source.path;
+    let src_labels = source.labels_path;
+    let mpk_bytes = std::fs::read(src_mpk).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ActivationError::NotFound {
-                what: format!("bundled default head.mpk at {}", src_mpk.display()),
+                what: format!("default head at {}", src_mpk.display()),
             }
         } else {
             ActivationError::File(io_err(src_mpk.display(), e))
         }
     })?;
-    let labels_bytes = std::fs::read(&src_labels).map_err(|e| {
+    let labels_bytes = std::fs::read(src_labels).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ActivationError::NotFound {
-                what: format!("bundled default labels.txt at {}", src_labels.display()),
+                what: format!("default head labels at {}", src_labels.display()),
             }
         } else {
             ActivationError::File(io_err(src_labels.display(), e))
@@ -732,14 +737,22 @@ mod tests {
     }
 
     /// Bundled-default fixture builder for tests.  Writes a
-    /// `head.mpk` + `labels.txt` under a tempdir-rooted
-    /// `bundled_default_dir/`.
-    fn fresh_bundled_default(root: &Path, mpk: &[u8], labels_text: &str) -> PathBuf {
+    /// `head.mpk` + `labels.txt` under a tempdir-rooted directory
+    /// and returns the explicit file pair used by launch config.
+    fn fresh_bundled_default(root: &Path, mpk: &[u8], labels_text: &str) -> (PathBuf, PathBuf) {
         let dir = root.join("bundled_default");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("head.mpk"), mpk).unwrap();
-        std::fs::write(dir.join("labels.txt"), labels_text).unwrap();
-        dir
+        let head = dir.join("head.mpk");
+        let labels = dir.join("labels.txt");
+        std::fs::write(&head, mpk).unwrap();
+        std::fs::write(&labels, labels_text).unwrap();
+        (head, labels)
+    }
+
+    fn default_origin<'a>(path: &'a Path, labels_path: &'a Path) -> ActivationOriginInput<'a> {
+        ActivationOriginInput::Default {
+            source: DefaultHeadSource { path, labels_path },
+        }
     }
 
     // MARK: stage_and_validate_activation
@@ -749,7 +762,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mpk = b"MPK-CONTENT-AAA";
         let (ws_dir, head_id) = fresh_workspace_with_head(tmp.path(), mpk);
-        let bundled = fresh_bundled_default(tmp.path(), b"unused", "x\n");
         let pending = PendingActivation {
             root: tmp.path(),
             origin_input: ActivationOriginInput::Head {
@@ -757,7 +769,6 @@ mod tests {
                 workspace_id: ws_id(),
                 head_id,
             },
-            bundled_default_dir: &bundled,
             now_rfc3339: "2026-05-07T12:34:56Z".to_string(),
         };
         let result = stage_and_validate_activation(pending, &*synth_loader_ok()).unwrap();
@@ -812,7 +823,6 @@ mod tests {
         )
         .unwrap();
 
-        let bundled = fresh_bundled_default(tmp.path(), b"unused", "x\n");
         let pending = PendingActivation {
             root: tmp.path(),
             origin_input: ActivationOriginInput::Head {
@@ -820,7 +830,6 @@ mod tests {
                 workspace_id: ws_id(),
                 head_id,
             },
-            bundled_default_dir: &bundled,
             now_rfc3339: "2026-05-07T12:34:56Z".to_string(),
         };
         let err = stage_and_validate_activation(pending, &*synth_loader_ok())
@@ -837,7 +846,6 @@ mod tests {
         write_workspace_core(&ws_dir, &synth_workspace_core()).unwrap();
         write_head_index(&ws_dir, &HeadIndex::default()).unwrap();
         let unknown = HeadId::parse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
-        let bundled = fresh_bundled_default(tmp.path(), b"unused", "x\n");
         let pending = PendingActivation {
             root: tmp.path(),
             origin_input: ActivationOriginInput::Head {
@@ -845,7 +853,6 @@ mod tests {
                 workspace_id: ws_id(),
                 head_id: unknown,
             },
-            bundled_default_dir: &bundled,
             now_rfc3339: "2026-05-07T12:34:56Z".to_string(),
         };
         let err = stage_and_validate_activation(pending, &*synth_loader_ok())
@@ -856,11 +863,10 @@ mod tests {
     #[test]
     fn default_origin_stages_and_validates() {
         let tmp = tempfile::tempdir().unwrap();
-        let bundled = fresh_bundled_default(tmp.path(), b"DEFAULT-MPK", "cat\ndog\nbird\n");
+        let (head, labels) = fresh_bundled_default(tmp.path(), b"DEFAULT-MPK", "cat\ndog\nbird\n");
         let pending = PendingActivation {
             root: tmp.path(),
-            origin_input: ActivationOriginInput::Default,
-            bundled_default_dir: &bundled,
+            origin_input: default_origin(&head, &labels),
             now_rfc3339: "2026-05-07T12:34:56Z".to_string(),
         };
         let result = stage_and_validate_activation(pending, &*synth_loader_ok()).unwrap();
@@ -880,10 +886,11 @@ mod tests {
     #[test]
     fn default_origin_missing_fixture_surfaces_not_found() {
         let tmp = tempfile::tempdir().unwrap();
+        let missing_head = tmp.path().join("does_not_exist.mpk");
+        let missing_labels = tmp.path().join("does_not_exist.labels.txt");
         let pending = PendingActivation {
             root: tmp.path(),
-            origin_input: ActivationOriginInput::Default,
-            bundled_default_dir: &tmp.path().join("does_not_exist"),
+            origin_input: default_origin(&missing_head, &missing_labels),
             now_rfc3339: "2026-05-07T12:34:56Z".to_string(),
         };
         let err = stage_and_validate_activation(pending, &*synth_loader_ok())
@@ -894,11 +901,10 @@ mod tests {
     #[test]
     fn preload_failure_propagates() {
         let tmp = tempfile::tempdir().unwrap();
-        let bundled = fresh_bundled_default(tmp.path(), b"DEFAULT-MPK", "cat\n");
+        let (head, labels) = fresh_bundled_default(tmp.path(), b"DEFAULT-MPK", "cat\n");
         let pending = PendingActivation {
             root: tmp.path(),
-            origin_input: ActivationOriginInput::Default,
-            bundled_default_dir: &bundled,
+            origin_input: default_origin(&head, &labels),
             now_rfc3339: "2026-05-07T12:34:56Z".to_string(),
         };
         let err = stage_and_validate_activation(pending, &*synth_loader_fail())
@@ -911,11 +917,10 @@ mod tests {
     #[test]
     fn publish_renames_and_writes_pointer() {
         let tmp = tempfile::tempdir().unwrap();
-        let bundled = fresh_bundled_default(tmp.path(), b"MPK", "x\n");
+        let (head, labels) = fresh_bundled_default(tmp.path(), b"MPK", "x\n");
         let pending = PendingActivation {
             root: tmp.path(),
-            origin_input: ActivationOriginInput::Default,
-            bundled_default_dir: &bundled,
+            origin_input: default_origin(&head, &labels),
             now_rfc3339: "2026-05-07T12:34:56Z".to_string(),
         };
         let result = stage_and_validate_activation(pending, &*synth_loader_ok()).unwrap();
@@ -943,14 +948,13 @@ mod tests {
     #[test]
     fn prune_keeps_only_listed_generations() {
         let tmp = tempfile::tempdir().unwrap();
-        let bundled = fresh_bundled_default(tmp.path(), b"MPK", "x\n");
+        let (head, labels) = fresh_bundled_default(tmp.path(), b"MPK", "x\n");
         // Run three activations end-to-end.
         let mut ids = Vec::new();
         for _ in 0..3 {
             let pending = PendingActivation {
                 root: tmp.path(),
-                origin_input: ActivationOriginInput::Default,
-                bundled_default_dir: &bundled,
+                origin_input: default_origin(&head, &labels),
                 now_rfc3339: "2026-05-07T12:34:56Z".to_string(),
             };
             let result = stage_and_validate_activation(pending, &*synth_loader_ok()).unwrap();

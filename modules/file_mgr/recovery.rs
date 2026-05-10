@@ -49,7 +49,7 @@ use sha2::{Digest, Sha256};
 use crate::common::ids::{HeadId, WorkspaceId};
 use crate::common::workspace::{ActiveHeadManifest, ActiveHeadValidationError, HeadIndex};
 use crate::file_mgr::active_head_writer::{
-    ActivationError, ActivationOriginInput, HeadInnerLoader, PendingActivation,
+    ActivationError, ActivationOriginInput, DefaultHeadSource, HeadInnerLoader, PendingActivation,
     publish_active_generation, stage_and_validate_activation, staging_path_for,
 };
 use crate::file_mgr::cache::WorkspaceCacheCell;
@@ -253,13 +253,13 @@ pub struct RecoveryReport {
 /// observe a workspace that root staging is about to delete.
 pub fn recover_all(
     root: &Path,
-    bundled_default_dir: &Path,
+    default_head: Option<DefaultHeadSource<'_>>,
     caches: &dashmap::DashMap<WorkspaceId, Arc<WorkspaceCacheCell>>,
     head_inner_loader: &HeadInnerLoader,
 ) -> Result<RecoveryReport, RecoveryError> {
     let root_staging = recover_root_staging(root, caches)?;
     let workspaces = recover_workspaces(root)?;
-    let active = recover_active_head(root, bundled_default_dir, head_inner_loader)?;
+    let active = recover_active_head(root, default_head, head_inner_loader)?;
     Ok(RecoveryReport {
         active,
         workspaces,
@@ -299,12 +299,12 @@ pub fn recover_all(
 /// `HotHead::load` after this returns).
 pub fn recover_active_head(
     root: &Path,
-    bundled_default_dir: &Path,
+    default_head: Option<DefaultHeadSource<'_>>,
     head_inner_loader: &HeadInnerLoader,
 ) -> Result<RecoveryActiveResult, RecoveryError> {
     let pointer_path = active_current_path(root);
     if !pointer_path.exists() {
-        return activate_bundled_default(root, bundled_default_dir, head_inner_loader);
+        return activate_bundled_default(root, default_head, head_inner_loader);
     }
 
     let pointer = match read_active_current(root) {
@@ -318,7 +318,7 @@ pub fn recover_active_head(
                 err = %e,
                 "active current.json read/parse failed; falling back",
             );
-            return promote_or_default(root, None, bundled_default_dir, head_inner_loader);
+            return promote_or_default(root, None, default_head, head_inner_loader);
         }
     };
 
@@ -330,7 +330,7 @@ pub fn recover_active_head(
         VerifyOutcome::Failed => promote_or_default(
             root,
             Some(&pointer.activation_id),
-            bundled_default_dir,
+            default_head,
             head_inner_loader,
         ),
     }
@@ -429,12 +429,12 @@ fn verify_generation(root: &Path, activation_id: &str) -> Result<VerifyOutcome, 
 fn promote_or_default(
     root: &Path,
     current_id: Option<&str>,
-    bundled_default_dir: &Path,
+    default_head: Option<DefaultHeadSource<'_>>,
     head_inner_loader: &HeadInnerLoader,
 ) -> Result<RecoveryActiveResult, RecoveryError> {
     let generations_root = active_generations_dir(root);
     if !generations_root.is_dir() {
-        return activate_bundled_default(root, bundled_default_dir, head_inner_loader);
+        return activate_bundled_default(root, default_head, head_inner_loader);
     }
     // Collect candidates, newest first by manifest-recorded
     // `activated_at` (RFC3339; lexicographic sort is correct for
@@ -515,7 +515,7 @@ fn promote_or_default(
             });
         }
     }
-    activate_bundled_default(root, bundled_default_dir, head_inner_loader)
+    activate_bundled_default(root, default_head, head_inner_loader)
 }
 
 /// Activate the deployment-bundled default through the standard
@@ -523,15 +523,27 @@ fn promote_or_default(
 /// pipeline.  Failure (missing fixture, hash mismatch, preload
 /// failure) becomes [`RecoveryActiveResult::Unhealthy`] so the
 /// daemon can boot without inference for operator triage.
+///
+/// `default_head: None` means the launch config did not configure a
+/// bundled default at all; surface `Unhealthy` directly without
+/// staging anything.  Recovery's other sweeps (root staging,
+/// per-workspace) still ran in `recover_all` -- this only suppresses
+/// the active-head materialization step.
 fn activate_bundled_default(
     root: &Path,
-    bundled_default_dir: &Path,
+    default_head: Option<DefaultHeadSource<'_>>,
     head_inner_loader: &HeadInnerLoader,
 ) -> Result<RecoveryActiveResult, RecoveryError> {
+    let Some(default_head) = default_head else {
+        return Ok(RecoveryActiveResult::Unhealthy {
+            reason: "head.default not configured in launch config".into(),
+        });
+    };
     let pending = PendingActivation {
         root,
-        origin_input: ActivationOriginInput::Default,
-        bundled_default_dir,
+        origin_input: ActivationOriginInput::Default {
+            source: default_head,
+        },
         now_rfc3339: now_rfc3339(),
     };
     let result = match stage_and_validate_activation(pending, head_inner_loader) {
@@ -1218,12 +1230,24 @@ mod tests {
         })
     }
 
-    fn fresh_bundled_default(root: &Path, mpk: &[u8], labels_text: &str) -> PathBuf {
+    fn fresh_bundled_default(root: &Path, mpk: &[u8], labels_text: &str) -> (PathBuf, PathBuf) {
         let dir = root.join("bundled_default");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("head.mpk"), mpk).unwrap();
-        std::fs::write(dir.join("labels.txt"), labels_text).unwrap();
-        dir
+        let head = dir.join("head.mpk");
+        let labels = dir.join("labels.txt");
+        std::fs::write(&head, mpk).unwrap();
+        std::fs::write(&labels, labels_text).unwrap();
+        (head, labels)
+    }
+
+    fn default_source<'a>(path: &'a Path, labels_path: &'a Path) -> DefaultHeadSource<'a> {
+        DefaultHeadSource { path, labels_path }
+    }
+
+    fn default_origin<'a>(path: &'a Path, labels_path: &'a Path) -> ActivationOriginInput<'a> {
+        ActivationOriginInput::Default {
+            source: default_source(path, labels_path),
+        }
     }
 
     /// Stage one workspace dir with the canonical files + a
@@ -1253,18 +1277,17 @@ mod tests {
     /// Run a full bundled-default activation against `root` so
     /// the per-test setup has a known-good current generation
     /// before each test mutates it.
-    fn seed_default_active_generation(root: &Path) -> (PathBuf, String) {
-        let bundled = fresh_bundled_default(root, b"DEFAULT-MPK", "cat\ndog\n");
+    fn seed_default_active_generation(root: &Path) -> (PathBuf, PathBuf, String) {
+        let (head, labels) = fresh_bundled_default(root, b"DEFAULT-MPK", "cat\ndog\n");
         let pending = PendingActivation {
             root,
-            origin_input: ActivationOriginInput::Default,
-            bundled_default_dir: &bundled,
+            origin_input: default_origin(&head, &labels),
             now_rfc3339: now_rfc3339(),
         };
         let result = stage_and_validate_activation(pending, &*synth_loader_ok()).unwrap();
         let staging = staging_path_for(root, &result.activation_id);
         publish_active_generation(root, &staging, &result.manifest, &result.activation_id).unwrap();
-        (bundled, result.activation_id)
+        (head, labels, result.activation_id)
     }
 
     // MARK: 1A active-head tests
@@ -1272,8 +1295,13 @@ mod tests {
     #[test]
     fn recover_active_current_passes() {
         let tmp = tempfile::tempdir().unwrap();
-        let (bundled, current_id) = seed_default_active_generation(tmp.path());
-        let result = recover_active_head(tmp.path(), &bundled, &*synth_loader_ok()).unwrap();
+        let (head, labels, current_id) = seed_default_active_generation(tmp.path());
+        let result = recover_active_head(
+            tmp.path(),
+            Some(default_source(&head, &labels)),
+            &*synth_loader_ok(),
+        )
+        .unwrap();
         match result {
             RecoveryActiveResult::Current { activation_id, .. } => {
                 assert_eq!(activation_id, current_id);
@@ -1287,11 +1315,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Seed two generations: the first becomes "previous"
         // after the second activation rewrites `current.json`.
-        let bundled1 = fresh_bundled_default(tmp.path(), b"DEFAULT-MPK-A", "cat\ndog\n");
+        let (head1, labels1) = fresh_bundled_default(tmp.path(), b"DEFAULT-MPK-A", "cat\ndog\n");
         let pending1 = PendingActivation {
             root: tmp.path(),
-            origin_input: ActivationOriginInput::Default,
-            bundled_default_dir: &bundled1,
+            origin_input: default_origin(&head1, &labels1),
             now_rfc3339: now_rfc3339(),
         };
         let r1 = stage_and_validate_activation(pending1, &*synth_loader_ok()).unwrap();
@@ -1304,11 +1331,11 @@ mod tests {
         .unwrap();
         // Sleep a moment so the two generations have distinct mtimes.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let bundled2 = fresh_bundled_default(tmp.path(), b"DEFAULT-MPK-B", "cat\ndog\nbird\n");
+        let (head2, labels2) =
+            fresh_bundled_default(tmp.path(), b"DEFAULT-MPK-B", "cat\ndog\nbird\n");
         let pending2 = PendingActivation {
             root: tmp.path(),
-            origin_input: ActivationOriginInput::Default,
-            bundled_default_dir: &bundled2,
+            origin_input: default_origin(&head2, &labels2),
             now_rfc3339: now_rfc3339(),
         };
         let r2 = stage_and_validate_activation(pending2, &*synth_loader_ok()).unwrap();
@@ -1327,7 +1354,12 @@ mod tests {
         // bundled2 still exists for the test; the recovery
         // should NOT need to fall back to it because r1 is
         // valid.
-        let result = recover_active_head(tmp.path(), &bundled2, &*synth_loader_ok()).unwrap();
+        let result = recover_active_head(
+            tmp.path(),
+            Some(default_source(&head2, &labels2)),
+            &*synth_loader_ok(),
+        )
+        .unwrap();
         match result {
             RecoveryActiveResult::PromotedPrevious { activation_id, .. } => {
                 assert_eq!(activation_id, r1.activation_id);
@@ -1343,13 +1375,18 @@ mod tests {
     #[test]
     fn recover_active_corrupt_labels_regenerates_from_manifest() {
         let tmp = tempfile::tempdir().unwrap();
-        let (bundled, current_id) = seed_default_active_generation(tmp.path());
+        let (head, labels, current_id) = seed_default_active_generation(tmp.path());
         // Tamper labels.txt so its hash mismatches; recovery
         // should regenerate from manifest.labels[].
         let labels_path =
             active_generation_dir(tmp.path(), &current_id).join(ACTIVE_LABELS_FILENAME);
         std::fs::write(&labels_path, b"TAMPERED LABELS").unwrap();
-        let result = recover_active_head(tmp.path(), &bundled, &*synth_loader_ok()).unwrap();
+        let result = recover_active_head(
+            tmp.path(),
+            Some(default_source(&head, &labels)),
+            &*synth_loader_ok(),
+        )
+        .unwrap();
         // The current generation passes after labels regen.
         match result {
             RecoveryActiveResult::Current { activation_id, .. } => {
@@ -1366,13 +1403,18 @@ mod tests {
     #[test]
     fn recover_active_no_valid_generation_falls_back_to_default() {
         let tmp = tempfile::tempdir().unwrap();
-        let (bundled, current_id) = seed_default_active_generation(tmp.path());
+        let (head, labels, current_id) = seed_default_active_generation(tmp.path());
         // Tamper the only generation's head.mpk; no previous
         // generation exists; recovery activates the bundled
         // default afresh.
         let head_path = active_generation_dir(tmp.path(), &current_id).join(ACTIVE_HEAD_FILENAME);
         std::fs::write(&head_path, b"TAMPERED").unwrap();
-        let result = recover_active_head(tmp.path(), &bundled, &*synth_loader_ok()).unwrap();
+        let result = recover_active_head(
+            tmp.path(),
+            Some(default_source(&head, &labels)),
+            &*synth_loader_ok(),
+        )
+        .unwrap();
         match result {
             RecoveryActiveResult::DefaultedFromBundle { activation_id, .. } => {
                 // The new id is freshly minted, distinct from the
@@ -1387,10 +1429,33 @@ mod tests {
     fn recover_active_bundled_default_missing_returns_unhealthy() {
         let tmp = tempfile::tempdir().unwrap();
         // No `current.json` and the bundled fixture path doesn't exist.
-        let bundled_missing = tmp.path().join("does_not_exist");
-        let result =
-            recover_active_head(tmp.path(), &bundled_missing, &*synth_loader_ok()).unwrap();
+        let missing_head = tmp.path().join("does_not_exist.mpk");
+        let missing_labels = tmp.path().join("does_not_exist.labels.txt");
+        let result = recover_active_head(
+            tmp.path(),
+            Some(default_source(&missing_head, &missing_labels)),
+            &*synth_loader_ok(),
+        )
+        .unwrap();
         assert!(matches!(result, RecoveryActiveResult::Unhealthy { .. }));
+    }
+
+    /// `default_head: None` skips the bundled-default activation
+    /// step and surfaces `Unhealthy` directly, but root staging /
+    /// per-workspace recovery still ran via `recover_all`.
+    #[test]
+    fn recover_active_no_default_head_returns_unhealthy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = recover_active_head(tmp.path(), None, &*synth_loader_ok()).unwrap();
+        match result {
+            RecoveryActiveResult::Unhealthy { reason } => {
+                assert!(
+                    reason.contains("head.default not configured"),
+                    "diagnostic should surface the root cause: {reason}",
+                );
+            }
+            other => panic!("expected Unhealthy with head.default reason, got {other:?}"),
+        }
     }
 
     // MARK: 1B per-workspace tests

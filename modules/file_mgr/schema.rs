@@ -177,7 +177,7 @@ pub fn backbone_dir(root: &Path) -> PathBuf {
 ///
 /// `activation_id` is the directory name only; not parsed as a
 /// `HeadId` because the operator-facing fixture path
-/// `misc/heads/00000000-default/` is a directory name, never a
+/// `misc/heads/default/` is a directory name, never a
 /// `HeadId`.  The string passes
 /// [`validate_activation_id`] on deserialize so a hand-edited
 /// `current.json` carrying `..` traversal cannot escape the

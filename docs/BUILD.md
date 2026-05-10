@@ -90,50 +90,69 @@ inference-only or training-only build.
 
 ## Run
 
-The daemon reads two TOML files: a hot-reloadable
-user-preference `--config` (mic policy, inference cadence,
-training defaults, stream binds, file caps) and a launch-time
-`--launch-config` (mic catalogue + backbone catalogue).  Both
-are auto-created with defaults if missing.
+The daemon takes two required CLI arguments:
 
-The active head is persisted under `<workspace_root>/active/`,
-not in the user-preference TOML; both TOMLs are parsed with
-`serde(deny_unknown_fields)`, so any unknown key (e.g. a
-legacy `[head_active]` block) is rejected at config load.
+* `--workspace <PATH>`: workspace root.  The daemon owns this
+  entire directory tree (config.toml, backbone/, workspaces/,
+  active/, logs/, the default UDS socket parent).  Auto-created
+  if missing.  The hot-reloadable user-preference TOML is
+  materialized at `<workspace>/config.toml` on first boot (mic
+  policy, inference cadence, training defaults, file caps).
+* `--config <PATH>`: launch-time TOML.  Holds the mic catalogue,
+  backbone catalogue, stream listener binds, and `[head.default]`
+  file pair.  Read once at boot; **edits are ignored until daemon
+  restart**.  Lives outside the workspace tree so deployments can
+  manage it independently of mutable state.
 
-### Smoke (`--check`)
+These are intentionally different schemas.  Passing the same
+file to both flags is rejected.
 
-Boot, run for `--check-seconds` (default 5), print one
-`StatusSnapshot` JSON, exit 0 iff every subsystem is healthy:
+The active head is persisted under `<workspace>/active/`, not in
+the user-preference TOML; both TOMLs are parsed with
+`serde(deny_unknown_fields)`, so any unknown key (e.g. a legacy
+`[head_active]` block) is rejected at config load.
+
+### Long-running (typical)
 
 ```bash
 cargo run --release --bin acousticsd -- \
-    --config misc/etc/dev.toml \
-    --launch-config misc/etc/launch.toml \
-    --check --check-seconds 2
+    --workspace misc/workspace \
+    --config misc/etc/launch.toml
 ```
 
-### Long-running
+The bundled `misc/etc/launch.toml` defaults bind to
+`127.0.0.1:8787` + `misc/share/acousticsd.sock`.  First-boot
+materializes `<workspace>/config.toml` with the user-preference
+defaults.
 
-Drop `--check` to keep the daemon listening on the configured
-TCP + UDS endpoints (the bundled `misc/etc/dev.toml` defaults
-to `127.0.0.1:8787` + `misc/share/acousticsd.sock`):
+### Smoke (`--check`, debug builds only)
+
+Debug builds expose `--check` for a one-shot subsystem-health
+probe.  Boot, run for `--check-seconds` (default 5), print one
+`StatusSnapshot` JSON, exit 0 iff every subsystem is healthy.
+Release builds drop the flag entirely so production deployments
+cannot accidentally treat the daemon as a smoke binary.
 
 ```bash
-cargo run --release --bin acousticsd -- \
-    --config misc/etc/dev.toml \
-    --launch-config misc/etc/launch.toml
+cargo run --bin acousticsd -- \
+    --workspace misc/workspace \
+    --config misc/etc/launch.toml \
+    --check --check-seconds 2
 ```
 
 ### Useful flags
 
-| Flag | Effect |
-|---|---|
-| `--mock-audio` | synthesise a 1 kHz tone instead of opening real audio devices |
-| `--no-inference` | skip backbone + head startup (no NPU lib / no `.mpk` needed) |
-| `--check` | one-shot health probe; pair with `--check-seconds N` |
-| `--worker-threads N` | tokio worker count (default 2) |
-| `--tcp-bind HOST:PORT` | override `stream.tcp_bind` (test-harness escape hatch) |
+| Flag | Builds | Effect |
+|---|---|---|
+| `--worker-threads N` | all | tokio worker count (default 2) |
+| `--tcp-bind HOST:PORT` | all | override `stream.tcp_bind` from launch TOML (test-harness escape hatch) |
+| `--mock-audio` | debug only | synthesise a 1 kHz tone instead of opening real audio devices |
+| `--no-inference` | debug only | skip backbone + head startup (no NPU lib / no `.mpk` needed) |
+| `--check` | debug only | one-shot health probe; pair with `--check-seconds N` |
+
+Production deployments achieve the equivalent of `--mock-audio`
+by adding a mock candidate to the launch TOML's `[[mic.candidates]]`
+table.
 
 ## Test
 
@@ -213,23 +232,27 @@ operator tuning becomes necessary, lift them into the
 appropriate TOML block (e.g. `[file]` for storage caps,
 `[jobs]` for the JobRegistry block).
 
-## Bundled-default head fixture path
+## Bundled-default head file pair
 
-The bundled-default classifier head MUST be present and
-discoverable from the daemon's CWD at boot:
+The bundled-default classifier head is specified by explicit
+`[head.default]` file paths in the launch TOML:
+
+```toml
+[head.default]
+path = "misc/heads/default/head.mpk"
+labels_path = "misc/heads/default/labels.txt"
+```
+
+For the bundled dev launch config those paths point at:
 
 ```
-misc/heads/00000000-default/head.mpk
-misc/heads/00000000-default/labels.txt
+misc/heads/default/head.mpk
+misc/heads/default/labels.txt
 ```
 
-The daemon resolves this path **CWD-relative**.  This is a
-known limitation; future hardening should resolve via
-`current_exe()` so a daemon launched from an arbitrary
-directory still finds its bundled fixture.  Until then, every
-operator launch script (systemd unit, runit run script, dev
-shell) MUST set the working directory to the repo root before
-invoking `acousticsd`.
+Relative paths are resolved against the daemon's CWD; production
+launch configs may use absolute paths to avoid depending on a
+working directory.
 
 A missing or corrupt bundled default surfaces as: boot
 without inference, status unhealthy, no synthetic head.  The
@@ -246,7 +269,7 @@ Operators upgrading from any earlier daemon MUST wipe
 `<workspace_root>/active/generations/` before launching; the
 daemon's first boot recreates the layout and materializes the
 bundled-default active generation from
-`misc/heads/00000000-default/`.
+`[head.default]` in the launch config.
 
 ## Deploy (Linux SBC)
 
@@ -282,10 +305,10 @@ After=network.target sound.target
 
 [Service]
 Type=simple                          # or Type=exec; sd_notify is not wired
-WorkingDirectory=/opt/acoustics_lab  # MUST be the repo root so misc/heads/00000000-default/ resolves
+WorkingDirectory=/opt/acoustics_lab  # relative launch paths resolve here
 ExecStart=/usr/local/bin/acousticsd \
-    --config /etc/acoustics_lab/dev.toml \
-    --launch-config /etc/acoustics_lab/launch.toml
+    --workspace /var/lib/acoustics_lab \
+    --config /etc/acoustics_lab/launch.toml
 Restart=on-failure
 RestartSec=2
 # StandardOutput=journal / StandardError=journal as desired.
@@ -297,8 +320,9 @@ WantedBy=multi-user.target
 `runit`, `s6`, or any equivalent supervisor that owns process
 lifecycle and restart policy works the same way.  There is no
 internal restart loop; do not add one.  The
-`WorkingDirectory=` directive is load-bearing — see
-[Bundled-default head fixture path](#bundled-default-head-fixture-path).
+`WorkingDirectory=` is load-bearing only for relative paths in
+`launch.toml`; production launch configs may use absolute paths.
+See [Bundled-default head file pair](#bundled-default-head-file-pair).
 
 For environments where systemd is not available, the repo
 ships a minimal exponential-backoff respawn wrapper as a
@@ -308,8 +332,8 @@ fallback only:
 sudo install -m 0755 scripts/run_acousticsd.sh /usr/local/bin/run_acousticsd
 
 cd /opt/acoustics_lab && /usr/local/bin/run_acousticsd \
-    --config /etc/acoustics_lab/dev.toml \
-    --launch-config /etc/acoustics_lab/launch.toml
+    --workspace /var/lib/acoustics_lab \
+    --config /etc/acoustics_lab/launch.toml
 ```
 
 Wrapper environment knobs: `ACOUSTICSD_BIN` (binary path),
@@ -326,14 +350,13 @@ root**: only one `acousticsd` instance writes to a given
 workspace locking is intentionally not implemented; running
 two daemons against the same root is unsupported.
 
-The default UDS lives at
-`<workspace_root>/var/run/acoustics_lab.sock`.  The daemon
-creates the parent directory at `0o700` if missing and warns
-on world-writable parents.  Operators preferring
-`/run/acoustics_lab.sock` (systemd-tmpfiles) override
-`[stream].uds_path` in `dev.toml` and provision the parent
-directory themselves with the same daemon-owned,
-restrictive-mode invariant.
+The UDS listener path lives in launch TOML as `[stream].uds_path`
+and is therefore startup-only, not hot-reloadable.  The daemon
+creates the parent directory at `0o700` if missing and warns on
+world-writable parents.  Operators preferring
+`/run/acoustics_lab.sock` (systemd-tmpfiles) set that path in
+`launch.toml` and provision the parent directory themselves with
+the same daemon-owned, restrictive-mode invariant.
 
 Logs land in `${workspace_root}/logs/` with daily rotation
 and a 7-file retention cap.

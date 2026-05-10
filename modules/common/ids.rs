@@ -295,7 +295,7 @@ uuid_id! {
 /// Pinned so the active-head manifest's `runtime_head_id` for
 /// `origin: "default"` is reproducible across deploys, and so
 /// the operator-facing fixture path
-/// `misc/heads/00000000-default/` (which is **not** parsed as a
+/// `misc/heads/default/` (which is **not** parsed as a
 /// `HeadId`) and the runtime identity stay aligned.
 pub const DEFAULT_RUNTIME_HEAD_ID_STR: &str = "00000000-0000-4000-8000-000000000000";
 

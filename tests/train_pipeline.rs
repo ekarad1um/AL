@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 use acoustics_lab::api::{AppState, router_v1_nested};
 use acoustics_lab::common::traits::head_store::HeadStore;
 use acoustics_lab::common::traits::lag_source::{BroadcastLagSnapshot, LagSource};
-use acoustics_lab::config::{Config, ConfigCell, LaunchConfig, MicSettingsCell, MicSettingsHandle};
+use acoustics_lab::config::{
+    Config, ConfigCell, DefaultHeadRef, LaunchConfig, MicSettingsCell, MicSettingsHandle,
+};
 use acoustics_lab::file_mgr::{FsService, FsServiceImpl};
 use acoustics_lab::inference::{HeadInner, HotHead};
 use acoustics_lab::status::{StatusMonitor, StatusReporter};
@@ -73,8 +75,7 @@ fn fresh_router(dir: &Path) -> Router {
         .expect("write backbone stub");
 
     let cfg_path = dir.join("config.toml");
-    let mut cfg = Config::default_for(workspace_root.clone());
-    cfg.stream.uds_path = dir.join("test.sock");
+    let cfg = Config::default_for(workspace_root.clone());
     let config = Arc::new(ConfigCell::from_value(cfg.clone(), cfg_path).expect("validate"));
     config.persist().expect("persist initial");
     let launch = LaunchConfig::default_for();
@@ -115,7 +116,10 @@ fn fresh_router(dir: &Path) -> Router {
         training,
         broadcast_lag_reader: Arc::new(StubLagSource::default()),
         active_mutex: Arc::new(parking_lot::Mutex::new(())),
-        bundled_default_dir: dir.join("bundled_default"),
+        default_head: Some(DefaultHeadRef {
+            path: dir.join("bundled_default/head.mpk"),
+            labels_path: dir.join("bundled_default/labels.txt"),
+        }),
         jobs,
     })
 }

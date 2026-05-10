@@ -27,17 +27,11 @@ impl LagSource for StubLagSource {
 // and exercise the real `POST /active` end-to-end via `HotHead`.
 
 fn fresh_state(dir: &std::path::Path) -> AppState {
-    use crate::config::{ConfigCell, LaunchConfig, MicSettingsCell};
+    use crate::config::{ConfigCell, DefaultHeadRef, LaunchConfig, MicSettingsCell};
     let cfg_path = dir.join("config.toml");
     let workspace_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspace_root).expect("workspace root");
-    let mut cfg = Config::default_for(workspace_root.clone());
-    // `Config::default_for` ships `/run/acoustics_lab.sock`, which
-    // `StreamCfg::validate_uds_path` rejects on hosts without `/run`
-    // (macOS dev, sandboxed CI).  Patch to a tempdir-relative path so
-    // the fixture validates everywhere without weakening the
-    // production default.
-    cfg.stream.uds_path = dir.join("test.sock");
+    let cfg = Config::default_for(workspace_root.clone());
     let config = Arc::new(ConfigCell::from_value(cfg.clone(), cfg_path).expect("validate"));
     config.persist().expect("persist initial");
     // Mirror the daemon's boot wiring: launch catalogue ships a
@@ -87,7 +81,10 @@ fn fresh_state(dir: &std::path::Path) -> AppState {
         // own fixture; the default points at an absent tempdir path
         // so an accidental bundled-default activation fails closed
         // rather than touching a checked-in fixture.
-        bundled_default_dir: dir.join("bundled_default"),
+        default_head: Some(DefaultHeadRef {
+            path: dir.join("bundled_default/head.mpk"),
+            labels_path: dir.join("bundled_default/labels.txt"),
+        }),
         jobs,
     }
 }

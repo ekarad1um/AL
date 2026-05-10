@@ -2,31 +2,35 @@
 //!
 //! Single binary.  Boots in this order:
 //!
-//!  1. Parse CLI.
-//!  2. Load (or create + persist) the TOML config.
-//!  3. Init JSON log appender + `tracing-subscriber`.
+//!  1. Parse CLI (`--workspace <PATH> --config <PATH>` are required;
+//!     `--mock-audio`, `--no-inference`, `--check[ -seconds]` are
+//!     debug-build-only escape hatches).
+//!  2. Load the launch TOML; load (or first-boot-create) the user-
+//!     preference TOML at `<workspace>/config.toml`.
+//!  3. Init the rolling-file log appender + `tracing-subscriber`.
 //!  4. Construct the [`AudioBuffer`] +
 //!     [`arc_swap::ArcSwap`]-wrapped `MicSettings`.
 //!  5. Spawn the [`MicArbitrator`].  With `--mock-audio`
 //!     the candidate list is force-overridden to a single
 //!     mock source.
 //!  6. Construct [`StatusMonitor`] and register every
-//!     subsystem.
+//!     subsystem; run [`run_boot_recovery`] over the workspace.
 //!  7. Construct [`StreamRouter`] (broadcast + watch
 //!     counters).
 //!  8. Optionally construct the [`InferenceEngine`]
-//!     (skipped when `--no-inference` or when the
-//!     configured backbone files are missing -- e.g. host
-//!     dev).
+//!     (skipped when `--no-inference`, the backbone catalogue is
+//!     empty, the active head is missing, or boot recovery
+//!     reports unhealthy).
 //!  9. Spawn the Opus encoder pipeline.
 //! 10. Mount the API router + stream router on TCP and
 //!     UDS listeners.
-//! 11. Wait for `ctrl_c` (or `--check`'s 5 s timeout);
+//! 11. Wait for `ctrl_c` / `SIGTERM` (or `--check`'s timeout);
 //!     cancel the shutdown token; drain handles.
 //!
-//! `--check` boots, runs for `args.check_seconds`, prints
-//! the [`crate::status::StatusSnapshot`] as JSON, and
-//! exits 0 if every subsystem is healthy.
+//! `--check` (debug builds only) boots, runs for
+//! `args.check_seconds()`, prints the
+//! [`crate::status::StatusSnapshot`] as JSON, and exits 0 if
+//! every subsystem is healthy.
 
 // `mimalloc::MiMalloc` is wired as `#[global_allocator]`
 // on the binary (`bin/acousticsd.rs`), not here: global
@@ -137,43 +141,24 @@ const HEARTBEAT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
     about = "On-device audio classification daemon."
 )]
 struct Cli {
-    /// Path to the user-preference TOML (mic policy, inference
-    /// cadence, head_active, training defaults, stream binds).
-    /// Hot-reloadable + API-mutable.  Created with defaults if
-    /// missing.
-    #[arg(long, default_value = "misc/dev.toml")]
+    /// Workspace root (required).  The daemon owns this entire
+    /// directory tree -- config, backbone, workspaces, active head,
+    /// logs, and the default UDS socket all live underneath.  The
+    /// user-preference TOML is auto-materialized at
+    /// `<workspace>/config.toml` on first boot.  Created (with all
+    /// missing parents) if absent; the daemon must be able to
+    /// read+write the path.
+    #[arg(long)]
+    workspace: PathBuf,
+
+    /// Path to the launch-time TOML (required).  Holds the mic
+    /// catalogue, backbone catalogue, stream listener binds, and
+    /// `[head.default]` file pair.  Read once at boot; **edits are
+    /// ignored until daemon restart**.  Lives outside the workspace
+    /// tree so deployments can manage it independently of mutable
+    /// state.
+    #[arg(long)]
     config: PathBuf,
-
-    /// Path to the launch-time TOML (mic catalogue: which mics +
-    /// channels are available to the arbitrator).  Read once at
-    /// boot; **edits to this file are ignored until daemon
-    /// restart**. Created with defaults (a synthetic mock
-    /// candidate) if missing -- gives macOS dev a working catalogue
-    /// without `--mock-audio`.
-    #[arg(long, default_value = "misc/launch.toml")]
-    launch_config: PathBuf,
-
-    /// Synthesize a 1 kHz tone instead of opening real audio devices.
-    /// Overrides the launch catalogue with a single in-memory mock
-    /// candidate (id `mock:0`) AND pins the user-pref policy at
-    /// `Fixed { id: "mock:0" }`.  Useful for macOS dev + smoke-
-    /// testing the rest of the wiring without a sound card.
-    #[arg(long)]
-    mock_audio: bool,
-
-    /// Skip InferenceEngine startup.  Useful on hosts without librknnrt
-    /// (macOS dev) or for isolating audio/stream issues from inference.
-    #[arg(long)]
-    no_inference: bool,
-
-    /// Boot, run for `--check-seconds` (default 5), print one
-    /// `StatusSnapshot` JSON, exit 0 if every registered subsystem
-    /// is healthy.  Otherwise exit 1.
-    #[arg(long)]
-    check: bool,
-
-    #[arg(long, default_value_t = 5)]
-    check_seconds: u64,
 
     /// Tokio worker thread count.  The default of 2 leaves CPU
     /// headroom for the std-thread mic arbitrator and the
@@ -181,7 +166,7 @@ struct Cli {
     #[arg(long, default_value_t = 2)]
     worker_threads: usize,
 
-    /// Override `stream.tcp_bind` from the user config TOML.
+    /// Override `stream.tcp_bind` from the launch config TOML.
     /// Primarily used by the integration-test harness so each test
     /// can pass `127.0.0.1:0` for a kernel-assigned ephemeral port;
     /// without it two parallel test binaries would race port 8787.
@@ -189,6 +174,70 @@ struct Cli {
     /// test-harness escape hatch.
     #[arg(long)]
     tcp_bind: Option<String>,
+
+    /// Synthesize a 1 kHz tone instead of opening real audio devices.
+    /// Overrides the launch catalogue with a single in-memory mock
+    /// candidate (id `mock:0`) AND pins the user-pref policy at
+    /// `Fixed { id: "mock:0" }`.  Useful for macOS dev + smoke-
+    /// testing the rest of the wiring without a sound card.
+    /// Debug builds only; production deployments specify a mock
+    /// candidate in the launch TOML's `[[mic.candidates]]` table.
+    #[cfg(debug_assertions)]
+    #[arg(long)]
+    mock_audio: bool,
+
+    /// Skip InferenceEngine startup.  Useful on hosts without librknnrt
+    /// (macOS dev) or for isolating audio/stream issues from inference.
+    /// Debug builds only.
+    #[cfg(debug_assertions)]
+    #[arg(long)]
+    no_inference: bool,
+
+    /// Boot, run for `--check-seconds` (default 5), print one
+    /// `StatusSnapshot` JSON, exit 0 if every registered subsystem
+    /// is healthy.  Otherwise exit 1.  Debug builds only.
+    #[cfg(debug_assertions)]
+    #[arg(long)]
+    check: bool,
+
+    #[cfg(debug_assertions)]
+    #[arg(long, default_value_t = 5)]
+    check_seconds: u64,
+}
+
+/// In release builds the debug-only flags collapse to compile-time
+/// constants so the rest of `async_main` reads them through the same
+/// `args.<flag>` syntax without `#[cfg]` litter at every call site.
+#[cfg(not(debug_assertions))]
+impl Cli {
+    const fn mock_audio(&self) -> bool {
+        false
+    }
+    const fn no_inference(&self) -> bool {
+        false
+    }
+    const fn check(&self) -> bool {
+        false
+    }
+    const fn check_seconds(&self) -> u64 {
+        0
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Cli {
+    fn mock_audio(&self) -> bool {
+        self.mock_audio
+    }
+    fn no_inference(&self) -> bool {
+        self.no_inference
+    }
+    fn check(&self) -> bool {
+        self.check
+    }
+    fn check_seconds(&self) -> u64 {
+        self.check_seconds
+    }
 }
 
 /// Top-level entry point.  The thin `acousticsd` binary calls
@@ -237,39 +286,57 @@ pub fn run() -> Result<()> {
 async fn async_main(args: Cli) -> Result<()> {
     // MARK: 1+2. Config (two-layer)
     //
-    // Layer 1: launch config (immutable).  Read once; edits ignored
-    // until restart.  Holds the mic catalogue (which mics + which
-    // channels are available to the arbitrator).
+    // Layer 1: launch config (immutable; operator-supplied via
+    // `--config`).  Read once; edits ignored until restart.  Holds
+    // the mic catalogue, backbone catalogue, stream binds, and
+    // bundled-default head file pair.
     //
-    // Layer 2: user-preference config (hot-reloadable + API-
-    // mutable).  Holds the mic policy (which mic + channel to use
-    // right now), inference cadence, head_active, etc.
+    // Layer 2: user-preference config (hot-reloadable + API-mutable;
+    // lives at `<workspace>/config.toml`).  Holds the mic policy
+    // (which mic + channel to use right now), inference cadence,
+    // training defaults, file caps.
     //
     // Cross-validation between layers happens at every boundary:
     // here at boot, in the `watch_with` callback on hot-reload of
     // the user TOML, and in `POST /mic/policy`.
-    let launch = load_or_init_launch_config(&args.launch_config)?;
+    //
+    // Workspace root is operator-supplied via `--workspace` and is
+    // the single source of truth for every mutable byte the daemon
+    // owns (config.toml, backbone/, workspaces/, active/, logs/,
+    // var/run/).  Ensure it exists before any loader touches it.
+    std::fs::create_dir_all(&args.workspace)
+        .with_context(|| format!("create workspace dir {}", args.workspace.display()))?;
+    let user_config_path = args.workspace.join("config.toml");
+    if paths_may_alias(&user_config_path, &args.config) {
+        anyhow::bail!(
+            "--config (launch TOML) must not point at <workspace>/config.toml \
+             (the user-pref TOML lives there); pass distinct paths",
+        );
+    }
+    let launch = load_or_init_launch_config(&args.config)?;
     // Wrap the cell in `Arc` once so the API
     // (which holds `Arc<dyn ConfigHandle>`) and the in-crate
     // consumers (`MicSettingsCell`, watcher) share the same
     // pointer.  The cell is internally Arc-shaped already; the
     // outer Arc adds one ref-bump per clone but enables the
     // dyn-coercion at the API boundary without extra allocations.
-    let config = Arc::new(load_or_init_config(&args.config)?);
+    let config = Arc::new(load_or_init_config(&user_config_path, &args.workspace)?);
     let snap = config.snapshot();
+    let stream = launch.stream.clone();
+    let default_head = launch.head.default.clone();
 
     // Validate user-pref policy against the launch catalogue at
     // boot.  A `Fixed { id }` referring to a missing catalogue
     // entry is a fatal config error -- fail loudly rather than
     // silently spinning the arbitrator inert with rate-limited
     // warns.
-    if !args.mock_audio
-        && let Err(e) = validate_policy_against_catalogue(&snap.mic, &launch.mic, &args.config)
+    if !args.mock_audio()
+        && let Err(e) = validate_policy_against_catalogue(&snap.mic, &launch.mic, &user_config_path)
     {
         anyhow::bail!(
             "{e}; either fix the policy in {} or add the candidate in {}",
+            user_config_path.display(),
             args.config.display(),
-            args.launch_config.display(),
         );
     }
     // The watcher itself is installed AFTER the live ArcSwaps are
@@ -366,10 +433,11 @@ async fn async_main(args: Cli) -> Result<()> {
     tracing::info!(
         target: "acoustics",
         version = env!("CARGO_PKG_VERSION"),
+        workspace = %args.workspace.display(),
         config = %args.config.display(),
         log_dir = %log_dir.display(),
-        mock_audio = args.mock_audio,
-        no_inference = args.no_inference,
+        mock_audio = args.mock_audio(),
+        no_inference = args.no_inference(),
         "daemon starting",
     );
 
@@ -396,10 +464,7 @@ async fn async_main(args: Cli) -> Result<()> {
     // deployment shape; warn loudly on a non-loopback bind so an
     // unintentionally-exposed listener is visible at boot.
     {
-        let resolved_tcp_bind = args
-            .tcp_bind
-            .as_deref()
-            .unwrap_or(snap.stream.tcp_bind.as_str());
+        let resolved_tcp_bind = args.tcp_bind.as_deref().unwrap_or(stream.tcp_bind.as_str());
         let resolved_loopback = bind_is_loopback(resolved_tcp_bind);
         tracing::info!(
             target: "acoustics",
@@ -426,8 +491,8 @@ async fn async_main(args: Cli) -> Result<()> {
     // `try_bind_uds` so a permission-warning surfaces in the
     // boot log next to the bind attempt rather than only after
     // `bind_uds` itself fails.
-    ensure_uds_parent_dir(&snap.stream.uds_path)
-        .with_context(|| format!("ensure UDS parent for {}", snap.stream.uds_path.display()))?;
+    ensure_uds_parent_dir(&stream.uds_path)
+        .with_context(|| format!("ensure UDS parent for {}", stream.uds_path.display()))?;
 
     // MARK: 4. Audio buffer + live policy ArcSwaps
     // 262_144 samples = 2^18 ~= 5.94 s of 44.1 kHz mono.  The
@@ -467,7 +532,7 @@ async fn async_main(args: Cli) -> Result<()> {
     // user-config hot-reloads flow into `policy` only (per the
     // watcher's `--mock-audio`-aware logic below); the catalogue
     // stays the synthetic mock.
-    let (catalogue_arc, policy) = if args.mock_audio {
+    let (catalogue_arc, policy) = if args.mock_audio() {
         let catalogue = MicCatalogue {
             candidates: vec![MicCandidate {
                 id: MicId::from_static("mock:0"),
@@ -503,8 +568,9 @@ async fn async_main(args: Cli) -> Result<()> {
             tracing::warn!(
                 target: "acoustics",
                 "launch catalogue is empty; the arbitrator will run without an active source. \
-                 Add at least one [[mic.candidates]] entry to {}, or pass --mock-audio.",
-                args.launch_config.display(),
+                 Add at least one [[mic.candidates]] entry to {} (debug builds may also pass \
+                 --mock-audio).",
+                args.config.display(),
             );
         }
         (Arc::new(launch.mic.clone()), snap.mic.clone())
@@ -571,45 +637,47 @@ async fn async_main(args: Cli) -> Result<()> {
     // reload path; inference updates still propagate.
     let mic_handle_for_reload = mic_settings_handle.clone();
     let inference_for_reload = inference_cfg_arcswap.clone();
-    let mock_audio = args.mock_audio;
+    let mock_audio = args.mock_audio();
     // String-format the paths once so the move-closure below
     // captures owned strings, not borrowed `args` fields.
-    let args_config_path_for_log = args.config.display().to_string();
-    let args_launch_path_for_log = args.launch_config.display().to_string();
+    let user_config_path_for_log = user_config_path.display().to_string();
+    let launch_config_path_for_log = args.config.display().to_string();
     let _config_watcher = config
-        .watch_with(move |cfg| -> Result<(), crate::config::ConfigValidationError> {
-            // Apply the new policy via the handle's
-            // `try_set_policy_no_persist` -- the on-disk TOML the
-            // watcher just observed IS the source of truth, so
-            // re-persisting would be redundant AND would re-enter
-            // `ConfigHandle::mutate` (we're already inside its
-            // callback, holding `mutate_lock` + the `IN_MUTATE`
-            // sentinel; re-entry trips 's reentrancy
-            // guard).  The cell's validator runs the same
-            // catalogue cross-check; on Err we wrap with the
-            // operator-friendly hint and return Err, which
-            // discards the reload (inner + live cell untouched).
-            //
-            // `--mock-audio` skips the policy update because the
-            // on-disk policy may legitimately disagree with the
-            // runtime mock-audio override (e.g. on-disk says
-            // `Fixed { id: "default-mock" }` while we're running
-            // the synthetic `mock:0` catalogue).
-            if !mock_audio
-                && let Err(e) = mic_handle_for_reload.try_set_policy_no_persist(cfg.mic.clone())
-            {
-                return Err(crate::config::ConfigValidationError::Callback(format!(
-                    "{e}; edit the policy in {} to match the catalogue, OR add the missing \
+        .watch_with(
+            move |cfg| -> Result<(), crate::config::ConfigValidationError> {
+                // Apply the new policy via the handle's
+                // `try_set_policy_no_persist` -- the on-disk TOML the
+                // watcher just observed IS the source of truth, so
+                // re-persisting would be redundant AND would re-enter
+                // `ConfigHandle::mutate` (we're already inside its
+                // callback, holding `mutate_lock` + the `IN_MUTATE`
+                // sentinel; re-entry trips the `ReentrantMutate`
+                // guard).  The cell's validator runs the same
+                // catalogue cross-check; on Err we wrap with the
+                // operator-friendly hint and return Err, which
+                // discards the reload (inner + live cell untouched).
+                //
+                // `--mock-audio` skips the policy update because the
+                // on-disk policy may legitimately disagree with the
+                // runtime mock-audio override (e.g. on-disk says
+                // `Fixed { id: "default-mock" }` while we're running
+                // the synthetic `mock:0` catalogue).
+                if !mock_audio
+                    && let Err(e) = mic_handle_for_reload.try_set_policy_no_persist(cfg.mic.clone())
+                {
+                    return Err(crate::config::ConfigValidationError::Callback(format!(
+                        "{e}; edit the policy in {} to match the catalogue, OR add the missing \
                      candidate to {} and restart the daemon",
-                    args_config_path_for_log, args_launch_path_for_log,
-                )));
-            }
-            // Inference cfg is an independent ArcSwap consumed by
-            // the inference engine; cross-store atomicity isn't
-            // required for correctness.  Store is infallible.
-            inference_for_reload.store(Arc::new(cfg.inference));
-            Ok(())
-        })
+                        user_config_path_for_log, launch_config_path_for_log,
+                    )));
+                }
+                // Inference cfg is an independent ArcSwap consumed by
+                // the inference engine; cross-store atomicity isn't
+                // required for correctness.  Store is infallible.
+                inference_for_reload.store(Arc::new(cfg.inference));
+                Ok(())
+            },
+        )
         .context("install config watcher")?;
 
     let monitor = StatusMonitor::new();
@@ -752,13 +820,13 @@ async fn async_main(args: Cli) -> Result<()> {
         //                            head-advance pump below
         //                            runs the normal healthy /
         //                            unhealthy switching.
-        let no_mic_configured = !args.mock_audio
+        let no_mic_configured = !args.mock_audio()
             && mic_settings_store
                 .snapshot()
                 .catalogue
                 .candidates
                 .is_empty();
-        let initial_detail: &'static str = if args.mock_audio {
+        let initial_detail: &'static str = if args.mock_audio() {
             "mock:0 / 44.1 k"
         } else if no_mic_configured {
             "no candidates configured"
@@ -814,9 +882,9 @@ async fn async_main(args: Cli) -> Result<()> {
     //    listener pulls its own router via `router_with_policy(
     //    uds_policy)` below.
     let stream_router = StreamRouter::with_capacities_and_policy(
-        snap.stream.broadcast_capacity,
+        stream.broadcast_capacity,
         64,
-        snap.stream.tcp_policy.clone(),
+        stream.tcp_policy.clone(),
     );
     let opus_audio_tx: broadcast::Sender<bytes::Bytes> = stream_router.audio_tx();
     let audio_subs_rx: watch::Receiver<usize> = stream_router.audio_subscribers();
@@ -840,160 +908,18 @@ async fn async_main(args: Cli) -> Result<()> {
     // the daemon stays up for operator triage instead of wedging;
     // `boot_recovery_unhealthy` propagates the reason into the
     // inference heartbeat.
-    let mut boot_recovery_unhealthy: Option<String> = None;
     // Stash the full report so we can hand it to the
     // `JobRegistry::record_boot_recovery` accessor; status surface
     // publishes the boot summary without re-walking the filesystem.
-    let mut boot_recovery_report: Option<crate::file_mgr::RecoveryReport> = None;
-    {
-        // The FsService lives later in this function; reuse the
-        // sync `WorkspaceMgr` directly for a fixed-cost layout
-        // pass that runs before any FsService consumer.
-        let layout_mgr = crate::file_mgr::WorkspaceMgr::new(snap.workspace_root.clone());
-        if let Err(e) = layout_mgr.ensure_root_layout() {
-            tracing::error!(
-                target: "acoustics",
-                err = %e,
-                "ensure_root_layout failed; daemon will boot without inference",
-            );
-            boot_recovery_unhealthy = Some(format!("ensure_root_layout failed: {e}"));
-        } else {
-            // The production FsService is constructed below with
-            // an empty DashMap; recovery's eviction hook fires
-            // against this transient map and the FsService
-            // inherits the post-recovery on-disk state lazily.
-            let caches: dashmap::DashMap<
-                crate::common::ids::WorkspaceId,
-                std::sync::Arc<crate::file_mgr::WorkspaceCacheCell>,
-            > = dashmap::DashMap::new();
-            let bundled = bundled_default_head_dir();
-            // Early diagnostic for the most common operator
-            // misconfiguration: launching with the wrong CWD so
-            // `misc/heads/00000000-default/` doesn't resolve.  The
-            // recovery sweep below would surface
-            // `RecoveryActiveResult::Unhealthy` with the same
-            // root cause ~500 ms later; this WARN is alongside
-            // the other boot-time diagnostics so operators
-            // looking at the boot log see the cause first.
-            if !bundled.is_dir() {
-                tracing::warn!(
-                    target: "acoustics",
-                    bundled_default = %bundled.display(),
-                    "bundled-default head fixture not found at the expected \
-                     CWD-relative path; daemon will fall back to \
-                     RecoveryActiveResult::Unhealthy if the on-disk active \
-                     generation is also missing or corrupt (see docs/BUILD.md \
-                     'bundled fixture' section)",
-                );
-            }
-            let loader: Box<crate::file_mgr::active_head_writer::HeadInnerLoader> = Box::new(
-                |head_mpk, labels, head_id| -> Result<Box<dyn std::any::Any + Send>, String> {
-                    let head =
-                        HotHead::load(head_mpk, labels, head_id).map_err(|e| format!("{e}"))?;
-                    let inner = (*head.snapshot()).clone();
-                    Ok(Box::new(inner) as Box<dyn std::any::Any + Send>)
-                },
-            );
-            match crate::file_mgr::recover_all(&snap.workspace_root, &bundled, &caches, &*loader) {
-                Ok(report) => {
-                    tracing::info!(
-                        target: "acoustics",
-                        workspaces_scanned = report.workspaces.workspaces_scanned,
-                        workspace_recovery_failures =
-                            report.workspaces.workspace_recovery_failures,
-                        head_orphans_swept = report.workspaces.head_orphans_swept,
-                        head_count_repaired = report.workspaces.head_count_repaired,
-                        dataset_tombstones_completed =
-                            report.workspaces.dataset_tombstones_completed,
-                        dataset_stage_orphans_swept =
-                            report.workspaces.dataset_stage_orphans_swept,
-                        converter_tombstones_completed =
-                            report.workspaces.converter_tombstones_completed,
-                        converter_stage_orphans_swept =
-                            report.workspaces.converter_stage_orphans_swept,
-                        incomplete_creates_removed =
-                            report.workspaces.incomplete_creates_removed,
-                        workspace_tombstones_completed =
-                            report.root_staging.workspace_tombstones_completed,
-                        workspace_stage_orphans_swept =
-                            report.root_staging.workspace_stage_orphans_swept,
-                        "boot recovery completed",
-                    );
-                    // Sum the orphan-sweep totals onto
-                    // `boot_orphans_swept_total` and stash the
-                    // full report on the `JobRegistry` so
-                    // `/status` can publish the boot summary
-                    // without re-walking the filesystem.
-                    let orphans = (report.workspaces.head_orphans_swept
-                        + report.workspaces.dataset_stage_orphans_swept
-                        + report.workspaces.converter_stage_orphans_swept
-                        + report.root_staging.workspace_stage_orphans_swept)
-                        as u64;
-                    workspace_metrics.record_boot_orphans_swept(orphans);
-                    // Surface per-workspace recovery failures
-                    // (heads.json parse, IO during sweep, ...) on
-                    // a typed counter so operators can spot
-                    // `workspaces_scanned < expected` without
-                    // grep-ing the log.  The structured
-                    // `tracing::warn!` from `recover_workspaces`
-                    // remains the authoritative diagnostic
-                    // source; this counter is the operator-
-                    // dashboard aggregate.
-                    workspace_metrics.record_boot_workspace_recovery_failures(
-                        report.workspaces.workspace_recovery_failures as u64,
-                    );
-                    match &report.active {
-                        crate::file_mgr::RecoveryActiveResult::Current {
-                            activation_id, ..
-                        } => {
-                            tracing::info!(
-                                target: "acoustics",
-                                activation_id = %activation_id,
-                                "active head verified at boot",
-                            );
-                        }
-                        crate::file_mgr::RecoveryActiveResult::PromotedPrevious {
-                            activation_id,
-                            ..
-                        } => {
-                            tracing::warn!(
-                                target: "acoustics",
-                                activation_id = %activation_id,
-                                "current generation failed verify; previous promoted",
-                            );
-                        }
-                        crate::file_mgr::RecoveryActiveResult::DefaultedFromBundle {
-                            activation_id,
-                            ..
-                        } => {
-                            tracing::warn!(
-                                target: "acoustics",
-                                activation_id = %activation_id,
-                                "no valid generation; bundled default activated",
-                            );
-                        }
-                        crate::file_mgr::RecoveryActiveResult::Unhealthy { reason } => {
-                            tracing::error!(
-                                target: "acoustics",
-                                reason = %reason,
-                                "boot recovery unhealthy; daemon will boot without inference",
-                            );
-                            boot_recovery_unhealthy = Some(reason.clone());
-                        }
-                    }
-                    boot_recovery_report = Some(report);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        target: "acoustics",
-                        err = %e,
-                        "boot recovery failed; daemon will boot without inference",
-                    );
-                    boot_recovery_unhealthy = Some(format!("boot recovery failed: {e}"));
-                }
-            }
-        }
-    }
+    // `boot_recovery_unhealthy` propagates the failure reason into
+    // the `inference` heartbeat below; `boot_recovery_report` is
+    // taken once into `JobRegistry::record_boot_recovery` further
+    // down (consumed via `Option::take`).
+    let (mut boot_recovery_report, boot_recovery_unhealthy) = run_boot_recovery(
+        &snap.workspace_root,
+        default_head.as_ref(),
+        &workspace_metrics,
+    );
 
     let mut head = synthetic_head_for_dev(&snap)?;
     // One subsystem entry per topology.  boot_inference re-uses this
@@ -1015,15 +941,12 @@ async fn async_main(args: Cli) -> Result<()> {
     // get a kernel-assigned ephemeral port per test invocation
     // (avoids port-8787 collisions when multiple test binaries
     // run in parallel under cargo test).
-    let tcp_bind_str = args
-        .tcp_bind
-        .as_deref()
-        .unwrap_or(snap.stream.tcp_bind.as_str());
+    let tcp_bind_str = args.tcp_bind.as_deref().unwrap_or(stream.tcp_bind.as_str());
     let tcp_addr: std::net::SocketAddr = tcp_bind_str
         .parse()
         .with_context(|| format!("parse tcp_bind {tcp_bind_str}"))?;
 
-    let want_inference = !args.no_inference
+    let want_inference = !args.no_inference()
         && boot_recovery_unhealthy.is_none()
         && head_files_present(&snap)
         && !launch.backbone.is_empty();
@@ -1046,7 +969,7 @@ async fn async_main(args: Cli) -> Result<()> {
         }
     };
     let tcp_bind_fut = tokio::net::TcpListener::bind(tcp_addr);
-    let uds_bind_fut = try_bind_uds(&snap.stream.uds_path, snap.stream.uds_mode);
+    let uds_bind_fut = try_bind_uds(&stream.uds_path, stream.uds_mode);
 
     let (inference_outcome, tcp_bind_res, uds_bind_res) =
         tokio::join!(inference_fut, tcp_bind_fut, uds_bind_fut);
@@ -1146,7 +1069,7 @@ async fn async_main(args: Cli) -> Result<()> {
             //    a hard failure.
             // 4. NoHead -- backbone present but no usable active
             //    generation (covered by `head_files_present`).
-            let kind = if args.no_inference {
+            let kind = if args.no_inference() {
                 SkipKind::Voluntary
             } else if launch.backbone.is_empty() {
                 SkipKind::NoBackbone
@@ -1284,10 +1207,11 @@ async fn async_main(args: Cli) -> Result<()> {
     );
 
     // MARK: 10. axum routers (api + stream)
-    // Idempotent -- no need to gate on `.exists()`.
+    // The workspace root was created at the top of `async_main`
+    // (`create_dir_all(&args.workspace)`) and `run_boot_recovery`'s
+    // `ensure_root_layout` materialized the canonical sub-tree;
+    // no further mkdir needed here.
     let workspace_root = snap.workspace_root.clone();
-    std::fs::create_dir_all(&workspace_root)
-        .with_context(|| format!("create workspace root {}", workspace_root.display()))?;
     // Admission caps come from the operator-tunable `[file]`
     // block in `Config`; defaults are 256 MiB per upload + 4
     // concurrent uploads.  `FileCfg` carries `max_concurrent_uploads:
@@ -1450,7 +1374,7 @@ async fn async_main(args: Cli) -> Result<()> {
         // Shared active-head mutex for `POST /active`; held
         // entirely inside the route's `spawn_blocking` worker.
         active_mutex: std::sync::Arc::new(parking_lot::Mutex::new(())),
-        bundled_default_dir: bundled_default_head_dir(),
+        default_head: default_head.clone(),
         // Hand the api the same registry the workspace-side
         // admission paths register against.
         jobs: jobs_registry,
@@ -1462,8 +1386,8 @@ async fn async_main(args: Cli) -> Result<()> {
     // `TransportPolicy` so the daemon can run the production-strict
     // gate on TCP and the relaxed gate on UDS without rebuilding
     // the broadcast plumbing.
-    let tcp_stream_app = stream_router.router_with_policy(snap.stream.tcp_policy.clone());
-    let uds_stream_app = stream_router.router_with_policy(snap.stream.uds_policy.clone());
+    let tcp_stream_app = stream_router.router_with_policy(stream.tcp_policy.clone());
+    let uds_stream_app = stream_router.router_with_policy(stream.uds_policy.clone());
     let tcp_app: axum::Router = api_router.clone().merge(tcp_stream_app);
     let uds_app: axum::Router = api_router.merge(uds_stream_app);
 
@@ -1501,7 +1425,7 @@ async fn async_main(args: Cli) -> Result<()> {
             tracing::warn!(
                 target: "acoustics",
                 err = %e,
-                path = %snap.stream.uds_path.display(),
+                path = %stream.uds_path.display(),
                 "uds bind failed; continuing TCP-only",
             );
             false
@@ -1511,7 +1435,7 @@ async fn async_main(args: Cli) -> Result<()> {
         .register("stream_io")
         .context("register stream_io subsystem")?;
     let initial_stream_detail = if uds_bound {
-        format!("TCP {tcp_local}; UDS {}", snap.stream.uds_path.display())
+        format!("TCP {tcp_local}; UDS {}", stream.uds_path.display())
     } else {
         format!("TCP {tcp_local}; UDS unavailable")
     };
@@ -1540,11 +1464,11 @@ async fn async_main(args: Cli) -> Result<()> {
     }
 
     // MARK: 11. Wait for shutdown
-    let exit_code = if args.check {
+    let exit_code = if args.check() {
         let res = run_check_mode(
             &monitor,
             &shutdown,
-            Duration::from_secs(args.check_seconds),
+            Duration::from_secs(args.check_seconds()),
             &snap,
         )
         .await;
@@ -1654,30 +1578,35 @@ where
     })
 }
 
-fn load_or_init_config(path: &std::path::Path) -> Result<ConfigCell> {
+/// Load `<workspace>/config.toml` (the user-pref TOML), or write
+/// defaults on first boot.  `workspace_root` is the operator-supplied
+/// `--workspace` value: the user-config's `workspace_root` field is
+/// authoritatively overwritten with this value so a stale on-disk
+/// path (operator moved the workspace, dev moved the repo) cannot
+/// contradict the daemon's runtime view.
+fn load_or_init_config(
+    path: &std::path::Path,
+    workspace_root: &std::path::Path,
+) -> Result<ConfigCell> {
     if path.exists() {
-        // Repair the UDS parent dir BEFORE `ConfigCell::load` runs
-        // its validate(), so a workspace-relative default whose
-        // parent disappeared between boots (e.g. operator
-        // `rm -rf workspaces/`) doesn't wedge boot at the
-        // parent-existence check.  Best-effort: if the partial
-        // parse fails we fall through and let `ConfigCell::load`'s
-        // structured error surface the real problem.  Routes
-        // through `ensure_uds_parent_dir` so the symlink-aware
-        // check + 0o700 tightening apply consistently with the
-        // hot-reload path -- a bare `create_dir_all` would inherit
-        // the umask (typically 0o755) and skip the symlink reject.
-        if let Ok(text) = std::fs::read_to_string(path)
-            && let Ok(value) = text.parse::<toml::Value>()
-            && let Some(uds_str) = value
-                .get("stream")
-                .and_then(|s| s.get("uds_path"))
-                .and_then(|p| p.as_str())
-        {
-            let uds_path = PathBuf::from(uds_str);
-            let _ = ensure_uds_parent_dir(&uds_path);
+        let cell =
+            ConfigCell::load(path).with_context(|| format!("load config {}", path.display()))?;
+        // CLI is the source of truth for the workspace root.  If
+        // the on-disk value differs (operator moved the tree, dev
+        // copied a config across hosts), rewrite to match.  No-op
+        // when already aligned (the mutate writes only on change).
+        let on_disk_root = cell.snapshot().workspace_root.clone();
+        if on_disk_root != workspace_root {
+            tracing::warn!(
+                target: "acoustics",
+                on_disk = %on_disk_root.display(),
+                cli = %workspace_root.display(),
+                "config.toml workspace_root differs from --workspace; rewriting to match CLI",
+            );
+            cell.mutate(|c| c.workspace_root = workspace_root.to_path_buf())
+                .context("override stale workspace_root in config.toml")?;
         }
-        Ok(ConfigCell::load(path).with_context(|| format!("load config {}", path.display()))?)
+        Ok(cell)
     } else {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -1686,19 +1615,7 @@ fn load_or_init_config(path: &std::path::Path) -> Result<ConfigCell> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create config parent dir {}", parent.display()))?;
         }
-        let workspace_root = path
-            .parent()
-            .map(|p| p.join("workspaces"))
-            .unwrap_or_else(|| PathBuf::from("./workspaces"));
-        let cfg = Config::default_for(workspace_root);
-        // The default UDS path is workspace-relative; ensure its
-        // parent exists with safe permissions before validation
-        // runs so first-boot doesn't trip the
-        // StreamCfg::validate_uds_path parent-existence check.
-        // Same helper as the hot-reload path so both paths apply
-        // the symlink-aware check + 0o700 tightening on Unix
-        // rather than relying on the umask.
-        ensure_uds_parent_dir(&cfg.stream.uds_path)?;
+        let cfg = Config::default_for(workspace_root.to_path_buf());
         let h = ConfigCell::from_value(cfg, path.to_path_buf())
             .context("first-boot default config failed validation")?;
         h.persist().context("persist initial config")?;
@@ -1712,6 +1629,21 @@ fn load_or_init_config(path: &std::path::Path) -> Result<ConfigCell> {
 /// mutate machinery, since the launch layer is immutable).
 fn load_or_init_launch_config(path: &std::path::Path) -> Result<LaunchConfig> {
     if path.exists() {
+        // Repair the launch-owned UDS parent dir BEFORE
+        // `LaunchConfig::load` runs `StreamCfg::validate()`, so an
+        // otherwise-valid launch TOML whose socket parent was swept
+        // can still boot.  Best-effort: parse failures fall through
+        // to the structured launch loader diagnostic.
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(value) = text.parse::<toml::Value>()
+            && let Some(uds_str) = value
+                .get("stream")
+                .and_then(|s| s.get("uds_path"))
+                .and_then(|p| p.as_str())
+        {
+            let uds_path = PathBuf::from(uds_str);
+            let _ = ensure_uds_parent_dir(&uds_path);
+        }
         LaunchConfig::load(path).with_context(|| format!("load launch config {}", path.display()))
     } else {
         if let Some(parent) = path.parent()
@@ -1722,6 +1654,7 @@ fn load_or_init_launch_config(path: &std::path::Path) -> Result<LaunchConfig> {
                 .with_context(|| format!("create launch config parent dir {}", parent.display()))?;
         }
         let cfg = LaunchConfig::default_for();
+        ensure_uds_parent_dir(&cfg.stream.uds_path)?;
         cfg.persist(path).context("persist initial launch config")?;
         tracing::info!(
             target: "acoustics",
@@ -1732,11 +1665,179 @@ fn load_or_init_launch_config(path: &std::path::Path) -> Result<LaunchConfig> {
     }
 }
 
+/// True when two CLI paths clearly point at the same file.  The
+/// user-preference config and launch catalogue are intentionally
+/// separate schemas; passing the same TOML to both flags produces a
+/// confusing launch-parse error, so catch the mix-up before either
+/// loader runs.
+fn paths_may_alias(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// True iff `<workspace_root>/active/current.json` exists +
 /// parses + the pointed generation's manifest validates.
 /// Replaces the legacy `cfg.head_active.*.exists()` gate.
 fn head_files_present(cfg: &Config) -> bool {
     matches!(resolve_active_head_paths(cfg), Ok(Some(_)))
+}
+
+/// Run the boot-time sweep (`ensure_root_layout` + `recover_all`)
+/// and translate the outcome into the two pieces `async_main`
+/// consumes downstream:
+///
+/// * `Option<RecoveryReport>` -- forwarded to
+///   `JobRegistry::record_boot_recovery` so `/status` can publish
+///   the boot summary without re-walking the filesystem.
+/// * `Option<String>` -- the `boot_recovery_unhealthy` reason that
+///   gates the inference engine's spawn (`SkipKind::RecoveryUnhealthy`)
+///   and surfaces in the `inference` heartbeat.
+///
+/// All side-effects (tracing, `WorkspaceMetrics` counters) match
+/// the previous in-line block byte for byte; this function exists
+/// only to lift the 130-line block out of `async_main` so the boot
+/// sequence reads top-to-bottom without a giant nested `match`.
+fn run_boot_recovery(
+    workspace_root: &std::path::Path,
+    default_head: Option<&crate::config::DefaultHeadRef>,
+    workspace_metrics: &crate::status::WorkspaceMetrics,
+) -> (Option<crate::file_mgr::RecoveryReport>, Option<String>) {
+    // The FsService lives later in `async_main`; reuse the sync
+    // `WorkspaceMgr` directly for a fixed-cost layout pass that
+    // runs before any FsService consumer.
+    let layout_mgr = crate::file_mgr::WorkspaceMgr::new(workspace_root.to_path_buf());
+    if let Err(e) = layout_mgr.ensure_root_layout() {
+        tracing::error!(
+            target: "acoustics",
+            err = %e,
+            "ensure_root_layout failed; daemon will boot without inference",
+        );
+        return (None, Some(format!("ensure_root_layout failed: {e}")));
+    }
+
+    // The production FsService is constructed below in `async_main`
+    // with an empty DashMap; recovery's eviction hook fires against
+    // this transient map and the FsService inherits the post-
+    // recovery on-disk state lazily.
+    let caches: dashmap::DashMap<
+        crate::common::ids::WorkspaceId,
+        std::sync::Arc<crate::file_mgr::WorkspaceCacheCell>,
+    > = dashmap::DashMap::new();
+    // Build the optional default-head source.  When `head.default`
+    // is absent in the launch config, recovery still runs (root
+    // staging + per-workspace sweeps); only the active-head
+    // materialization step short-circuits to `Unhealthy`.
+    let default_source =
+        default_head.map(|h| crate::file_mgr::active_head_writer::DefaultHeadSource {
+            path: &h.path,
+            labels_path: &h.labels_path,
+        });
+    if default_source.is_none() {
+        tracing::warn!(
+            target: "acoustics",
+            "head.default not configured in launch config; bundled-default fallback disabled \
+             (workspace + staging recovery still runs)",
+        );
+    }
+    // Captures nothing, so a stack closure suffices; `&loader`
+    // coerces to `&HeadInnerLoader` (`&(dyn Fn + Send + Sync)`)
+    // without allocating a Box.
+    let loader = |head_mpk: &std::path::Path,
+                  labels: &std::path::Path,
+                  head_id: crate::common::ids::HeadId|
+     -> Result<Box<dyn std::any::Any + Send>, String> {
+        let head = HotHead::load(head_mpk, labels, head_id).map_err(|e| format!("{e}"))?;
+        let inner = (*head.snapshot()).clone();
+        Ok(Box::new(inner) as Box<dyn std::any::Any + Send>)
+    };
+    let report =
+        match crate::file_mgr::recover_all(workspace_root, default_source, &caches, &loader) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    target: "acoustics",
+                    err = %e,
+                    "boot recovery failed; daemon will boot without inference",
+                );
+                return (None, Some(format!("boot recovery failed: {e}")));
+            }
+        };
+
+    tracing::info!(
+        target: "acoustics",
+        workspaces_scanned = report.workspaces.workspaces_scanned,
+        workspace_recovery_failures = report.workspaces.workspace_recovery_failures,
+        head_orphans_swept = report.workspaces.head_orphans_swept,
+        head_count_repaired = report.workspaces.head_count_repaired,
+        dataset_tombstones_completed = report.workspaces.dataset_tombstones_completed,
+        dataset_stage_orphans_swept = report.workspaces.dataset_stage_orphans_swept,
+        converter_tombstones_completed = report.workspaces.converter_tombstones_completed,
+        converter_stage_orphans_swept = report.workspaces.converter_stage_orphans_swept,
+        incomplete_creates_removed = report.workspaces.incomplete_creates_removed,
+        workspace_tombstones_completed = report.root_staging.workspace_tombstones_completed,
+        workspace_stage_orphans_swept = report.root_staging.workspace_stage_orphans_swept,
+        "boot recovery completed",
+    );
+    // Sum the orphan-sweep totals onto `boot_orphans_swept_total`
+    // and stash the full report on the `JobRegistry` so `/status`
+    // can publish the boot summary without re-walking the
+    // filesystem.
+    let orphans = (report.workspaces.head_orphans_swept
+        + report.workspaces.dataset_stage_orphans_swept
+        + report.workspaces.converter_stage_orphans_swept
+        + report.root_staging.workspace_stage_orphans_swept) as u64;
+    workspace_metrics.record_boot_orphans_swept(orphans);
+    // Surface per-workspace recovery failures (heads.json parse,
+    // IO during sweep, ...) on a typed counter so operators can
+    // spot `workspaces_scanned < expected` without grep-ing the
+    // log.  The structured `tracing::warn!` from
+    // `recover_workspaces` remains the authoritative diagnostic
+    // source; this counter is the operator-dashboard aggregate.
+    workspace_metrics.record_boot_workspace_recovery_failures(
+        report.workspaces.workspace_recovery_failures as u64,
+    );
+
+    let unhealthy_reason = match &report.active {
+        crate::file_mgr::RecoveryActiveResult::Current { activation_id, .. } => {
+            tracing::info!(
+                target: "acoustics",
+                activation_id = %activation_id,
+                "active head verified at boot",
+            );
+            None
+        }
+        crate::file_mgr::RecoveryActiveResult::PromotedPrevious { activation_id, .. } => {
+            tracing::warn!(
+                target: "acoustics",
+                activation_id = %activation_id,
+                "current generation failed verify; previous promoted",
+            );
+            None
+        }
+        crate::file_mgr::RecoveryActiveResult::DefaultedFromBundle { activation_id, .. } => {
+            tracing::warn!(
+                target: "acoustics",
+                activation_id = %activation_id,
+                "no valid generation; bundled default activated",
+            );
+            None
+        }
+        crate::file_mgr::RecoveryActiveResult::Unhealthy { reason } => {
+            tracing::error!(
+                target: "acoustics",
+                reason = %reason,
+                "boot recovery unhealthy; daemon will boot without inference",
+            );
+            Some(reason.clone())
+        }
+    };
+
+    (Some(report), unhealthy_reason)
 }
 
 /// Resolve the live active-head directory under
@@ -1907,13 +2008,6 @@ fn hash_hex(bytes: &[u8]) -> String {
         out[2 * i + 1] = HEX[(b & 0x0f) as usize];
     }
     String::from_utf8(out).expect("ascii hex is utf8")
-}
-
-/// Path to the bundled-default head fixture under the source
-/// tree.  Operators do not edit; the daemon copies this into a
-/// fresh active generation on first boot.
-fn bundled_default_head_dir() -> PathBuf {
-    PathBuf::from("misc/heads/00000000-default")
 }
 
 /// Build a synthetic 2-class head for hosts where the configured
@@ -2475,7 +2569,7 @@ async fn run_check_mode(
 
 #[cfg(test)]
 mod bind_is_loopback_tests {
-    use super::bind_is_loopback;
+    use super::{bind_is_loopback, paths_may_alias};
 
     #[test]
     fn ipv4_loopback_accepts() {
@@ -2516,5 +2610,21 @@ mod bind_is_loopback_tests {
         assert!(!bind_is_loopback("example.com:443"));
         // No colon at all.
         assert!(!bind_is_loopback("garbage"));
+    }
+
+    #[test]
+    fn paths_may_alias_detects_same_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        // Test fixture: no concurrent reader, no atomicity required.
+        #[allow(clippy::disallowed_methods)]
+        std::fs::write(&path, b"fixture").expect("write fixture");
+
+        assert!(paths_may_alias(&path, &path));
+        assert!(paths_may_alias(
+            &path,
+            &dir.path().join(".").join("config.toml")
+        ));
+        assert!(!paths_may_alias(&path, &dir.path().join("launch.toml")));
     }
 }

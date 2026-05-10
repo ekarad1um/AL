@@ -1,5 +1,5 @@
-//! Domain-specific config sub-sections: `StreamCfg`,
-//! `TrainingDefaults`, `FileCfg`.  Each
+//! Domain-specific config sub-sections: `StreamCfg` (launch),
+//! `TrainingDefaults`, `FileCfg` (hot config).  Each
 //! carries its own `validate()` predicate; `Config::validate`
 //! aggregates them.
 //!
@@ -55,6 +55,23 @@ pub struct StreamCfg {
     /// in TOML.
     #[serde(default = "default_uds_policy")]
     pub uds_policy: TransportPolicy,
+}
+
+impl Default for StreamCfg {
+    fn default() -> Self {
+        Self {
+            // Launch-time default for first boot.  Bundled dev and
+            // production deployments should pin their actual socket
+            // location in launch.toml; the daemon ensures the parent
+            // before validation when it auto-materializes defaults.
+            uds_path: PathBuf::from("var/run/acoustics_lab.sock"),
+            uds_mode: 0o666,
+            tcp_bind: "127.0.0.1:8787".into(),
+            broadcast_capacity: 64,
+            tcp_policy: default_tcp_policy(),
+            uds_policy: default_uds_policy(),
+        }
+    }
 }
 
 /// Default `TransportPolicy` for the TCP listener: cap of 32

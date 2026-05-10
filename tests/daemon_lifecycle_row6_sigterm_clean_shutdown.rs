@@ -48,24 +48,10 @@ use daemon_helpers::{CheckProfile, launch_long_running};
 /// budget (5 s + soft margin).
 #[tokio::test]
 async fn lifecycle_row6_sigterm_clean_shutdown_within_drain_budget() {
-    let profile = CheckProfile {
-        // `check_seconds` is unused for the long-running path
-        // (the daemon runs until signal); keep the default for
-        // doc consistency with Rows 1-3.
-        check_seconds: 3,
-        mock_audio: true,
-        no_inference: true,
-        // `timeout` here bounds the BOOT wait, not the run
-        // duration; 15 s is the same generous cold-boot budget
-        // Rows 1-3 use.
-        timeout: Duration::from_secs(15),
-        tcp_bind: "127.0.0.1:0".into(),
-        launch_toml_override: None,
-        extra_args: Vec::new(),
-        cwd_override: None,
-    };
-
-    let daemon = launch_long_running(profile)
+    // `launch_long_running` ignores `check_seconds` (the daemon
+    // runs until signal); `timeout` here bounds the BOOT wait, not
+    // the run duration.  Defaults match Rows 1-3's profile.
+    let daemon = launch_long_running(CheckProfile::default())
         .await
         .expect("daemon long-running launch must succeed");
     let cwd = daemon.cwd().to_path_buf();

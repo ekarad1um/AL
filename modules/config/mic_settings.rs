@@ -321,14 +321,7 @@ mod tests {
 
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let cfg_path = tmpdir.path().join("config.toml");
-        let mut initial_cfg = crate::config::Config::default_for(tmpdir.path().join("workspaces"));
-        // `Config::default_for` builds
-        // `<workspace_root>/var/run/acoustics_lab.sock`.
-        // Production's `load_or_init_config` mkdirs `var/run/`
-        // before `validate()`; this test calls `from_value`
-        // directly, so patch to a tempdir-relative socket so
-        // `validate_uds_path` accepts it.
-        initial_cfg.stream.uds_path = tmpdir.path().join("test.sock");
+        let initial_cfg = crate::config::Config::default_for(tmpdir.path().join("workspaces"));
         let initial_policy = initial_cfg.mic.clone();
         let cfg_cell = Arc::new(
             crate::config::ConfigCell::from_value(initial_cfg, cfg_path)

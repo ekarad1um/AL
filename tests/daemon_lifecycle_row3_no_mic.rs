@@ -41,12 +41,25 @@ use daemon_helpers::{CheckProfile, launch_check_mode};
 /// (the launch validator's `is_empty()` check just emits a
 /// `tracing::warn!` rather than refusing boot per
 /// `modules/daemon/main_body.rs:441-447`).
+///
+/// `[stream]` is required by the launch schema (no
+/// `#[serde(default)]` on the field) so the fixture supplies
+/// tempdir-friendly defaults: `tcp_bind = "127.0.0.1:0"` is
+/// overridden by the helper's `--tcp-bind`, and
+/// `uds_path = "misc/acousticsd.sock"` resolves into the
+/// `<cwd>/misc/` directory the helper pre-creates.
 const NO_MIC_NO_BACKBONE_LAUNCH_TOML: &str = r#"
 [mic]
 candidates = []
 
 [backbone]
 candidates = []
+
+[stream]
+uds_path = "misc/acousticsd.sock"
+uds_mode = 438
+tcp_bind = "127.0.0.1:0"
+broadcast_capacity = 64
 "#;
 
 /// **Row 3 -- no mic device available.** Pre-write a launch

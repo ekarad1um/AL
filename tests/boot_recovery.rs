@@ -28,8 +28,8 @@ use acoustics_lab::common::workspace::{
     HeadIndex, HeadManifest, HeadRecord, WorkspaceCore, WorkspaceRevision,
 };
 use acoustics_lab::file_mgr::active_head_writer::{
-    ActivationOriginInput, HeadInnerLoader, PendingActivation, publish_active_generation,
-    stage_and_validate_activation, staging_path_for,
+    ActivationOriginInput, DefaultHeadSource, HeadInnerLoader, PendingActivation,
+    publish_active_generation, stage_and_validate_activation, staging_path_for,
 };
 use acoustics_lab::file_mgr::schema::{
     ACTIVE_HEAD_FILENAME, active_current_path, active_generation_dir, head_artifact_path,
@@ -85,30 +85,45 @@ fn hex_sha256(bytes: &[u8]) -> String {
 /// recorder is unnecessary here.  Recovery's bundled-default
 /// activation pipeline only requires the bytes + the labels
 /// list.
-fn fresh_bundled_default(dir: &Path, mpk: &[u8], labels_text: &str) -> PathBuf {
+fn fresh_bundled_default(dir: &Path, mpk: &[u8], labels_text: &str) -> (PathBuf, PathBuf) {
     let bundled = dir.join("bundled_default");
     std::fs::create_dir_all(&bundled).unwrap();
-    std::fs::write(bundled.join("head.mpk"), mpk).unwrap();
-    std::fs::write(bundled.join("labels.txt"), labels_text).unwrap();
-    bundled
+    let head = bundled.join("head.mpk");
+    let labels = bundled.join("labels.txt");
+    std::fs::write(&head, mpk).unwrap();
+    std::fs::write(&labels, labels_text).unwrap();
+    (head, labels)
+}
+
+fn default_source<'a>(path: &'a Path, labels_path: &'a Path) -> DefaultHeadSource<'a> {
+    DefaultHeadSource { path, labels_path }
+}
+
+fn default_origin<'a>(path: &'a Path, labels_path: &'a Path) -> ActivationOriginInput<'a> {
+    ActivationOriginInput::Default {
+        source: default_source(path, labels_path),
+    }
 }
 
 /// Activate a fresh bundled-default generation so the test
 /// starts with a known-good current pointer.  Returns the
-/// `(bundled_dir, activation_id)` pair.
-fn seed_active_generation(root: &Path, mpk: &[u8], labels_text: &str) -> (PathBuf, String) {
+/// `(head_path, labels_path, activation_id)` triple.
+fn seed_active_generation(
+    root: &Path,
+    mpk: &[u8],
+    labels_text: &str,
+) -> (PathBuf, PathBuf, String) {
     std::fs::create_dir_all(root).unwrap();
-    let bundled = fresh_bundled_default(root, mpk, labels_text);
+    let (head, labels) = fresh_bundled_default(root, mpk, labels_text);
     let pending = PendingActivation {
         root,
-        origin_input: ActivationOriginInput::Default,
-        bundled_default_dir: &bundled,
+        origin_input: default_origin(&head, &labels),
         now_rfc3339: now_rfc3339(),
     };
     let result = stage_and_validate_activation(pending, &*synth_loader()).unwrap();
     let staging = staging_path_for(root, &result.activation_id);
     publish_active_generation(root, &staging, &result.manifest, &result.activation_id).unwrap();
-    (bundled, result.activation_id)
+    (head, labels, result.activation_id)
 }
 
 /// Seed a workspace dir with a single trained head.  Mirrors the
@@ -170,12 +185,11 @@ fn corrupt_active_head_falls_back_to_previous_generation() {
     // Pre-seed two generations so recovery has a previous to
     // promote.  The first activation publishes; we sleep then
     // publish a second, which becomes "current".
-    let (bundled1, gen1) = seed_active_generation(root, b"DEFAULT-MPK-A", "cat\ndog\n");
+    let (head1, labels1, gen1) = seed_active_generation(root, b"DEFAULT-MPK-A", "cat\ndog\n");
     std::thread::sleep(std::time::Duration::from_millis(50));
     let pending2 = PendingActivation {
         root,
-        origin_input: ActivationOriginInput::Default,
-        bundled_default_dir: &bundled1,
+        origin_input: default_origin(&head1, &labels1),
         now_rfc3339: now_rfc3339(),
     };
     let r2 = stage_and_validate_activation(pending2, &*synth_loader()).unwrap();
@@ -193,7 +207,13 @@ fn corrupt_active_head_falls_back_to_previous_generation() {
     let head_path = active_generation_dir(root, &current_id).join(ACTIVE_HEAD_FILENAME);
     std::fs::write(&head_path, b"TAMPERED").unwrap();
     let caches = fresh_caches();
-    let report = recover_all(root, &bundled1, &caches, &*synth_loader()).unwrap();
+    let report = recover_all(
+        root,
+        Some(default_source(&head1, &labels1)),
+        &caches,
+        &*synth_loader(),
+    )
+    .unwrap();
     match &report.active {
         RecoveryActiveResult::PromotedPrevious { activation_id, .. } => {
             assert_eq!(*activation_id, gen1);
@@ -214,7 +234,7 @@ fn workspace_delete_tombstone_resumes_at_boot() {
     // Lay down the root layout + a current active generation so
     // recovery has a healthy active head to verify alongside the
     // staging sweep.
-    let (bundled, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
+    let (default_head, default_labels, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
     // Stage a half-completed workspace-delete: write the
     // tombstone + rename a victim workspace tree under root
     // `.tmp/`.  Recovery should drain the payload, finalize, and
@@ -250,7 +270,13 @@ fn workspace_delete_tombstone_resumes_at_boot() {
             HeadIndex::default(),
         )),
     );
-    let report = recover_all(root, &bundled, &caches, &*synth_loader()).unwrap();
+    let report = recover_all(
+        root,
+        Some(default_source(&default_head, &default_labels)),
+        &caches,
+        &*synth_loader(),
+    )
+    .unwrap();
     assert_eq!(report.root_staging.workspace_tombstones_completed, 1);
     assert!(!staged.tombstone.exists());
     assert!(!staged.stage_dir.exists());
@@ -263,7 +289,7 @@ fn workspace_delete_tombstone_resumes_at_boot() {
 fn daemon_owned_head_orphans_swept_on_boot() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let (bundled, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
+    let (head, labels, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
     std::fs::create_dir_all(workspaces_dir(root)).unwrap();
     let ws = ws_id(0xBB);
     let real_head = head_id(0xCC);
@@ -277,7 +303,13 @@ fn daemon_owned_head_orphans_swept_on_boot() {
     std::fs::write(&orphan_mpk, b"ORPHAN-MPK").unwrap();
     std::fs::write(&orphan_json, b"{}").unwrap();
     let caches = fresh_caches();
-    let report = recover_all(root, &bundled, &caches, &*synth_loader()).unwrap();
+    let report = recover_all(
+        root,
+        Some(default_source(&head, &labels)),
+        &caches,
+        &*synth_loader(),
+    )
+    .unwrap();
     assert_eq!(report.workspaces.workspaces_scanned, 1);
     // Two files removed (mpk + json).
     assert_eq!(report.workspaces.head_orphans_swept, 2);
@@ -294,7 +326,7 @@ fn daemon_owned_head_orphans_swept_on_boot() {
 fn head_count_drift_repaired_on_boot() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let (bundled, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
+    let (head, labels, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
     std::fs::create_dir_all(workspaces_dir(root)).unwrap();
     let ws = ws_id(0xEE);
     let real_head = head_id(0xFA);
@@ -335,7 +367,13 @@ fn head_count_drift_repaired_on_boot() {
     core.head_count = 0;
     write_workspace_core(&ws_dir, &core).unwrap();
     let caches = fresh_caches();
-    let report = recover_all(root, &bundled, &caches, &*synth_loader()).unwrap();
+    let report = recover_all(
+        root,
+        Some(default_source(&head, &labels)),
+        &caches,
+        &*synth_loader(),
+    )
+    .unwrap();
     assert_eq!(report.workspaces.head_count_repaired, 1);
     let core = read_workspace_core(&ws_dir).unwrap();
     assert_eq!(core.head_count, 2);
@@ -361,7 +399,7 @@ fn legacy_active_manifest_falls_back_to_bundled_default() {
     // Stage a fresh active layout with a known-good `current.json`
     // but a hand-rolled legacy-shape manifest under the pointed
     // generation.
-    let bundled = fresh_bundled_default(root, b"DEFAULT-MPK", "alpha\n");
+    let (head, labels) = fresh_bundled_default(root, b"DEFAULT-MPK", "alpha\n");
     let activation_id = "11111111-2222-4333-8444-555555555560".to_string();
     let gen_dir = active_generation_dir(root, &activation_id);
     std::fs::create_dir_all(&gen_dir).unwrap();
@@ -404,7 +442,13 @@ fn legacy_active_manifest_falls_back_to_bundled_default() {
     .unwrap();
 
     let caches = fresh_caches();
-    let report = recover_all(root, &bundled, &caches, &*synth_loader()).unwrap();
+    let report = recover_all(
+        root,
+        Some(default_source(&head, &labels)),
+        &caches,
+        &*synth_loader(),
+    )
+    .unwrap();
     match &report.active {
         RecoveryActiveResult::DefaultedFromBundle {
             activation_id: new_id,
@@ -428,7 +472,7 @@ fn legacy_active_manifest_falls_back_to_bundled_default() {
 fn recover_all_aggregates_multi_failure_residue() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let (bundled, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
+    let (head, labels, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
     std::fs::create_dir_all(workspaces_dir(root)).unwrap();
 
     // (a) Healthy workspace + head_count drift + head orphan.
@@ -481,7 +525,13 @@ fn recover_all_aggregates_multi_failure_residue() {
         )),
     );
 
-    let report = recover_all(root, &bundled, &caches, &*synth_loader()).unwrap();
+    let report = recover_all(
+        root,
+        Some(default_source(&head, &labels)),
+        &caches,
+        &*synth_loader(),
+    )
+    .unwrap();
 
     // Per-workspace counters.
     assert_eq!(
@@ -527,7 +577,7 @@ fn recover_all_aggregates_multi_failure_residue() {
 fn per_workspace_recovery_failure_counted() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let (bundled, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
+    let (head, labels, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
     std::fs::create_dir_all(workspaces_dir(root)).unwrap();
 
     // Healthy workspace ws_a -- scanned successfully.
@@ -561,7 +611,13 @@ fn per_workspace_recovery_failure_counted() {
     std::fs::write(ws_dir_b.join("heads.json"), b"{not json}").unwrap();
 
     let caches = fresh_caches();
-    let report = recover_all(root, &bundled, &caches, &*synth_loader()).unwrap();
+    let report = recover_all(
+        root,
+        Some(default_source(&head, &labels)),
+        &caches,
+        &*synth_loader(),
+    )
+    .unwrap();
 
     assert_eq!(
         report.workspaces.workspace_recovery_failures, 1,
@@ -592,7 +648,7 @@ fn recover_all_drains_dataset_and_converter_tombstones_together() {
     use acoustics_lab::common::asset_path::AssetPath;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let (bundled, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
+    let (default_head, default_labels, _) = seed_active_generation(root, b"DEFAULT-MPK", "cat\n");
     std::fs::create_dir_all(workspaces_dir(root)).unwrap();
 
     let ws = ws_id(0xD0);
@@ -630,7 +686,13 @@ fn recover_all_drains_dataset_and_converter_tombstones_together() {
     stage_payload(&converter_target, &converter_staged).unwrap();
 
     let caches = fresh_caches();
-    let report = recover_all(root, &bundled, &caches, &*synth_loader()).unwrap();
+    let report = recover_all(
+        root,
+        Some(default_source(&default_head, &default_labels)),
+        &caches,
+        &*synth_loader(),
+    )
+    .unwrap();
 
     assert_eq!(report.workspaces.dataset_tombstones_completed, 1);
     assert_eq!(report.workspaces.converter_tombstones_completed, 1);

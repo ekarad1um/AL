@@ -8,10 +8,10 @@ use thiserror::Error;
 
 /// Per-section validation failure for [`crate::config::Config`].
 ///
-/// Wraps the freeform `String` from each leaf validator
-/// (`StreamCfg::validate`, `TrainingDefaults::validate`, etc.)
-/// under a typed discriminator so the hot-reload callback (and
-/// any future telemetry surface) can match on category instead
+/// Wraps the freeform `String` from each hot-reloadable leaf
+/// validator (`TrainingDefaults::validate`, `FileCfg::validate`,
+/// etc.) under a typed discriminator so the hot-reload callback
+/// (and any future telemetry surface) can match on category instead
 /// of regex-parsing log text.  `Display` renders as
 /// `"<section>: <leaf>"`.
 #[derive(Debug, Error)]
@@ -20,9 +20,6 @@ pub enum ConfigValidationError {
     /// `Config.inference` (`InferenceCfg::validate`) rejected.
     #[error("inference: {0}")]
     Inference(String),
-    /// `Config.stream` (`StreamCfg::validate`) rejected.
-    #[error("stream: {0}")]
-    Stream(String),
     /// `Config.file` (`FileCfg::validate`) rejected.
     #[error("file: {0}")]
     File(String),

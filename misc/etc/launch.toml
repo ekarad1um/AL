@@ -1,0 +1,31 @@
+[[mic.candidates]]
+id = "default-mock"
+channels = [0]
+
+[mic.candidates.source]
+kind = "mock"
+period_size = 512
+sample_rate = 44100
+
+[[mic.candidates.source.waveforms]]
+kind = "sine"
+freq_hz = 1000.0
+amplitude = 0.25
+
+[stream]
+uds_path = "misc/share/acousticsd.sock"
+uds_mode = 438
+tcp_bind = "127.0.0.1:8787"
+broadcast_capacity = 64
+
+[[backbone.candidates]]
+kind = "rknn"
+path = "misc/backbones/backbone.rknn"
+
+[[backbone.candidates]]
+kind = "burn"
+path = "misc/backbones/backbone.mpk"
+
+[head.default]
+path = "misc/heads/default/head.mpk"
+labels_path = "misc/heads/default/labels.txt"

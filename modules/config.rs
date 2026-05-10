@@ -49,9 +49,10 @@
 //!
 //! | Type | Kind | Why |
 //! |---|---|---|
-//! | [`Config`] | Schema DTO | Top-level TOML mapping; `Serialize + Deserialize`; one-to-one with the operator's `dev.toml`. |
-//! | [`LaunchConfig`] | Schema DTO | Boot-time TOML; mic catalogue + backbone catalogue. |
-//! | [`StreamCfg`], [`TrainingDefaults`], [`FileCfg`] | Schema DTO | Sub-tables in `Config`; pure schema, all `Serialize + Deserialize`. |
+//! | [`Config`] | Schema DTO | Top-level TOML mapping; `Serialize + Deserialize`; one-to-one with `<workspace>/config.toml`. |
+//! | [`LaunchConfig`] | Schema DTO | Boot-time TOML; mic catalogue + backbone catalogue + stream listener settings + default-head file pair. |
+//! | [`TrainingDefaults`], [`FileCfg`] | Schema DTO | Sub-tables in `Config`; pure schema, all `Serialize + Deserialize`. |
+//! | [`StreamCfg`] | Schema DTO | Sub-table in `LaunchConfig`; startup-only, never hot-reloaded. |
 //! | [`crate::audio_io::mic_arbitrator::MicPolicy`] / `MicSelection` / `ChannelSelection` (re-exported through `Config.mic`) | Schema DTO (cross-module) | Owned by `audio_io` but lives in the TOML; cross-validated against `LaunchConfig.mic`. |
 //! | [`crate::inference::InferenceCfg`] (re-exported through `Config.inference`) | Schema DTO (cross-module) | Inference cadence; same dual-ownership pattern. |
 //! | [`ConfigError`] | Diagnostic type | Internal failure shape mapped to HTTP statuses via `Categorized`. |
@@ -131,7 +132,9 @@ use error::{parse_err, read_err};
 // consumer holds (`Arc<dyn ConfigHandle>`); the concrete impl is
 // `ConfigCell` below.
 pub use handle::{ConfigGuard, ConfigHandle};
-pub use launch::{LaunchConfig, validate_policy_against_catalogue};
+pub use launch::{
+    DefaultHeadRef, HeadLaunchConfig, LaunchConfig, validate_policy_against_catalogue,
+};
 pub use mic_settings::{MicError, MicSettingsCell, MicSettingsHandle};
 
 use crate::audio_io::mic_arbitrator::{ChannelSelection, MicPolicy, MicSelection};
@@ -168,7 +171,6 @@ pub struct Config {
     #[serde(default)]
     pub training_defaults: TrainingDefaults,
     pub workspace_root: PathBuf,
-    pub stream: StreamCfg,
     /// File-service admission caps.  Defaults
     /// (256 MiB / 4 concurrent) match the workspace-redesign §9
     /// storage table; operators on dev hosts can lift the
@@ -199,7 +201,6 @@ impl Config {
         self.inference
             .validate()
             .map_err(ConfigValidationError::Inference)?;
-        self.stream.validate().map_err(ConfigValidationError::Stream)?;
         // Gate operator-supplied admission caps at
         // boot.  Zero on either field would refuse every upload; the
         // resulting daemon would look healthy but reject 100 % of
@@ -237,36 +238,6 @@ impl Config {
             },
             inference: InferenceCfg::default(),
             training_defaults: TrainingDefaults::default(),
-            stream: StreamCfg {
-                // Workspace-relative so the daemon can mkdir the
-                // parent on first boot without root and so the
-                // shipped default validates on every host (Linux
-                // production, macOS dev, CI).  Operators who
-                // deploy under systemd override this to e.g.
-                // `/run/acoustics_lab.sock` and let
-                // systemd-tmpfiles provision `/run/acoustics_lab/`.
-                uds_path: workspace_root.join("var/run/acoustics_lab.sock"),
-                uds_mode: 0o666,
-                // Loopback by default.  The daemon does not
-                // authenticate clients itself: production
-                // deployments front it with an Nginx (or
-                // equivalent) reverse proxy that handles TLS
-                // termination and auth.  Operators who expose
-                // the listener directly own the trust boundary;
-                // `validate_tcp_bind` allows any well-formed
-                // host:port (including 0.0.0.0).
-                tcp_bind: "127.0.0.1:8787".into(),
-                broadcast_capacity: 64,
-                // S4.TCP gets the strict capped policy
-                // (32 connections, subprotocol required); UDS
-                // relaxes the subprotocol gate since filesystem
-                // permissions are already the auth boundary.
-                tcp_policy: crate::stream_io::TransportPolicy::capped(),
-                uds_policy: crate::stream_io::TransportPolicy {
-                    require_subprotocol: false,
-                    ..crate::stream_io::TransportPolicy::capped()
-                },
-            },
             file: FileCfg::default(),
             workspace_root,
         }
@@ -324,9 +295,10 @@ impl ConfigCell {
         let text = std::fs::read_to_string(path).map_err(|e| read_err(path.display(), e))?;
         let cfg: Config = toml::from_str(&text).map_err(|e| parse_err(path.display(), e))?;
         // Reject operator-supplied values that would corrupt runtime
-        // behaviour (inference: zero hop / top_k out of range; stream:
-        // missing tcp_bind / zero broadcast capacity; etc.).  The engine clamps some of
-        // these defensively at runtime, but failing loudly at boot is
+        // behaviour (inference: zero hop / top_k out of range,
+        // file caps at zero, invalid training defaults, etc.).
+        // The engine clamps some of these defensively at runtime,
+        // but failing loudly at boot is
         // preferable to a silently-corrected config that drifts from
         // what's on disk.  Mic policy cross-validation against the
         // launch catalogue runs at the daemon boundary (see
@@ -851,23 +823,26 @@ mod tests {
     // appear in lib.rs's free imports (they live in `launch.rs` /
     // `domain.rs` now).
     use crate::common::ids::MicId;
-    use crate::inference::{BackboneCatalogue, BackboneKind};
+    use crate::inference::{BackboneCatalogue, BackboneKind, BackboneRef};
 
-    /// Test fixture: production-default `Config` patched so it
-    /// validates inside the test sandbox.  `Config::default_for`
-    /// builds a workspace-relative `uds_path` (e.g.
-    /// `<workspace_root>/var/run/acoustics_lab.sock`) whose
-    /// `var/run/` parent the production daemon mkdirs before
-    /// `validate()` (see `load_or_init_config` in `daemon/main_body.rs`).
-    /// Tests that call `.validate()` directly bypass that mkdir,
-    /// so we point `uds_path` at `$TMPDIR/acoustics_lab_test.sock`
-    /// (parent always exists) to keep every existing test
-    /// deterministic on every supported host without weakening
-    /// the production default.
+    /// Test fixture: production-default hot config.  Stream binds
+    /// live in `LaunchConfig` now, so this can validate without
+    /// test-side socket path patching.
     fn fresh_default() -> Config {
-        let mut cfg = Config::default_for(PathBuf::from("/tmp/acoustics_lab_test_workspaces"));
-        cfg.stream.uds_path = std::env::temp_dir().join("acoustics_lab_test.sock");
-        cfg
+        Config::default_for(PathBuf::from("/tmp/acoustics_lab_test_workspaces"))
+    }
+
+    fn fresh_stream() -> StreamCfg {
+        StreamCfg {
+            uds_path: std::env::temp_dir().join("acoustics_lab_test.sock"),
+            ..StreamCfg::default()
+        }
+    }
+
+    fn fresh_launch_for_load(dir: &Path) -> LaunchConfig {
+        let mut launch = LaunchConfig::default_for();
+        launch.stream.uds_path = dir.join("launch.sock");
+        launch
     }
 
     /// TOML round-trip preserves all fields.
@@ -886,23 +861,23 @@ mod tests {
     /// The TOML round-trip preserves the distinction.
     #[test]
     fn stream_cfg_defaults_per_listener_policy() {
-        let cfg = fresh_default();
-        assert_eq!(cfg.stream.tcp_policy.max_connections_per_stream, 32);
+        let stream = StreamCfg::default();
+        assert_eq!(stream.tcp_policy.max_connections_per_stream, 32);
         assert!(
-            cfg.stream.tcp_policy.require_subprotocol,
+            stream.tcp_policy.require_subprotocol,
             "TCP default must keep the strict subprotocol gate",
         );
-        assert_eq!(cfg.stream.uds_policy.max_connections_per_stream, 32);
+        assert_eq!(stream.uds_policy.max_connections_per_stream, 32);
         assert!(
-            !cfg.stream.uds_policy.require_subprotocol,
+            !stream.uds_policy.require_subprotocol,
             "UDS default must relax the subprotocol gate",
         );
 
         // Round-trip preserves both policies.
-        let s = toml::to_string_pretty(&cfg).expect("serialize");
-        let back: Config = toml::from_str(&s).expect("parse");
-        assert_eq!(cfg.stream.tcp_policy, back.stream.tcp_policy);
-        assert_eq!(cfg.stream.uds_policy, back.stream.uds_policy);
+        let s = toml::to_string_pretty(&stream).expect("serialize");
+        let back: StreamCfg = toml::from_str(&s).expect("parse");
+        assert_eq!(stream.tcp_policy, back.tcp_policy);
+        assert_eq!(stream.uds_policy, back.uds_policy);
     }
 
     /// Pre-S4 TOML files (no `[stream.tcp_policy]` /
@@ -913,8 +888,8 @@ mod tests {
     fn stream_cfg_legacy_toml_loads_with_default_policies() {
         // Hand-rolled minimal TOML mirrors the pre-S4 shape: stream
         // table has only the four legacy fields.
-        let cfg = fresh_default();
-        let mut text = toml::to_string_pretty(&cfg).expect("ser");
+        let stream = fresh_stream();
+        let mut text = toml::to_string_pretty(&stream).expect("ser");
         // Strip the new policy tables from the on-disk text to
         // simulate a pre-S4 config file.
         for marker in ["[stream.tcp_policy]", "[stream.uds_policy]"] {
@@ -927,11 +902,9 @@ mod tests {
                 break;
             }
         }
-        let parsed: Config = toml::from_str(&text).expect("parse legacy shape");
-        // Defaults match what `Config::default_for` would have
-        // produced for a fresh install.
-        assert_eq!(parsed.stream.tcp_policy, cfg.stream.tcp_policy);
-        assert_eq!(parsed.stream.uds_policy, cfg.stream.uds_policy);
+        let parsed: StreamCfg = toml::from_str(&text).expect("parse legacy shape");
+        assert_eq!(parsed.tcp_policy, stream.tcp_policy);
+        assert_eq!(parsed.uds_policy, stream.uds_policy);
     }
 
     /// `load()` reads a TOML file and yields the parsed config.
@@ -961,30 +934,15 @@ mod tests {
         // Default-for is by construction valid.
         fresh_default().validate().expect("default must validate");
 
-        // stream.broadcast_capacity = 0.
-        let mut cfg = fresh_default();
-        cfg.stream.broadcast_capacity = 0;
-        let err = cfg.validate().expect_err("zero broadcast must reject").to_string();
-        assert!(err.contains("stream"), "{err}");
-
-        // stream.tcp_bind missing port.
-        let mut cfg = fresh_default();
-        cfg.stream.tcp_bind = "0.0.0.0".into();
-        let err = cfg.validate().expect_err("no-port tcp_bind must reject").to_string();
-        assert!(err.contains("stream"), "{err}");
-
-        // stream.uds_path empty.
-        let mut cfg = fresh_default();
-        cfg.stream.uds_path = PathBuf::new();
-        let err = cfg.validate().expect_err("empty uds_path must reject").to_string();
-        assert!(err.contains("stream"), "{err}");
-
         // Inference (delegated) -- zero hop, already covered by
         // `load_rejects_invalid_inference_cfg`; ensure the aggregate
         // walker reaches inference too.
         let mut cfg = fresh_default();
         cfg.inference.hop_samples = 0;
-        let err = cfg.validate().expect_err("zero hop must reject").to_string();
+        let err = cfg
+            .validate()
+            .expect_err("zero hop must reject")
+            .to_string();
         assert!(err.contains("inference"), "{err}");
 
         // training_defaults -- aggregate walker must reach
@@ -993,7 +951,10 @@ mod tests {
         // `training_defaults_validator_*` below).
         let mut cfg = fresh_default();
         cfg.training_defaults.epochs = 0;
-        let err = cfg.validate().expect_err("zero epochs must reject").to_string();
+        let err = cfg
+            .validate()
+            .expect_err("zero epochs must reject")
+            .to_string();
         assert!(err.contains("training_defaults"), "{err}");
     }
 
@@ -1004,8 +965,8 @@ mod tests {
     /// listener to the network must flip the bind explicitly.
     #[test]
     fn default_tcp_bind_is_loopback() {
-        let cfg = Config::default_for(PathBuf::from("/tmp/al-test-ws"));
-        assert_eq!(cfg.stream.tcp_bind, "127.0.0.1:8787");
+        let launch = LaunchConfig::default_for();
+        assert_eq!(launch.stream.tcp_bind, "127.0.0.1:8787");
     }
 
     /// `StreamCfg::validate` accepts any well-formed `host:port`,
@@ -1029,9 +990,9 @@ mod tests {
             "8.8.8.8:8787",
             "example.com:8787",
         ] {
-            let mut cfg = fresh_default();
-            cfg.stream.tcp_bind = ok.into();
-            if let Err(e) = cfg.validate() {
+            let mut stream = fresh_stream();
+            stream.tcp_bind = ok.into();
+            if let Err(e) = stream.validate() {
                 panic!("{ok:?} should validate but got {e}");
             }
         }
@@ -1045,9 +1006,12 @@ mod tests {
     /// shape.
     #[test]
     fn stream_cfg_rejects_empty_host_tcp_bind() {
-        let mut cfg = fresh_default();
-        cfg.stream.tcp_bind = ":8787".into();
-        let err = cfg.validate().expect_err("empty-host tcp_bind must reject").to_string();
+        let mut stream = fresh_stream();
+        stream.tcp_bind = ":8787".into();
+        let err = stream
+            .validate()
+            .expect_err("empty-host tcp_bind must reject")
+            .to_string();
         assert!(
             err.contains("empty host"),
             "diagnostic should name the empty-host shape: {err}",
@@ -1063,9 +1027,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let regular_file = dir.path().join("not-a-socket.txt");
         std::fs::write(&regular_file, b"hello").expect("write regular file");
-        let mut cfg = fresh_default();
-        cfg.stream.uds_path = regular_file.clone();
-        let err = cfg
+        let mut stream = fresh_stream();
+        stream.uds_path = regular_file.clone();
+        let err = stream
             .validate()
             .expect_err("regular-file uds_path must reject")
             .to_string();
@@ -1091,9 +1055,12 @@ mod tests {
         std::fs::write(&target, b"x").expect("write target");
         let link = dir.path().join("link.sock");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
-        let mut cfg = fresh_default();
-        cfg.stream.uds_path = link;
-        let err = cfg.validate().expect_err("symlink uds_path must reject").to_string();
+        let mut stream = fresh_stream();
+        stream.uds_path = link;
+        let err = stream
+            .validate()
+            .expect_err("symlink uds_path must reject")
+            .to_string();
         assert!(
             err.contains("symlink"),
             "diagnostic should name the symlink shape: {err}",
@@ -1110,9 +1077,9 @@ mod tests {
     #[test]
     fn stream_cfg_rejects_uds_path_with_missing_parent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut cfg = fresh_default();
-        cfg.stream.uds_path = dir.path().join("does-not-exist").join("a.sock");
-        let err = cfg
+        let mut stream = fresh_stream();
+        stream.uds_path = dir.path().join("does-not-exist").join("a.sock");
+        let err = stream
             .validate()
             .expect_err("missing-parent uds_path must reject")
             .to_string();
@@ -1127,9 +1094,9 @@ mod tests {
     /// a daemon-supervised process; require an explicit parent.
     #[test]
     fn stream_cfg_rejects_uds_path_without_parent() {
-        let mut cfg = fresh_default();
-        cfg.stream.uds_path = PathBuf::from("acoustics_lab.sock");
-        let err = cfg
+        let mut stream = fresh_stream();
+        stream.uds_path = PathBuf::from("acoustics_lab.sock");
+        let err = stream
             .validate()
             .expect_err("bare-filename uds_path must reject")
             .to_string();
@@ -1145,9 +1112,11 @@ mod tests {
     #[test]
     fn stream_cfg_accepts_uds_path_in_existing_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut cfg = fresh_default();
-        cfg.stream.uds_path = dir.path().join("a.sock");
-        cfg.validate().expect("uds_path under existing dir is fine");
+        let mut stream = fresh_stream();
+        stream.uds_path = dir.path().join("a.sock");
+        stream
+            .validate()
+            .expect("uds_path under existing dir is fine");
     }
 
     /// `TrainingDefaults::validate` rejects every
@@ -1232,7 +1201,7 @@ mod tests {
     /// `Config::validate` rejects an invalid
     /// `[training_defaults]` at TOML load time (i.e. inside
     /// `ConfigCell::load`), the same boundary at which
-    /// inference / stream / file caps already reject.
+    /// inference / file caps already reject.
     #[test]
     fn load_rejects_invalid_training_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1328,7 +1297,7 @@ mod tests {
 
         let err = h
             .mutate(|c| {
-                c.stream.broadcast_capacity = 0;
+                c.inference.top_k = 0;
             })
             .expect_err("invalid mutator result must reject");
         assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
@@ -1375,7 +1344,7 @@ mod tests {
     fn launch_load_rejects_invalid_mic_candidate() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("launch.toml");
-        let mut launch = LaunchConfig::default_for();
+        let mut launch = fresh_launch_for_load(dir.path());
         // Empty channels whitelist -- caught by catalogue validate.
         launch.mic.candidates[0].channels.clear();
         let text = toml::to_string_pretty(&launch).expect("ser");
@@ -1403,15 +1372,69 @@ mod tests {
         assert_eq!(original, back);
     }
 
-    /// First-boot default lists the canonical NPU + CPU candidates
-    /// in fall-through order.  Operators on a real device override
-    /// these to absolute paths; pinning the default here catches
-    /// silent drift in the dev workflow.
+    /// First-boot defaults include a cross-platform mock mic but no
+    /// backbone paths.  Backbone artifacts are deployment-specific;
+    /// operators must specify them in launch.toml instead of relying
+    /// on daemon-hardcoded filesystem assumptions.
     #[test]
-    fn launch_default_backbone_lists_rknn_then_burn() {
+    fn launch_default_backbone_catalogue_is_empty() {
         let l = LaunchConfig::default_for();
-        let kinds: Vec<_> = l.backbone.candidates.iter().map(|c| c.kind).collect();
-        assert_eq!(kinds, vec![BackboneKind::Rknn, BackboneKind::Burn]);
+        assert!(l.backbone.is_empty());
+    }
+
+    /// The checked-in dev fixtures are a PAIR of distinct schemas:
+    /// `misc/etc/config.toml` carries hot-reloadable user
+    /// preferences (mirrors `<workspace>/config.toml` shape), while
+    /// `misc/etc/launch.toml` carries the immutable launch
+    /// catalogues.  Pin them together so the smoke command from
+    /// `docs/BUILD.md` does not regress to a policy/catalogue or
+    /// backbone-path mismatch.
+    #[test]
+    fn bundled_etc_configs_parse_and_cross_validate() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config_path = root.join("misc/etc/config.toml");
+        let launch_path = root.join("misc/etc/launch.toml");
+
+        std::fs::create_dir_all(root.join("misc/share")).expect("bundled UDS parent");
+        let launch = LaunchConfig::load(&launch_path).expect("load bundled launch.toml");
+        let text = std::fs::read_to_string(&config_path).expect("read bundled config.toml");
+        let cfg: Config = toml::from_str(&text).expect("parse bundled config.toml");
+        cfg.validate().expect("bundled config.toml validates");
+        validate_policy_against_catalogue(&cfg.mic, &launch.mic, &config_path)
+            .expect("bundled mic policy matches bundled launch catalogue");
+        let paths: Vec<_> = launch
+            .backbone
+            .candidates
+            .iter()
+            .map(|c| c.path.as_path())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                Path::new("misc/backbones/backbone.rknn"),
+                Path::new("misc/backbones/backbone.mpk"),
+            ],
+            "bundled launch.toml must specify local dev backbone paths",
+        );
+        assert_eq!(
+            launch.head.default.as_ref().map(|h| h.path.as_path()),
+            Some(Path::new("misc/heads/default/head.mpk")),
+            "bundled launch.toml must specify the local dev default head mpk",
+        );
+        assert_eq!(
+            launch
+                .head
+                .default
+                .as_ref()
+                .map(|h| h.labels_path.as_path()),
+            Some(Path::new("misc/heads/default/labels.txt")),
+            "bundled launch.toml must specify the local dev default labels",
+        );
+        assert_eq!(
+            launch.stream.uds_path,
+            PathBuf::from("misc/share/acousticsd.sock"),
+            "bundled launch.toml must own local dev stream binds",
+        );
     }
 
     /// A launch.toml without `[[backbone.candidates]]` (older /
@@ -1423,7 +1446,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("launch.toml");
         // Write a valid catalogue but no `[backbone]` table at all.
-        let mut launch = LaunchConfig::default_for();
+        let mut launch = fresh_launch_for_load(dir.path());
         launch.backbone = BackboneCatalogue::default();
         let mut text = toml::to_string_pretty(&launch).expect("ser");
         // toml::to_string emits a `[backbone]` header even when the
@@ -1444,7 +1467,12 @@ mod tests {
     fn launch_load_rejects_malformed_backbone_hash() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("launch.toml");
-        let mut launch = LaunchConfig::default_for();
+        let mut launch = fresh_launch_for_load(dir.path());
+        launch.backbone.candidates.push(BackboneRef {
+            kind: BackboneKind::Burn,
+            path: PathBuf::from("operator-supplied/backbone.mpk"),
+            hash: None,
+        });
         // 63-char hash -- fails the 64-hex validator.
         launch.backbone.candidates[0].hash = Some("a".repeat(63));
         let text = toml::to_string_pretty(&launch).expect("ser");

@@ -15,9 +15,9 @@
 //! viable Row 7 covers what the operator's external-supervisor
 //! recovery story actually depends on:
 //!
-//! 1. Boot the daemon (writes `misc/dev.toml` + `misc/launch.toml`
-//!    via `file_mgr::put_atomic`'s tempfile + atomic-rename
-//!    discipline).
+//! 1. Boot the daemon (writes `<workspace>/config.toml` +
+//!    `misc/launch.toml` via `file_mgr::put_atomic`'s tempfile +
+//!    atomic-rename discipline).
 //! 2. SIGKILL the daemon mid-flight (skips signal handler ->
 //!    no graceful shutdown -> kernel terminates the process
 //!    immediately).
@@ -43,25 +43,14 @@ use daemon_helpers::{CheckProfile, launch_check_mode, launch_long_running};
 /// **Row 7 -- SIGKILL + respawn cycle.** Spawn daemon long-running,
 /// wait for boot completion, SIGKILL it, then spawn a SECOND
 /// daemon pointing at the same cwd and assert it boots cleanly.
-/// The `misc/dev.toml` + `misc/launch.toml` written by the first
-/// boot must survive the force-kill (atomic-rename guarantee from
-/// `file_mgr::put_atomic`); the second boot must read them
-/// without complaint.
+/// The `<workspace>/config.toml` + `misc/launch.toml` written by
+/// the first boot must survive the force-kill (atomic-rename
+/// guarantee from `file_mgr::put_atomic`); the second boot must
+/// read them without complaint.
 #[tokio::test]
 async fn lifecycle_row7_sigkill_then_respawn_clean_boot() {
-    let profile = CheckProfile {
-        check_seconds: 3,
-        mock_audio: true,
-        no_inference: true,
-        timeout: Duration::from_secs(15),
-        tcp_bind: "127.0.0.1:0".into(),
-        launch_toml_override: None,
-        extra_args: Vec::new(),
-        cwd_override: None,
-    };
-
     // MARK: Phase 1: boot + force-kill
-    let daemon = launch_long_running(profile.clone())
+    let daemon = launch_long_running(CheckProfile::default())
         .await
         .expect("daemon long-running launch must succeed (phase 1)");
     // Snapshot the cwd path BEFORE we move `daemon` into
@@ -102,11 +91,16 @@ async fn lifecycle_row7_sigkill_then_respawn_clean_boot() {
     // file is either fully there (committed) or fully absent
     // (rename never happened).  A half-written file is the
     // failure mode the contract excludes.
-    let etc_dev = cwd_path.join("misc/dev.toml");
+    //
+    // Post-CLI-redesign layout: the user-pref TOML is the
+    // workspace-internal `<workspace>/config.toml`; the launch
+    // TOML is the operator-supplied `<cwd>/misc/launch.toml`
+    // (auto-created on first boot when not pre-written).
+    let workspace_config = cwd_path.join("workspace/config.toml");
     let etc_launch = cwd_path.join("misc/launch.toml");
     assert!(
-        etc_dev.exists(),
-        "misc/dev.toml should survive SIGKILL (auto-created during phase 1 boot); \
+        workspace_config.exists(),
+        "workspace/config.toml should survive SIGKILL (auto-created during phase 1 boot); \
          cwd={cwd_path:?}",
     );
     assert!(
@@ -118,15 +112,15 @@ async fn lifecycle_row7_sigkill_then_respawn_clean_boot() {
     // half-written-then-killed scenario could leave a 0-byte
     // file if `put_atomic`'s tempfile-then-rename discipline
     // were broken).
-    let dev_size = std::fs::metadata(&etc_dev)
-        .expect("metadata dev.toml")
+    let config_size = std::fs::metadata(&workspace_config)
+        .expect("metadata workspace/config.toml")
         .len();
     let launch_size = std::fs::metadata(&etc_launch)
         .expect("metadata launch.toml")
         .len();
     assert!(
-        dev_size > 0,
-        "misc/dev.toml should be non-empty post-SIGKILL"
+        config_size > 0,
+        "workspace/config.toml should be non-empty post-SIGKILL"
     );
     assert!(
         launch_size > 0,
@@ -154,22 +148,17 @@ async fn lifecycle_row7_sigkill_then_respawn_clean_boot() {
     // MARK: Phase 2: respawn pointing at the same cwd
     //
     // Run a fresh `--check` invocation against the SAME cwd via
-    // `cwd_override` so the second boot reads the `misc/dev.toml`
-    // + `misc/launch.toml` the first boot wrote (instead of
-    // auto-creating fresh ones in a new tempdir).  Going through
+    // `cwd_override` so the second boot reads the
+    // `<workspace>/config.toml` + `misc/launch.toml` the first
+    // boot wrote (instead of auto-creating fresh ones in a new
+    // tempdir).  Going through
     // `launch_check_mode` keeps the CLI flag set + spawn shape
     // aligned with Rows 1-3 -- if the harness adds a default
     // flag later, this row picks it up automatically rather
     // than silently diverging.
     let phase2_profile = CheckProfile {
-        check_seconds: 3,
-        mock_audio: true,
-        no_inference: true,
-        timeout: Duration::from_secs(15),
-        tcp_bind: "127.0.0.1:0".into(),
-        launch_toml_override: None,
-        extra_args: Vec::new(),
         cwd_override: Some(cwd_path.clone()),
+        ..CheckProfile::default()
     };
     let phase2 = launch_check_mode(phase2_profile)
         .await

@@ -140,8 +140,8 @@ mod parity_tests {
     fn burn_backbone_parity_against_reference_logits() {
         let root = crate_root();
         let backbone_path = root.join("misc/backbones/backbone.mpk");
-        let head_path = root.join("misc/heads/00000000-default/head.mpk");
-        let labels_path = root.join("misc/heads/00000000-default/labels.txt");
+        let head_path = root.join("misc/heads/default/head.mpk");
+        let labels_path = root.join("misc/heads/default/labels.txt");
         for p in [&backbone_path, &head_path, &labels_path] {
             assert!(p.exists(), "missing test asset: {}", p.display());
         }
@@ -281,8 +281,8 @@ mod stream_e2e {
     fn stream_parity_e2e() {
         let root = crate_root();
         let backbone = root.join("misc/backbones/backbone.rknn");
-        let head_mpk = root.join("misc/heads/00000000-default/head.mpk");
-        let labels_path = root.join("misc/heads/00000000-default/labels.txt");
+        let head_mpk = root.join("misc/heads/default/head.mpk");
+        let labels_path = root.join("misc/heads/default/labels.txt");
         let waveform_path = root.join("misc/npys/waveform_0.npy");
         for p in [&backbone, &head_mpk, &labels_path, &waveform_path] {
             assert!(p.exists(), "missing test asset: {}", p.display());
@@ -440,8 +440,8 @@ mod stream_e2e {
     fn stream_parity_e2e_burn() {
         let root = crate_root();
         let backbone_path = root.join("misc/backbones/backbone.mpk");
-        let head_mpk = root.join("misc/heads/00000000-default/head.mpk");
-        let labels_path = root.join("misc/heads/00000000-default/labels.txt");
+        let head_mpk = root.join("misc/heads/default/head.mpk");
+        let labels_path = root.join("misc/heads/default/labels.txt");
         let waveform_path = root.join("misc/npys/waveform_0.npy");
         for p in [&backbone_path, &head_mpk, &labels_path, &waveform_path] {
             assert!(p.exists(), "missing test asset: {}", p.display());
@@ -566,8 +566,8 @@ mod stream_e2e {
 
         let root = crate_root();
         let backbone_path = root.join("misc/backbones/backbone.mpk");
-        let head_mpk = root.join("misc/heads/00000000-default/head.mpk");
-        let labels_path = root.join("misc/heads/00000000-default/labels.txt");
+        let head_mpk = root.join("misc/heads/default/head.mpk");
+        let labels_path = root.join("misc/heads/default/labels.txt");
         let waveform_path = root.join("misc/npys/waveform_0.npy");
         for p in [&backbone_path, &head_mpk, &labels_path, &waveform_path] {
             assert!(p.exists(), "missing test asset: {}", p.display());

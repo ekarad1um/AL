@@ -16,9 +16,9 @@ acoustics_lab/
 |-- misc/
 |   |-- backbones/                 -- backbone weights (.mpk + .rknn)
 |   |-- datasets/                  -- training datasets (operator-supplied)
-|   |-- etc/dev.toml               -- daemon config (local dev)
+|   |-- etc/config.toml            -- hot user-pref template (mirrors `<workspace>/config.toml`)
 |   |-- heads/
-|   |   |-- 00000000-default/      -- bundled default head, copied into active/ on first boot
+|   |   |-- default/               -- bundled default head, copied into active/ on first boot
 |   |       |-- head.mpk
 |   |       |-- labels.txt
 |   |-- models/                    -- TFJS source models for the converter
@@ -54,12 +54,12 @@ within fp32 rounding.
 
 | File | Size | Notes |
 |---|---|---|
-| `00000000-default/{head.mpk, labels.txt}` | 24 KiB + 113 B | 20-class Speech-Commands bundled-default; the daemon copies these into `active/generations/<activation_id>/` on first boot or when `POST /active {default: true}` runs |
+| `default/{head.mpk, labels.txt}` | 24 KiB + 113 B | 20-class Speech-Commands bundled-default; the daemon copies these into `active/generations/<activation_id>/` on first boot or when `POST /active {default: true}` runs |
 
-The fixture directory name `00000000-default/` is operator-facing
-only; the bundled default's runtime identity is the valid
-UUID-v4 `00000000-0000-4000-8000-000000000000`.  The directory
-name is never parsed as a `HeadId`.
+The fixture directory name `default/` is operator-facing only; the
+bundled default's runtime identity is the valid UUID-v4
+`00000000-0000-4000-8000-000000000000`.  The directory name is never
+parsed as a `HeadId`.
 
 Regenerable via the
 [`regen_fixtures`](../examples/regen_fixtures.rs) example —
@@ -76,13 +76,26 @@ Consumed via [`extract_head_from_tfjs_dir`](../modules/converter.rs):
   [`get_tfjs_sc_model.sh`](../misc/models/get_tfjs_sc_model.sh);
   gitignored (anchored to the top of `misc/models/`).
 
-### `misc/etc/dev.toml`
+### `misc/etc/config.toml`
 
-Local-dev daemon config.  Points at `misc/workspace/` for the
-workspace root and `misc/share/acousticsd.sock` for the UDS
-listener.  Paths resolve relative to the daemon's CWD.  No
-persisted active-head pointer here — `<workspace_root>/active/`
-is the single source.
+Bundled user-pref template.  Mirrors the shape the daemon
+auto-creates at `<workspace>/config.toml` on first boot: mic
+policy, inference cadence, training defaults, file caps.  No
+stream listener binds and no persisted active-head pointer here —
+`<workspace>/active/` is the single source for active head state.
+Operators copying the dev workflow into a real deployment can use
+this file as a starting point for `<workspace>/config.toml`; the
+daemon itself does not read `misc/etc/config.toml` directly (it
+reads `<workspace>/config.toml`).
+
+### `misc/etc/launch.toml`
+
+Local-dev launch catalogue, what `--config` points at.  Distinct
+schema from the user-pref TOML: lists mic candidates, backbone
+candidates, stream listener binds, and `[head.default]`
+(`path` + `labels_path`) read once at daemon boot.  Passing the
+same TOML to `--config` and as `<workspace>/config.toml` is
+rejected at boot.
 
 ### Runtime-only directories (gitignored)
 
@@ -121,6 +134,7 @@ through its API or wipe and recreate.
 
 ```
 <workspace_root>/
+    config.toml                                   -- mutable user-pref config; auto-created if missing
     backbone/
         backbone.mpk                              -- shared default; deployment-managed
         backbone.meta.json                        -- {sha256, n_features}
@@ -147,18 +161,31 @@ through its API or wipe and recreate.
                 manifest.json                     -- ActiveHeadManifest body
         .tmp/                                     -- activation staging
     var/run/
-        acoustics_lab.sock                        -- default UDS listener (configurable)
+        acoustics_lab.sock                        -- default UDS listener (configurable in launch TOML)
     logs/
         acousticsd.log                            -- daily rotated; 7-file retention
 ```
 
+`config.toml` is the hot-reloadable user-preference TOML
+(mic policy, inference cadence, training defaults, file caps).
+The daemon writes a default body on first boot and watches the
+file for operator edits at runtime; it lives inside the
+workspace tree so a single `--workspace <PATH>` argument is
+sufficient to locate everything mutable the daemon owns.
+
 `backbone/` is loaded at boot from a deployment-bundled file.
 Operators do not upload backbones via the API.
+
+The launch-time TOML (mic catalogue, backbone catalogue, stream
+binds, `[head.default]`) is operator-supplied via `--config <PATH>`
+and lives OUTSIDE the workspace tree so it can be deployment-
+managed independently.
 
 ### File and directory roles
 
 | Path | Role | Schema | Atomicity invariants |
 |---|---|---|---|
+| `config.toml` | Hot-reloadable user-preference TOML | [`Config`](../modules/config.rs) | Atomic rewrite (tempfile + fsync + rename); auto-created on first boot if missing |
 | `backbone/backbone.mpk` | Frozen feature extractor (shared by every workspace and the runtime engine) | Burn `.mpk` | Deployment-supplied; daemon does not mutate |
 | `backbone/backbone.meta.json` | `{sha256, n_features}` companion | JSON | Deployment-supplied |
 | `workspaces/<id>/workspace.json` | Hot core metadata; eagerly loaded into `ArcSwap<WorkspaceCore>` | [`WorkspaceCore`](#workspacecore) | Atomic rewrite via `put_atomic` (tempfile + fsync + rename + parent fsync); revision-bump precedes dataset byte mutation |
@@ -298,7 +325,7 @@ disk parse-fails through `read_workspace_core` /
 
 `activation_id` is the directory name only; not parsed as a
 `HeadId` (the operator-facing fixture path
-`misc/heads/00000000-default/` is a directory name, never an
+`misc/heads/default/` is a directory name, never an
 identifier).  `deny_unknown_fields` fails closed on a
 hand-edited or future-shape file.
 

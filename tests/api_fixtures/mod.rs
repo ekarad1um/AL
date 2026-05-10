@@ -11,14 +11,14 @@
 //! Five `tests/*.rs` files (and `modules/api/tests.rs`) used to
 //! carry near-identical 70–95 LOC `fresh_state(&Path) -> AppState`
 //! helpers.  Every difference between them was either an irrelevant
-//! comment drift or a one-field override (`bundled_default_dir`,
+//! comment drift or a one-field override (`default_head`,
 //! the wrapper struct name).  Centralising here drops each
 //! consumer to ~10 LOC and removes the drift surface — when the
 //! `AppState` shape changes, the fixture changes once.
 //!
 //! Pull in via `mod api_fixtures;` in any test binary and call
 //! `api_fixtures::fresh_app_state(tempdir.path())`.  Tests that
-//! need a non-default `bundled_default_dir` override the field
+//! need a non-default `default_head` override the field
 //! after construction (it's `pub`).
 
 use std::path::Path;
@@ -33,7 +33,9 @@ use tower::ServiceExt;
 use acoustics_lab::api::AppState;
 use acoustics_lab::common::traits::head_store::HeadStore;
 use acoustics_lab::common::traits::lag_source::{BroadcastLagSnapshot, LagSource};
-use acoustics_lab::config::{Config, ConfigCell, LaunchConfig, MicSettingsCell, MicSettingsHandle};
+use acoustics_lab::config::{
+    Config, ConfigCell, DefaultHeadRef, LaunchConfig, MicSettingsCell, MicSettingsHandle,
+};
 use acoustics_lab::file_mgr::{FsService, FsServiceImpl};
 use acoustics_lab::inference::{HeadInner, HotHead};
 use acoustics_lab::status::{StatusMonitor, StatusReporter};
@@ -149,25 +151,19 @@ impl LagSource for StubLagSource {
 }
 
 /// Build an `AppState` rooted at `dir` with the canonical test
-/// wiring: a tempdir-resolved UDS path, a freshly-persisted default
-/// `Config`, the launch catalogue's `default-mock` candidate, a
+/// wiring: a freshly-persisted default `Config`, the launch
+/// catalogue's `default-mock` candidate, a
 /// 2-class synthetic `HotHead`, an `FsServiceImpl` over
 /// `dir/workspaces/`, fresh job + status + training registries,
-/// and a stub `LagSource`.  `bundled_default_dir` defaults to
-/// `dir.join("bundled_default")` (an absent path) so an accidental
+/// and a stub `LagSource`.  `default_head` defaults to an absent
+/// file pair under `dir.join("bundled_default")` so an accidental
 /// `POST /active {default: true}` fails closed; tests that need a
 /// real bundled fixture override the field after construction.
 pub fn fresh_app_state(dir: &Path) -> AppState {
     let cfg_path = dir.join("config.toml");
     let workspace_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspace_root).expect("workspace root");
-    let mut cfg = Config::default_for(workspace_root.clone());
-    // `Config::default_for` ships `/run/acoustics_lab.sock`, which
-    // `StreamCfg::validate_uds_path` rejects on hosts without
-    // `/run` (macOS dev, sandboxed CI).  Patch to a tempdir-relative
-    // path so the fixture validates everywhere without weakening
-    // the production default.
-    cfg.stream.uds_path = dir.join("test.sock");
+    let cfg = Config::default_for(workspace_root.clone());
     let config = Arc::new(ConfigCell::from_value(cfg.clone(), cfg_path).expect("validate"));
     config.persist().expect("persist initial");
     // Mirror the daemon's boot wiring: launch catalogue ships a
@@ -207,7 +203,10 @@ pub fn fresh_app_state(dir: &Path) -> AppState {
         training,
         broadcast_lag_reader: Arc::new(StubLagSource::default()),
         active_mutex: Arc::new(parking_lot::Mutex::new(())),
-        bundled_default_dir: dir.join("bundled_default"),
+        default_head: Some(DefaultHeadRef {
+            path: dir.join("bundled_default/head.mpk"),
+            labels_path: dir.join("bundled_default/labels.txt"),
+        }),
         jobs,
     }
 }

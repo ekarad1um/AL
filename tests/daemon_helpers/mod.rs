@@ -132,16 +132,17 @@ pub struct CheckProfile {
     pub tcp_bind: String,
     /// Matrix Rows 2-3 -- pre-write
     /// `<cwd>/misc/launch.toml` with this content BEFORE spawning
-    /// the daemon.  `None` lets the daemon auto-create its
-    /// default `misc/launch.toml` (Row 1 path).  `Some(toml)`
-    /// substitutes the operator-supplied launch config -- used
-    /// by Row 2 (empty backbone catalogue) and Row 3 (empty mic
-    /// catalogue).
+    /// the daemon.  `None` lets the daemon auto-create the file
+    /// from `LaunchConfig::default_for()` (Row 1 path).
+    /// `Some(toml)` substitutes the operator-supplied launch
+    /// config -- used by Row 2 (empty backbone catalogue) and
+    /// Row 3 (empty mic catalogue).
     ///
     /// The harness creates `<cwd>/misc/` and writes the file
-    /// before exec, so the daemon's loader (which reads
-    /// `misc/launch.toml` relative to cwd via the default
-    /// `--launch-config` value) picks it up unmodified.
+    /// before exec; the harness then passes
+    /// `--config <cwd>/misc/launch.toml` to the daemon
+    /// explicitly (the post-CLI-redesign `--config` flag has no
+    /// default, so the harness owns the path).
     pub launch_toml_override: Option<String>,
     /// Extra CLI args appended after the standard `--check
     /// --mock-audio --no-inference --tcp-bind ...` set.  Reserved
@@ -157,9 +158,10 @@ pub struct CheckProfile {
     /// `None` (the default) is the Row 1-3 path: each invocation
     /// gets its own scoped tempdir that drops at function exit.
     /// `Some(path)` is the Row 7 phase-2 path: the test wants the
-    /// second `--check` invocation to read the `misc/dev.toml` +
-    /// `misc/launch.toml` written by phase 1's SIGKILL'd daemon,
-    /// so the cwd must outlive the first daemon's lifetime.
+    /// second `--check` invocation to read the
+    /// `<workspace>/config.toml` + `misc/launch.toml` written by
+    /// phase 1's SIGKILL'd daemon, so the cwd must outlive the
+    /// first daemon's lifetime.
     /// The harness writes `misc/launch.toml` (when
     /// `launch_toml_override` is also set) and ensures `misc/`
     /// exists, but does NOT take ownership of the directory's
@@ -187,10 +189,10 @@ impl Default for CheckProfile {
 /// [`CheckRun`].
 ///
 /// The child runs in a fresh `tempfile::TempDir` as its cwd so
-/// the auto-created `misc/dev.toml` + `misc/launch.toml` stay
-/// scoped to this one test invocation.  The tempdir drops at the
-/// end of the function (the daemon process has already exited by
-/// then, so no file is open).
+/// the auto-created `workspace/config.toml` + `misc/launch.toml`
+/// stay scoped to this one test invocation.  The tempdir drops at
+/// the end of the function (the daemon process has already exited
+/// by then, so no file is open).
 pub async fn launch_check_mode(profile: CheckProfile) -> Result<CheckRun> {
     // Resolve the cwd: caller-supplied path (Row 7 phase 2) OR a
     // freshly-allocated tempdir (Rows 1-3).  The `_tmpdir_guard`
@@ -225,9 +227,21 @@ pub async fn launch_check_mode(profile: CheckProfile) -> Result<CheckRun> {
         std::fs::write(misc_dir.join("launch.toml"), toml)
             .context("pre-write misc/launch.toml fixture")?;
     }
+    // Workspace lives under the cwd tempdir; launch TOML defaults
+    // to `<cwd>/misc/launch.toml` (auto-created on first boot if
+    // not pre-written by `launch_toml_override`).  The launch path
+    // is passed explicitly so the daemon's required `--config`
+    // argument is satisfied without depending on a CWD-relative
+    // default that no longer exists post-CLI redesign.
+    let workspace_dir = cwd.join("workspace");
+    let launch_path = misc_dir.join("launch.toml");
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_acousticsd"));
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.current_dir(&cwd)
+        .arg("--workspace")
+        .arg(&workspace_dir)
+        .arg("--config")
+        .arg(&launch_path)
         .arg("--check")
         .arg("--check-seconds")
         .arg(profile.check_seconds.to_string())
@@ -415,11 +429,11 @@ pub struct RunningDaemon {
     /// for diagnostic dumps when a row asserts a clean shutdown but
     /// the daemon panicked instead.
     pub boot_stderr: String,
-    /// Tempdir holding `misc/dev.toml` + `misc/launch.toml` + the
-    /// auto-created `workspaces/` + `logs/` subdirs.  Owned here so
-    /// the dir survives until the test explicitly drops the
-    /// `RunningDaemon` (and therefore until after the test's
-    /// post-shutdown filesystem inspection completes).
+    /// Tempdir holding `workspace/config.toml`, `misc/launch.toml`,
+    /// and the auto-created `workspaces/` / `logs/` subdirs.
+    /// Owned here so the dir survives until the test explicitly
+    /// drops the `RunningDaemon` (and therefore until after the
+    /// test's post-shutdown filesystem inspection completes).
     tmpdir: tempfile::TempDir,
 }
 
@@ -511,7 +525,9 @@ pub struct DaemonExit {
     /// Signal number that terminated the process (`None` if natural exit).
     pub terminating_signal: Option<i32>,
     /// The daemon's cwd at termination -- tests inspect
-    /// `cwd/workspaces/`, `cwd/misc/dev.toml`, `cwd/logs/` etc.
+    /// `cwd/workspace/{config.toml,workspaces/,logs/,active/}` etc.
+    /// (the `--workspace` value the harness passes is `<cwd>/workspace`,
+    /// so all daemon-owned subtrees live under that subdir).
     pub cwd: tempfile::TempDir,
     /// Stderr captured during the boot wait.  The post-boot stderr
     /// lines (which the harness stops reading after the boot marker)
@@ -539,9 +555,15 @@ pub async fn launch_long_running(profile: CheckProfile) -> anyhow::Result<Runnin
         std::fs::write(misc_dir.join("launch.toml"), toml)
             .context("pre-write misc/launch.toml fixture")?;
     }
+    let workspace_dir = tmpdir.path().join("workspace");
+    let launch_path = misc_dir.join("launch.toml");
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_acousticsd"));
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.current_dir(tmpdir.path())
+        .arg("--workspace")
+        .arg(&workspace_dir)
+        .arg("--config")
+        .arg(&launch_path)
         .arg("--tcp-bind")
         .arg(&profile.tcp_bind)
         .stdout(std::process::Stdio::piped())

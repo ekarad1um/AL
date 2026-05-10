@@ -51,6 +51,12 @@ source = { kind = "mock", period_size = 512, sample_rate = 44100, waveforms = [{
 
 [backbone]
 candidates = []
+
+[stream]
+uds_path = "misc/acousticsd.sock"
+uds_mode = 438
+tcp_bind = "127.0.0.1:0"
+broadcast_capacity = 64
 "#;
 
 /// **Row 2 -- no backbone available.** Pre-write a launch config

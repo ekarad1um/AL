@@ -131,12 +131,10 @@ pub struct AppState {
     /// the entire critical section runs on one `spawn_blocking`
     /// worker -- the guard never crosses `.await`.
     pub active_mutex: Arc<parking_lot::Mutex<()>>,
-    /// Path to the deployment-bundled default head fixture
-    /// (`misc/heads/00000000-default/`).  Sourced on every
-    /// `POST /active {default: true}` and used by boot-time
-    /// recovery as the last-resort fallback.  Resolved once at
-    /// daemon boot, cwd-relative.
-    pub bundled_default_dir: std::path::PathBuf,
+    /// Optional deployment-bundled default head file pair.  Sourced
+    /// on `POST /active {default: true}`.  Resolved once at daemon
+    /// boot from the launch config.
+    pub default_head: Option<crate::config::DefaultHeadRef>,
     /// Cross-cutting in-process job registry.  Owns the admission
     /// gate (per-`JobType` concurrency caps plus reference-overlap
     /// detection), the per-job event ring for SSE replay, the

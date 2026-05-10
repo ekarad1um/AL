@@ -30,9 +30,9 @@ use crate::api::extract::ApiJson;
 use crate::common::ids::{HeadId, WorkspaceId};
 use crate::common::workspace::{ActiveHeadManifest, ActiveOrigin, WorkspaceRevision};
 use crate::file_mgr::active_head_writer::{
-    ActivationError, ActivationOriginInput, ActivationResult, HeadInnerLoader, PendingActivation,
-    prune_old_generations, publish_active_generation, stage_and_validate_activation,
-    staging_path_for,
+    ActivationError, ActivationOriginInput, ActivationResult, DefaultHeadSource, HeadInnerLoader,
+    PendingActivation, prune_old_generations, publish_active_generation,
+    stage_and_validate_activation, staging_path_for,
 };
 
 /// `POST /active` body: either `{workspace_id, head_id}` to activate
@@ -171,10 +171,7 @@ async fn post_active(
         let summary = task::spawn_blocking(move || files.summary(&workspace_id))
             .await?
             .map_err(|e| {
-                crate::api::routes::workspace::classify_workspace_existence_error(
-                    &workspace_id,
-                    e,
-                )
+                crate::api::routes::workspace::classify_workspace_existence_error(&workspace_id, e)
             })?;
         if !summary.heads.heads.iter().any(|r| r.head_id == head_id) {
             return Err(ApiError::NotFound(format!(
@@ -199,7 +196,7 @@ async fn post_active(
     //     `current.json` pointing at a missing dir.
     let active_mutex = state.active_mutex.clone();
     let files = state.files.clone();
-    let bundled = state.bundled_default_dir.clone();
+    let default_head = state.default_head.clone();
     let head = state.head.clone();
     let (activation_id, manifest) =
         task::spawn_blocking(move || -> Result<(String, ActiveHeadManifest), ApiError> {
@@ -247,14 +244,22 @@ async fn post_active(
                             workspace_id,
                             head_id,
                         },
-                        &bundled,
                     )?
                 }
-                ActivateRequest::Default(_) => stage_and_publish_activation(
-                    files.root(),
-                    ActivationOriginInput::Default,
-                    &bundled,
-                )?,
+                ActivateRequest::Default(_) => {
+                    let default_head = default_head
+                        .as_ref()
+                        .ok_or_else(|| ApiError::Bad("head.default not configured".into()))?;
+                    stage_and_publish_activation(
+                        files.root(),
+                        ActivationOriginInput::Default {
+                            source: DefaultHeadSource {
+                                path: &default_head.path,
+                                labels_path: &default_head.labels_path,
+                            },
+                        },
+                    )?
+                }
             };
 
             // Install AFTER `current.json` is durable so on-disk
@@ -295,13 +300,11 @@ async fn post_active(
 fn stage_and_publish_activation(
     root: &Path,
     origin_input: ActivationOriginInput<'_>,
-    bundled_default_dir: &Path,
 ) -> Result<ActivationResult, ActivationError> {
     let staged = stage_and_validate_activation(
         PendingActivation {
             root,
             origin_input,
-            bundled_default_dir,
             now_rfc3339: crate::file_mgr::now_rfc3339(),
         },
         &runtime_head_loader(),

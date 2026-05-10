@@ -12,10 +12,55 @@ use crate::audio_io::mic_arbitrator::{
 };
 use crate::audio_io::mock::Waveform;
 use crate::common::ids::MicId;
+use crate::config::domain::StreamCfg;
 use crate::config::error::{ConfigError, parse_err, read_err, write_err};
-use crate::inference::{BackboneCatalogue, BackboneKind, BackboneRef};
+use crate::inference::BackboneCatalogue;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Launch-owned head settings.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HeadLaunchConfig {
+    /// Optional deployment-bundled default head.  When omitted,
+    /// boot recovery and `POST /active { default: true }` cannot
+    /// fall back to a bundled classifier.
+    #[serde(default)]
+    pub default: Option<DefaultHeadRef>,
+}
+
+impl HeadLaunchConfig {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(default) = &self.default {
+            default.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Explicit file pair for the deployment-bundled default head.
+///
+/// Keeping the `.mpk` and labels paths separate avoids daemon
+/// assumptions about filenames or directory layouts; a launch TOML
+/// can point at immutable assets wherever the deployment stores them.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DefaultHeadRef {
+    pub path: PathBuf,
+    pub labels_path: PathBuf,
+}
+
+impl DefaultHeadRef {
+    fn validate(&self) -> Result<(), String> {
+        if self.path.as_os_str().is_empty() {
+            return Err("head.default.path must be non-empty".into());
+        }
+        if self.labels_path.as_os_str().is_empty() {
+            return Err("head.default.labels_path must be non-empty".into());
+        }
+        Ok(())
+    }
+}
 
 /// Launch-time deployment manifest. **Read once at daemon boot;
 /// never mutated by API, never hot-reloaded.** Operators edit the
@@ -29,17 +74,23 @@ use std::path::{Path, PathBuf};
 ///   policy resolves against this catalogue at every mutation
 ///   point (boot, hot-reload, API).
 /// * [`BackboneCatalogue`] -- ordered list of inference-backbone
-///   candidates ([`BackboneKind`] + path + optional sha256).
+///   candidates ([`crate::inference::BackboneKind`] + path +
+///   optional sha256).
 ///   Loaded once at boot via
 ///   [`BackboneCatalogue::load_first_supported`]; kinds not
 ///   supported by the current build (e.g. `rknn` off cfg) are
 ///   silently skipped, so the same launch.toml can ship on both
 ///   host-dev macOS and aarch64 Rockchip devices.
+/// * [`StreamCfg`] -- listener binds and stream admission policy.
+///   Startup-only: not hot-reloaded and not API-mutable.
+/// * [`HeadLaunchConfig`] -- optional explicit file pair for the
+///   deployment-bundled default classifier head.
 ///
 /// Future fields (host id, hardware-specific tuning constants, etc.)
 /// can land here without disturbing the user-pref TOML's reload
 /// semantics.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchConfig {
     pub mic: MicCatalogue,
     /// Ordered list of inference-backbone candidates.  `#[serde(default)]`
@@ -49,6 +100,14 @@ pub struct LaunchConfig {
     /// missing).
     #[serde(default)]
     pub backbone: BackboneCatalogue,
+    /// Stream listener binds + websocket admission policy.  Read
+    /// once at boot so stream endpoints are not hot-configurable.
+    pub stream: StreamCfg,
+    /// Default-head launch settings.  `#[serde(default)]` keeps
+    /// launch TOMLs without a bundled default valid; those daemons
+    /// simply boot without bundled-default recovery.
+    #[serde(default)]
+    pub head: HeadLaunchConfig,
 }
 
 impl LaunchConfig {
@@ -56,10 +115,10 @@ impl LaunchConfig {
     /// the daemon produces audio on a fresh macOS dev workstation
     /// without hand-editing the launch TOML -- mirrors the previous
     /// `Config::default_for` mock-audio fallback, just in the
-    /// launch-immutable layer.  The backbone catalogue lists the
-    /// canonical NPU + CPU candidates under `misc/` so a
-    /// stock dev workflow keeps booting; operators on a real device
-    /// override these to absolute paths in their own launch.toml.
+    /// launch-immutable layer.  The backbone catalogue is empty by
+    /// default: deployments must name concrete backbone artifacts in
+    /// their launch TOML instead of inheriting daemon-hardcoded
+    /// paths.
     pub fn default_for() -> Self {
         Self {
             mic: MicCatalogue {
@@ -76,23 +135,9 @@ impl LaunchConfig {
                     channels: vec![0],
                 }],
             },
-            backbone: BackboneCatalogue {
-                candidates: vec![
-                    // Production NPU path (used on Linux + rknpu builds;
-                    // silently skipped elsewhere by the loader).
-                    BackboneRef {
-                        kind: BackboneKind::Rknn,
-                        path: PathBuf::from("misc/backbone.rknn"),
-                        hash: None,
-                    },
-                    // CPU fallback (always supported).
-                    BackboneRef {
-                        kind: BackboneKind::Burn,
-                        path: PathBuf::from("misc/backbone.mpk"),
-                        hash: None,
-                    },
-                ],
-            },
+            backbone: BackboneCatalogue::default(),
+            stream: StreamCfg::default(),
+            head: HeadLaunchConfig::default(),
         }
     }
 
@@ -115,6 +160,14 @@ impl LaunchConfig {
                 msg: format!("launch backbone catalogue: candidate[{idx}]: {err}"),
             });
         }
+        cfg.stream.validate().map_err(|err| ConfigError::Invalid {
+            path: path.display().to_string(),
+            msg: format!("launch stream: {err}"),
+        })?;
+        cfg.head.validate().map_err(|err| ConfigError::Invalid {
+            path: path.display().to_string(),
+            msg: format!("launch head: {err}"),
+        })?;
         Ok(cfg)
     }
 

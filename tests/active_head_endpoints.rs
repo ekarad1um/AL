@@ -5,8 +5,8 @@
 //! against a tempdir-rooted workspace.  The bundled-default
 //! fixture is a hand-rolled `head.mpk` (with the ACSTHEAD
 //! header) + `labels.txt` written into a per-test directory so
-//! the daemon's `bundled_default_dir` can point at it without
-//! depending on the in-tree `misc/heads/00000000-default/`
+//! the daemon's `default_head` can point at it without
+//! depending on the in-tree `misc/heads/default/`
 //! checked-in fixture.
 //!
 //! Coverage:
@@ -34,20 +34,21 @@ use acoustics_lab::common::ids::{HeadId, WorkspaceId};
 use acoustics_lab::common::workspace::{
     HeadIndex, HeadManifest, HeadRecord, WorkspaceCore, WorkspaceRevision,
 };
+use acoustics_lab::config::DefaultHeadRef;
 use axum::http::{Method, StatusCode};
 
 mod api_fixtures;
 use api_fixtures::{call, fresh_app_state, json_body};
 
 /// Build an API state pointing at a tempdir.  The
-/// `bundled_default_dir` is staged with a real `head.mpk` (via
-/// the in-tree Burn recorder + ACSTHEAD header) so
+/// `default_head` is staged with a real `head.mpk` (via the
+/// in-tree Burn recorder + ACSTHEAD header) so
 /// `POST /active {default: true}` exercises the full pipeline.
 /// The remaining wiring is shared with the other integration
 /// binaries via [`fresh_app_state`].
 fn fresh_state(dir: &Path) -> AppState {
     let mut state = fresh_app_state(dir);
-    state.bundled_default_dir = stage_bundled_default(dir);
+    state.default_head = Some(stage_bundled_default(dir));
     state
 }
 
@@ -55,7 +56,7 @@ fn fresh_state(dir: &Path) -> AppState {
 /// `<dir>/bundled_default/`.  The `head.mpk` is real (Burn
 /// recorder + ACSTHEAD header) so the runtime preload via
 /// `HotHead::load` succeeds.
-fn stage_bundled_default(dir: &Path) -> std::path::PathBuf {
+fn stage_bundled_default(dir: &Path) -> DefaultHeadRef {
     use acoustics_lab::common::head_header::write_with_payload;
     use acoustics_lab::model::Head;
     use burn::backend::NdArray;
@@ -85,7 +86,10 @@ fn stage_bundled_default(dir: &Path) -> std::path::PathBuf {
     // Cleanup: drop the raw bytes so the fixture only exposes
     // `head.mpk` + `labels.txt`.
     let _ = std::fs::remove_file(&raw_mpk);
-    bundled
+    DefaultHeadRef {
+        path: bundled.join("head.mpk"),
+        labels_path: bundled.join("labels.txt"),
+    }
 }
 
 /// Stage a real trained head into a hand-rolled workspace
