@@ -42,8 +42,13 @@ async fn get_inference(
 #[serde(deny_unknown_fields)]
 struct SetInferenceReq {
     /// Stride in samples between successive windows.  Must be
-    /// in `1..=InferenceCfg::MAX_HOP_SAMPLES` (= `WaveformLen *
-    /// 3 / 4`) so successive windows overlap by at least 25%.
+    /// in `InferenceCfg::MIN_HOP_SAMPLES..=InferenceCfg::MAX_HOP_SAMPLES`
+    /// (= `sample_rate * (1 - MAX_OVERLAP_RATIO) ..= sample_rate`,
+    /// i.e. `11_025..=44_100` at 44.1 kHz).  The lower bound caps
+    /// per-window overlap at 75% so the engine doesn't burn CPU
+    /// re-running on near-identical audio; the upper bound caps
+    /// cadence at 1 Hz to match the Google Speech-Commands /
+    /// Teachable-Machine stride convention.
     pub hop_samples: Option<usize>,
     /// Number of TopK entries per emitted frame.  1..=64.
     pub top_k: Option<usize>,

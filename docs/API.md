@@ -709,7 +709,7 @@ Read the live inference cadence.
 
 Response:
 ```json
-{ "cfg": { "hop_samples": 1024, "top_k": 3 } }
+{ "cfg": { "hop_samples": 11025, "top_k": 3 } }
 ```
 
 ### `POST /api/v1/inference`
@@ -719,11 +719,16 @@ the current value.
 
 Request:
 ```json
-{ "hop_samples": 2048, "top_k": 5 }
+{ "hop_samples": 22050, "top_k": 5 }
 ```
 
-Constraints: `hop_samples` in `1..=33024` (`WaveformLen * 3 / 4`);
-`top_k` in `1..=64`.
+Constraints: `hop_samples` in `11025..=44100`
+(`sample_rate * (1 - max_overlap_ratio) ..= sample_rate`, with
+`max_overlap_ratio = 0.75` at the 44.1 kHz capture rate); `top_k`
+in `1..=64`.  The lower bound caps per-window overlap at 75%
+so the engine does not re-run inference on near-identical
+audio; the upper bound caps cadence at 1 Hz to match the
+Google Speech-Commands / Teachable-Machine stride convention.
 
 Response: same shape as `GET /api/v1/inference`, with the
 merged config.

@@ -1620,7 +1620,9 @@ mod tests {
     /// "value is in writer range" would still pass -- false negative.
     /// Defaults: `mic = Auto`, `inference.hop_samples = 11_025`.  We
     /// pick mic = `mic-N` (Fixed, N < 1000) and hop_samples in
-    /// `[100_000, 100_200)` -- both clearly distinct from defaults.
+    /// `[22_000, 22_200)` -- both clearly distinct from the
+    /// default and well inside the `MIN_HOP_SAMPLES..=MAX_HOP_SAMPLES`
+    /// validator window (= `11_025..=44_100` at 44.1 kHz).
     #[test]
     fn concurrent_mutate_preserves_disjoint_field_updates() {
         use std::sync::Arc;
@@ -1665,11 +1667,12 @@ mod tests {
                 h2.mutate(|c| {
                     let id = inf_seq_w.fetch_add(1, Ordering::Relaxed);
                     // Pick a base inside `hop_samples`'s
-                    // `1..=MAX_HOP_SAMPLES` window so
-                    // `mutate_then`'s validator passes;
+                    // `MIN_HOP_SAMPLES..=MAX_HOP_SAMPLES`
+                    // window (= 11_025..=44_100 at 44.1 kHz)
+                    // so `mutate_then`'s validator passes;
                     // uniqueness is still guaranteed by the seq
-                    // counter (id < 200, base + id <
-                    // 22 200 << MAX_HOP_SAMPLES).
+                    // counter (id < 200, base + id < 22 200
+                    // < MAX_HOP_SAMPLES = 44_100).
                     c.inference.hop_samples = 22_000 + id as usize;
                     let _ = i;
                 })

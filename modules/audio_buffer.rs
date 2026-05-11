@@ -627,6 +627,27 @@ impl Reader {
     pub fn tail(&self) -> u64 {
         self.tail
     }
+
+    /// Sample count currently readable: `head - tail`.  Loaded
+    /// with `Acquire` so it synchronizes-with the writer's
+    /// `Release`-store on head; the value is a lower bound by
+    /// the time the caller inspects it (the writer may have
+    /// pushed more in the interim).
+    ///
+    /// Used by the inference engine to defer
+    /// [`Reader::advance`] when `hop_samples > WaveformLen`:
+    /// the per-frame [`Reader::peek_into`] only guarantees
+    /// `WaveformLen` samples are available, so advancing
+    /// further would trip `advance`'s `tail <= head` assertion.
+    /// `available()` lets the engine poll for the extra
+    /// samples before advancing.  `saturating_sub` covers the
+    /// (cold-boot / `reader_at`) case where `tail` was placed
+    /// ahead of head and the value would otherwise underflow.
+    #[inline]
+    pub fn available(&self) -> u64 {
+        let head = self.inner.head.load(Ordering::Acquire);
+        head.saturating_sub(self.tail)
+    }
 }
 
 #[cfg(test)]
@@ -866,6 +887,32 @@ mod tests {
         out.fill(0.0);
         assert_eq!(r.peek_into(&mut out), ReadStatus::Ready);
         assert_eq!(out, [10.0, 20.0, 30.0]);
+    }
+
+    /// `Reader::available()` tracks the writer's head relative to
+    /// the reader's tail.  Exercised by the inference engine's
+    /// "wait until enough samples to advance by hop" loop when
+    /// `hop_samples > WaveformLen` (peek-Ready alone would not
+    /// suffice for the advance assertion).
+    #[test]
+    fn available_tracks_head_minus_tail() {
+        let buf = AudioBuffer::new(64);
+        let mut w = buf.take_writer();
+        let mut r = buf.reader();
+        // Fresh reader at the live edge: nothing to read.
+        assert_eq!(r.available(), 0);
+        w.push(&[1.0, 2.0, 3.0]);
+        assert_eq!(r.available(), 3);
+        // peek_into without advance leaves the count untouched.
+        let mut out = [0.0; 3];
+        assert_eq!(r.peek_into(&mut out), ReadStatus::Ready);
+        assert_eq!(r.available(), 3);
+        // advance consumes from the count.
+        r.advance(2);
+        assert_eq!(r.available(), 1);
+        // Another push grows it again.
+        w.push(&[4.0, 5.0]);
+        assert_eq!(r.available(), 3);
     }
 
     #[test]

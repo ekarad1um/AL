@@ -27,6 +27,16 @@
 //! `seek_latest(WaveformLen::USIZE)` and skip one frame: the audible glitch
 //! has already happened, no point compounding it by chasing the
 //! backlog.
+//!
+//! When `hop_samples > WaveformLen::USIZE` (only at the very top of
+//! the configured range, e.g. 1 Hz cadence with `hop = sample_rate`)
+//! the peek-Ready guarantee `head - tail >= WaveformLen` is not
+//! sufficient for `Reader::advance(hop_samples)`'s `tail <= head`
+//! assertion.  Before each advance we poll `Reader::available` and
+//! sleep on the same `wait_sleep` until the writer has pushed the
+//! remaining `hop - WaveformLen` samples (~1.5 ms at the upper
+//! bound).  In steady state this loop is a no-op because inference
+//! latency already covers the catchup window.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -106,8 +116,13 @@ pub struct InferenceCfg {
     /// Stride between successive windows, in samples.  The first
     /// inference fires once `WaveformLen::USIZE` samples are buffered;
     /// subsequent fires advance the reader by this many samples.
+    /// Valid range (see [`Self::MIN_HOP_SAMPLES`] /
+    /// [`Self::MAX_HOP_SAMPLES`]): `11_025..=44_100` at 44.1 kHz,
+    /// equivalently `(sample_rate * (1 - max_overlap_ratio))..=sample_rate`.
     /// Typical values: 11_025 (250 ms hop, 4 Hz cadence) for
-    /// real-time UI; 22_050 (500 ms hop) when CPU is constrained.
+    /// real-time UI; 22_050 (500 ms hop) when CPU is constrained;
+    /// 44_100 (1 s hop, 1 Hz cadence) for low-power inference at
+    /// the Speech-Commands / Teachable-Machine default rate.
     /// Smaller hops cost more CPU but reduce per-frame latency.
     pub hop_samples: usize,
 
@@ -119,21 +134,57 @@ pub struct InferenceCfg {
 impl Default for InferenceCfg {
     fn default() -> Self {
         Self {
-            hop_samples: 11_025, // 250 ms @ 44.1 kHz
+            // Busy end of the cadence range (250 ms hop, 4 Hz) so
+            // fresh-install UX feels responsive.  Referencing the
+            // const (not the 11_025 literal) tracks any future
+            // retune of the overlap policy.
+            hop_samples: Self::MIN_HOP_SAMPLES,
             top_k: 3,
         }
     }
 }
 
 impl InferenceCfg {
-    /// Largest accepted `hop_samples`, capped so successive
-    /// inference windows overlap by at least 25%.  Equivalently
-    /// the operator-tunable overlap ratio `(WaveformLen - hop) /
-    /// WaveformLen` is constrained to `[0.25, 1.0)` (`hop = 0`
-    /// is rejected by the lower bound below).  At the upper
-    /// bound (`hop = MAX_HOP_SAMPLES`) overlap is exactly 25%;
-    /// at the lower bound (`hop = 1`) overlap is ~100%.
-    pub const MAX_HOP_SAMPLES: usize = WaveformLen::USIZE * 3 / 4;
+    /// Largest fraction of the inference window that successive
+    /// hops are allowed to overlap.  Caps how aggressively an
+    /// operator can shorten the hop: at 75% overlap the engine
+    /// re-classifies the same audio four times per window, which
+    /// is the practical ceiling before per-frame work stops
+    /// adding information and starts wasting CPU.  Mirrors the
+    /// Google Speech-Commands / Teachable-Machine convention
+    /// where `stride >= window * (1 - overlap)`.
+    ///
+    /// Drives [`Self::MIN_HOP_SAMPLES`] via const-evaluated float
+    /// math (stable since Rust 1.83), so a retune of this ratio
+    /// retunes the lower bound in lockstep.
+    pub const MAX_OVERLAP_RATIO: f32 = 0.75;
+
+    /// Smallest accepted `hop_samples`.  Derived from
+    /// [`Self::MAX_OVERLAP_RATIO`] as `sample_rate * (1 -
+    /// MAX_OVERLAP_RATIO)` — at 44.1 kHz with the canonical
+    /// 0.75 ratio this is 11_025 samples (250 ms hop, 4 Hz
+    /// cadence — the busy end of real-time UI cadence).
+    /// Smaller hops would overlap more than 75% of the window
+    /// and burn CPU re-running the backbone on essentially the
+    /// same audio.  Float arithmetic is exact at the canonical
+    /// `(44_100, 0.75)` pair (both inputs and the `0.25`
+    /// difference are representable in f32; product is 11025.0
+    /// exactly) and `as usize` truncates toward zero, matching
+    /// the integer-floor semantics expected for sample counts.
+    pub const MIN_HOP_SAMPLES: usize =
+        ((SAMPLE_RATE_HZ as f32) * (1.0 - Self::MAX_OVERLAP_RATIO)) as usize;
+
+    /// Largest accepted `hop_samples`.  Set to `sample_rate =
+    /// 44_100` (1 inference per wall-clock second), matching
+    /// the relaxed end of the Speech-Commands stride range.
+    /// Note this exceeds [`WaveformLen::USIZE`] (44_032) by 68
+    /// samples (~1.5 ms): at the upper bound successive windows
+    /// are non-overlapping with a tiny inter-window gap.  The
+    /// engine handles that case by waiting on
+    /// [`crate::audio_buffer::Reader::available`] before
+    /// `advance`, so the buffer's `tail <= head` invariant
+    /// holds.
+    pub const MAX_HOP_SAMPLES: usize = SAMPLE_RATE_HZ as usize;
 
     /// Hard cap on `top_k`.  The runtime allocates a small fixed
     /// buffer; keeping the cap modest avoids surprising memory
@@ -147,9 +198,10 @@ impl InferenceCfg {
     /// `validate` is the explicit-reject hook for the API + config
     /// loaders that take operator input.
     pub fn validate(&self) -> Result<(), String> {
-        if self.hop_samples == 0 || self.hop_samples > Self::MAX_HOP_SAMPLES {
+        if self.hop_samples < Self::MIN_HOP_SAMPLES || self.hop_samples > Self::MAX_HOP_SAMPLES {
             return Err(format!(
-                "hop_samples must be 1..={}; got {}",
+                "hop_samples must be {}..={}; got {}",
+                Self::MIN_HOP_SAMPLES,
                 Self::MAX_HOP_SAMPLES,
                 self.hop_samples
             ));
@@ -422,6 +474,24 @@ impl InferenceEngine {
             let window_start_tail = reader.tail();
             // Ready: advance tail by hop_samples (NOT WaveformLen --
             // successive windows overlap by WaveformLen - hop_samples).
+            //
+            // When `hop_samples > WaveformLen::USIZE` (only possible
+            // at the very top of the configured range, where 1 Hz
+            // cadence is requested) the peek-Ready outcome only
+            // guarantees head - tail >= WaveformLen, not >= hop.
+            // Directly calling `advance` here would trip its
+            // `tail <= head` assertion.  Spin on `Reader::available`
+            // until the writer catches up; in practice this is a
+            // no-op because inference latency already dwarfs the
+            // ~1.5 ms head-catchup window (max hop - WaveformLen =
+            // 68 samples at 44.1 kHz).
+            while (reader.available() as usize) < hop_samples {
+                if shutdown.is_cancelled() {
+                    return Ok(());
+                }
+                self.send_heartbeat_state(EngineState::Waiting, &counters);
+                std::thread::sleep(wait_sleep);
+            }
             reader.advance(hop_samples);
 
             // Per-frame timestamps
@@ -659,6 +729,61 @@ mod tests {
         let c = InferenceCfg::default();
         assert_eq!(c.hop_samples, 11_025);
         assert_eq!(c.top_k, 3);
+    }
+
+    /// `hop_samples` bounds derive from the sample rate and the
+    /// 75% max-overlap policy: `[sample_rate/4, sample_rate]`
+    /// = `[11_025, 44_100]` at 44.1 kHz.  Pinning the literals
+    /// here so a future tuning of `MAX_OVERLAP_RATIO` or
+    /// `SAMPLE_RATE_HZ` shows up as a deliberate test edit, not
+    /// an accidental drift.
+    #[test]
+    fn hop_samples_bounds_match_sample_rate_policy() {
+        assert_eq!(InferenceCfg::MIN_HOP_SAMPLES, 11_025);
+        assert_eq!(InferenceCfg::MAX_HOP_SAMPLES, 44_100);
+        // Default sits at the busy end (4 Hz cadence) — i.e.
+        // operators can only widen the hop from the default,
+        // not narrow it further.
+        assert_eq!(
+            InferenceCfg::default().hop_samples,
+            InferenceCfg::MIN_HOP_SAMPLES,
+        );
+        // The upper bound exceeds WaveformLen, which the engine
+        // hot loop handles via `Reader::available`-gated advance.
+        // Pinning via a `const` ensures the relation is a build-time
+        // invariant rather than a runtime check on constants.
+        const _: () = assert!(InferenceCfg::MAX_HOP_SAMPLES > WaveformLen::USIZE);
+    }
+
+    /// `validate` rejects hop values outside the
+    /// `[MIN_HOP_SAMPLES, MAX_HOP_SAMPLES]` window and accepts
+    /// the inclusive endpoints.
+    #[test]
+    fn validate_rejects_out_of_range_hop() {
+        let base = InferenceCfg::default();
+
+        // Below MIN: rejected.
+        let mut c = base;
+        c.hop_samples = InferenceCfg::MIN_HOP_SAMPLES - 1;
+        let err = c.validate().expect_err("below min must reject");
+        assert!(err.contains("hop_samples"), "{err}");
+
+        // Zero is well below MIN: still rejected.
+        let mut c = base;
+        c.hop_samples = 0;
+        c.validate().expect_err("zero must reject");
+
+        // Above MAX: rejected.
+        let mut c = base;
+        c.hop_samples = InferenceCfg::MAX_HOP_SAMPLES + 1;
+        c.validate().expect_err("above max must reject");
+
+        // Inclusive endpoints: accepted.
+        let mut c = base;
+        c.hop_samples = InferenceCfg::MIN_HOP_SAMPLES;
+        c.validate().expect("min must accept");
+        c.hop_samples = InferenceCfg::MAX_HOP_SAMPLES;
+        c.validate().expect("max must accept");
     }
 
     /// Heartbeat default has at-now and Starting state.
