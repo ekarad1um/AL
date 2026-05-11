@@ -993,11 +993,7 @@ impl WorkspaceMgr {
         let cell = Arc::new(crate::file_mgr::cache::WorkspaceCacheCell::load_from_disk(
             &workspace_dir,
         )?);
-        Ok(self
-            .caches
-            .entry(*ws)
-            .or_insert_with(|| cell.clone())
-            .clone())
+        Ok(self.caches.entry(*ws).or_insert(cell).clone())
     }
 
     /// Workspace-wide [`JobType::WorkspaceDelete`] handle for

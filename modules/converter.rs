@@ -559,62 +559,28 @@ pub fn write_head_artifacts(
     let labels_txt = dst_dir.join("labels.txt");
     let metadata_json = dst_dir.join("metadata.json");
 
-    // 1. Build a Burn Head with the correct n_classes and load
-    //    weights.  Use the validating constructor so any class
-    //    count that slipped past the parser-side check still hits
-    //    the model boundary's own 1..=MAX_N_CLASSES guard before
-    //    reaching Burn's allocator.
-    let device: burn::tensor::Device<B> = Default::default();
-    let mut head = Head::<B>::try_new(weights.n_classes, &device).map_err(|e| match e {
-        model::Error::BadClassCount { got, max } => ConvertError::BadClassCount { got, max },
-        other => ConvertError::Tensor(format!("head construct: {other}")),
-    })?;
-    let kernel_tensor = Tensor::<B, 2>::from_data(
-        TensorData::new(weights.kernel.clone(), [weights.in_dim, weights.n_classes]),
-        &device,
-    );
-    let bias_tensor = Tensor::<B, 1>::from_data(
-        TensorData::new(weights.bias.clone(), [weights.n_classes]),
-        &device,
-    );
-    head.linear.weight = Param::from_tensor(kernel_tensor);
-    head.linear.bias = Some(Param::from_tensor(bias_tensor));
-
-    // 2. Serialize the head to bytes in memory via Burn's bytes
-    //    recorder, then prepend the 32-byte ACSTHEAD header
-    //    (feature_dim + num_classes + payload_len + CRC32).  One
-    //    `put_atomic` call publishes the whole blob -- no
+    // 1. Build the ACSTHEAD-wrapped .mpk blob in memory.  One
+    //    `put_atomic` call below publishes the whole blob -- no
     //    `head-partial-*` / `head-with-header-partial-*` siblings
     //    ever appear under `dst_dir`, which closes the
-    //    "recorder return != data on disk" gap
-    //    (the prior `NamedMpkFileRecorder` returned without
-    //    `sync_all`, so a hard-crash between recorder return and
-    //    the read-back-and-prepend dance could SHA in zeroes /
-    //    stale pagecache).
-    let recorder = NamedMpkBytesRecorder::<FullPrecisionSettings>::new();
-    let payload = recorder
-        .record(head.into_record(), ())
-        .map_err(|e| ConvertError::Record(format!("{e}")))?;
-    let header = crate::common::head_header::serialize_header(
-        weights.in_dim as u32,
-        weights.n_classes as u32,
-        payload.len() as u32,
-    );
-    let mut head_blob: Vec<u8> = Vec::with_capacity(header.len() + payload.len());
-    head_blob.extend_from_slice(&header);
-    head_blob.extend_from_slice(&payload);
+    //    "recorder return != data on disk" gap (the prior
+    //    `NamedMpkFileRecorder` returned without `sync_all`, so a
+    //    hard-crash between recorder return and the
+    //    read-back-and-prepend dance could SHA in zeroes / stale
+    //    pagecache).
+    let head_blob = build_head_mpk_blob(weights)?;
     fs.put_atomic(&head_mpk, &head_blob).map_err(|e| {
         convert_write_err(head_mpk.display(), std::io::Error::other(format!("{e}")))
     })?;
 
-    // 3. labels.txt -- one label per line, no trailing whitespace.
+    // 2. labels.txt -- one label per line, no trailing whitespace.
     let labels_blob = labels.join("\n") + "\n";
     fs.put_atomic(&labels_txt, labels_blob.as_bytes())
         .map_err(|e| {
             convert_write_err(labels_txt.display(), std::io::Error::other(format!("{e}")))
         })?;
 
-    // 4. metadata.json (last; presence = converter run committed)
+    // 3. metadata.json (last; presence = converter run committed)
     let meta = ConversionMetadata {
         schema_version: 1,
         source_kind,
@@ -802,6 +768,14 @@ pub(crate) fn parse_tfjs_manifest_with_limits(
                     msg: format!("`{name}`: missing or not an array"),
                 })?;
             let mut shape: Vec<usize> = Vec::with_capacity(shape_arr.len());
+            // Cloned on each call so the error carries the partial
+            // shape accumulated up to the failing dim.  Takes args
+            // (rather than capturing) so the loop below can keep
+            // mutating `shape` between calls.
+            let overflow = |name: &str, shape: &[usize]| ConvertError::TfjsShapeOverflow {
+                name: name.to_string(),
+                shape: shape.to_vec(),
+            };
             for d in shape_arr {
                 let n = d.as_u64().ok_or_else(|| ConvertError::TfjsParse {
                     what: "weight.shape[]",
@@ -811,10 +785,7 @@ pub(crate) fn parse_tfjs_manifest_with_limits(
                 // declare a u64 dim that doesn't fit in usize.  Carry
                 // the partial shape through the error so the
                 // operator sees which dim blew up, not just the name.
-                let n_us = usize::try_from(n).map_err(|_| ConvertError::TfjsShapeOverflow {
-                    name: name.clone(),
-                    shape: shape.clone(),
-                })?;
+                let n_us = usize::try_from(n).map_err(|_| overflow(&name, &shape))?;
                 shape.push(n_us);
             }
             // Reject zero dimensions BEFORE the product-checked
@@ -837,17 +808,11 @@ pub(crate) fn parse_tfjs_manifest_with_limits(
             for &d in &shape {
                 count = count
                     .checked_mul(d)
-                    .ok_or_else(|| ConvertError::TfjsShapeOverflow {
-                        name: name.clone(),
-                        shape: shape.clone(),
-                    })?;
+                    .ok_or_else(|| overflow(&name, &shape))?;
             }
             let len_bytes = count
                 .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| ConvertError::TfjsShapeOverflow {
-                    name: name.clone(),
-                    shape: shape.clone(),
-                })?;
+                .ok_or_else(|| overflow(&name, &shape))?;
             // For potential head kernels and biases, gate on
             // the declared class-count dimension FIRST -- it's
             // the more specific diagnostic and operators care
@@ -1491,9 +1456,12 @@ fn read_labels_from_path(
     Ok(labels)
 }
 
-/// Build the ACSTHEAD-wrapped `.mpk` payload as one in-memory blob;
-/// the caller stages it under `.tmp/` and publishes through the head
-/// rotation primitive.
+/// Build the ACSTHEAD-wrapped `.mpk` payload as one in-memory blob.
+/// Callers pair this with [`FsService::put_atomic`] -- either
+/// directly into `<dst_dir>/head.mpk` (the
+/// [`write_head_artifacts`] path) or after staging under `.tmp/`
+/// for publication through the head rotation primitive (the
+/// convert-pipeline path).
 fn build_head_mpk_blob(weights: &HeadWeights) -> Result<Vec<u8>, ConvertError> {
     validate_head_class_count(weights.n_classes, &ConvertLimits::default())?;
     if weights.in_dim != BACKBONE_FEATURE_DIM {
