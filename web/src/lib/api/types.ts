@@ -11,13 +11,54 @@ export interface WorkspaceRevision {
   at: Rfc3339;
 }
 
-export interface WorkspaceSummary {
+// GET /api/v1/workspace -- minimal entry for the list view.  The daemon
+// deliberately omits `tags`, `workspace_revision`, and any head data
+// here so the listing is a cached `workspace.json` read with no asset
+// walk; per-workspace detail (incl. heads) lives on `WorkspaceDetail`.
+export interface WorkspaceListEntry {
+  id: Uuid;
+  name: string;
+  created_at: Rfc3339;
+}
+
+// GET /api/v1/workspace/{id} -- hot summary that does NOT walk the
+// asset tree.  `tags` is intentionally not on the wire here either
+// (only POST/PATCH responses carry it); operator-tag UI reads tags
+// from a prior mutation or refetches via PATCH-no-op when needed.
+export interface WorkspaceDetail {
+  id: Uuid;
+  name: string;
+  created_at: Rfc3339;
+  workspace_revision: WorkspaceRevision;
+  heads: HeadRecord[];
+}
+
+// POST /api/v1/workspace and PATCH /api/v1/workspace/{id} share this
+// response shape -- both return the post-mutation `WorkspaceCore`
+// fields including `tags`, the one place tags travel the wire.
+export interface WorkspaceMutationResp {
   id: Uuid;
   name: string;
   tags: string[];
   created_at: Rfc3339;
   workspace_revision: WorkspaceRevision;
-  head_count: number;
+}
+
+export interface WorkspaceCreateReq {
+  name: string;
+  tags?: string[];
+}
+
+export interface WorkspacePatchReq {
+  name?: string;
+  tags?: string[];
+}
+
+// DELETE /api/v1/workspace/{id} and DELETE /api/v1/workspace/{id}/
+// assets/{*path} both ack with a job id (status 202); clients track
+// terminal state via `GET /api/v1/jobs/{job_id}/events`.
+export interface AsyncJobAck {
+  job_id: Uuid;
 }
 
 export type HeadStatus = 'current' | 'stale';
@@ -34,10 +75,6 @@ export interface HeadRecord {
 
 export interface HeadManifest extends HeadRecord {
   labels: string[];
-}
-
-export interface WorkspaceDetail extends WorkspaceSummary {
-  heads: HeadRecord[];
 }
 
 export type ActiveOrigin = 'head' | 'default';
@@ -76,32 +113,42 @@ export type JobType =
   | 'convert'
   | 'dataset_delete'
   | 'converter_delete'
-  | 'workspace_delete';
+  | 'workspace_delete'
+  | 'training_logs_delete'
+  | 'converter_logs_delete';
 
 export interface JobProgress {
   done: number;
   total?: number;
 }
 
+// `GET /api/v1/jobs` and `GET /api/v1/jobs/{job_id}` share this
+// snapshot.  Several fields are absent from the wire on jobs that
+// don't populate them (e.g. `target_path` is only meaningful for the
+// asset-delete variants; `workspace_id` is None on a job with no
+// workspace reference) -- they arrive as missing properties, not
+// `null`, per the backend's `skip_serializing_if = "Option::is_none"`.
 export interface JobSnapshot {
   job_id: Uuid;
   job_type: JobType;
-  workspace_id: Uuid;
+  workspace_id?: Uuid;
+  target_path?: string;
   state: JobState;
-  progress: JobProgress;
-  result: unknown;
+  progress?: JobProgress;
+  result?: unknown;
   last_seq: number;
   updated_at: Rfc3339;
-  message?: string;
 }
 
+// SSE event over `GET /api/v1/jobs/{job_id}/events`.  Any one event
+// may carry a state transition, a progress tick, a log line, or any
+// combination thereof; clients react to whichever fields are present.
 export interface JobEvent {
   seq: number;
   at: Rfc3339;
-  state: JobState;
+  state?: JobState;
   progress?: JobProgress;
   message?: string;
-  metrics?: Record<string, number>;
 }
 
 export interface SubsystemHealth {

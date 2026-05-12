@@ -17,8 +17,54 @@ Pacing is deliberate: ample time, step-by-step. We will not pursue testing/bench
 - **No SSR/Node runtime**: build artifact is a static `web/build/` deployable to any static host or reverse-proxied.
 - **Components**: hand-rolled Tailwind primitives. **Extracted only after a pattern is copy-pasted twice in real features.** No headless lib, no kit.
 - **History**: memory ring via `GET /api/v1/jobs` for live state + JSONL backfill via `GET /api/v1/workspace/{id}/assets/training_logs/<job>.jsonl?after_seq=&limit=` for durability.
-- **Converter workspaces**: marker tag `__converter__`, auto-name `converter-<uuid8>`. Client-side filter (backend treats all workspaces uniformly).
+- **Converter workspaces**: marker tag `__converter__`, auto-name `converter-<uuid8>`. Client-side filter uses **name-prefix `converter-`** (not tag membership, since the daemon's list response omits `tags` — see corrections below). Tag is still set on creation as forward-compat metadata.
 - **No tests, no benchmarks, no CI**.
+
+## Implementation status (rolling)
+
+Updated as slices ship. Anchor for future sessions to avoid re-doing.
+
+### Shipped
+
+- **Slice A — Dashboard MVP** (complete; see [docs/web/NOTES.md](./NOTES.md) for design-system decisions).
+- **Slice B.1 — Workspace CRUD foundation**:
+  - List / detail routes, async-job-tracked delete, create dialog, inline rename, delete + bulk-delete dialogs.
+  - Right-click context menu is the canonical surface for Rename / Delete / Select (on cards) and New / Select all / Done (on the empty list area). No always-visible per-card action icons.
+  - Selection mode is opt-in via the header's "Select" button (or the context menu). Checkboxes slide in only while `mode === 'selecting'`; the header swaps to Select-all / Done / Delete-N. No sticky bottom toolbar.
+  - Bulk and per-item delete both flow through the store's `deleteChain` in [stores/workspaces.svelte.ts](../../web/src/lib/stores/workspaces.svelte.ts) because the daemon's delete-family slot is global (1 at a time — see corrections below).
+  - Every backend-mutating dialog renders an inline error banner (rose-50). Native `<dialog>` lives in the browser top-layer, so any later toast surface would be hidden behind the backdrop; inline is the only operator-visible error path while a modal is open.
+  - Primitives extracted to [components/ui/](../../web/src/lib/components/ui/): `Button`, `Modal`, `EmptyState`, `ContextMenu`, `InlineName`, `PlusIcon`, `TrashIcon`, `inputClass()`.
+  - Live name validation via `$derived` + red-bordered input mirrors [`validate_workspace_name`](../../modules/file_mgr/registry.rs).
+  - Error-copy layer strips daemon thiserror prefixes (`fs:`, `convert:`, `training:`, …) so operator copy reads as "Workspace name conflict: test." rather than "Fs: workspace name conflict: test."
+  - `color-scheme: light` pinned globally so native form controls (checkboxes, scrollbars) don't render dark on systems with `prefers-color-scheme: dark`. Slice E's dark-mode work flips this to `light dark` and gates reactively.
+  - Toast / Drawer / Tooltip primitives still deferred to Slice E.
+
+### In flight / not started
+
+- **Slice B.2** — IDB drafts + recorder + audio import. Detail page is still the management surface only; recording UI lands here.
+- **Slice B.3** — Slicer UI + commit flow (XHR upload with progress, resumability prompt on reload).
+- **Slice C** — Training + SSE job events with `event_gap` recovery + history.
+- **Slice D** — Converter tab + Tiny Dashboard.
+- **Slice E** — Polish + remaining primitive extractions (Toast, Drawer, Tooltip, Tabs, …).
+
+### Corrections to the spec (verified against the running daemon)
+
+The original Slice B prose assumed wire shapes that don't match the actual API. Discovered by direct probing in [docs/API.md](../API.md) cross-referenced with [modules/api/routes/workspace.rs](../../modules/api/routes/workspace.rs); future sessions should treat these as authoritative:
+
+1. **`GET /api/v1/workspace` (list)** returns only `{id, name, created_at}` per entry — **no `tags`, no `workspace_revision`, no `head_count`**. The `__converter__` filter therefore can't read tags from the list and uses the workspace-name prefix `converter-` instead.
+2. **`GET /api/v1/workspace/{id}` (detail)** returns `{id, name, created_at, workspace_revision, heads[]}` — **no `tags` either**. Only `POST` / `PATCH` responses carry tags.
+3. **Workspace delete concurrency**: the daemon's `JobRegistry` admits one `WorkspaceDelete` at a time globally. Firing N parallel `DELETE`s rejects N-1 with `409 conflict` (`fs: job conflict: conflicts with running job ... (WorkspaceDelete)`). Both the per-item and bulk delete flow through a single client-side `deleteChain` that serializes ACK + SSE-terminal before kicking off the next.
+4. **Heads bundle**: there is no separate `GET /workspace/{id}/heads` endpoint — heads come on the workspace detail. The original Slice C reference to that path was wrong.
+
+### Sub-slice strategy for Slice B
+
+The PLAN.md prose for Slice B describes the full end state; in practice we are shipping it in three gates so each gate verifies independently against the daemon:
+
+- **B.1 — CRUD foundation** (done): workspace lifecycle + selection + bulk delete; Toast + primitives + error-copy infrastructure.
+- **B.2 — Local audio**: IDB schema, getUserMedia recorder, file import + decode + resample, drafts list under workspace detail.
+- **B.3 — Slicer + commit**: segment editor, WAV PCM-16 encoder, XHR upload with progress, commit state machine, resumability.
+
+Each sub-slice ends in a manual verification gate against the running daemon (no automated tests per project policy).
 
 ## Strategy: vertical slices
 

@@ -634,3 +634,113 @@ Surfaces touched during this iteration:
 - [`web/src/lib/components/dashboard/TopKMeter.svelte`](../../web/src/lib/components/dashboard/TopKMeter.svelte)
 - [`web/src/lib/components/dashboard/WaveformCanvas.svelte`](../../web/src/lib/components/dashboard/WaveformCanvas.svelte)
 - [`web/src/lib/components/dashboard/SpectrogramCanvas.svelte`](../../web/src/lib/components/dashboard/SpectrogramCanvas.svelte)
+
+## Slice B.1 additions
+
+The Workspace tab introduces a few new patterns worth recording so future
+work doesn't relitigate them.
+
+### `color-scheme: light` pinning
+
+Tailwind v4's Preflight leaves `color-scheme` at `normal`, which means
+native form controls (checkboxes, scrollbars, date picker) follow the
+operator's OS preference.  Every author-styled surface in this app is
+explicitly light (white panels on zinc-50), so a dark-mode operator
+saw black-filled checkboxes against light cards — broken-looking.
+
+[`web/src/app.css`](../../web/src/app.css) pins
+`html, body { color-scheme: light }`.  Slice E's dark-mode work
+flips this to `light dark` and gates the palette via a `data-theme`
+attribute on `<html>`; until then the app is intentionally light-only.
+
+### Native `<dialog>` top-layer + inline error banners
+
+Native `<dialog>` opened via `showModal()` sits in the browser
+*top layer*, strictly above any `z-index` value.  A fixed-position
+toast container at `z-50` would be hidden behind the backdrop while
+a modal is open.
+
+B.1's resolution: every modal that fires a backend mutation renders
+its own inline error banner beneath the form
+(`rounded-md border border-rose-200 bg-rose-50 text-rose-900`).
+No global toast surface ships in B.1 — when Slice E adds one, it
+will need to render through a portal-into-dialog or a
+top-layer-eligible primitive (e.g. the `popover` API) to avoid
+re-introducing the same occlusion.
+
+### Delete serialization (`deleteChain`)
+
+The daemon's `JobRegistry` admits at most one job from the entire
+delete family (Dataset / Converter / TrainingLogs / ConverterLogs /
+Workspace) at a time globally (`max_delete_jobs = 1`).  Firing N
+parallel `DELETE /workspace/{id}` requests returns N-1 of them with
+`409 conflict` (`fs: job conflict: … (WorkspaceDelete)`).  Both
+single-item and bulk delete flow through `WorkspacesStore.enqueueDelete`,
+which chains every call onto a private `deleteChain: Promise<unknown>`
+so each new request waits for the previous job's SSE terminal event
+before its own DELETE fires.  `.catch(() => undefined)` on the chain
+swallows individual failures so one bad delete doesn't stall the queue.
+
+The downstream UX: both the per-item and the bulk dialog are
+**fire-and-forget**.  The dialog closes immediately on confirm;
+the queue runs in the background and the operator watches each card
+transition through the list's `deleting` state.  Failed deletes
+re-enter the selection set so the operator can retry from the
+toolbar without re-checking.
+
+### Live name validation (`inputClass(hasError)`)
+
+[`web/src/lib/components/ui/inputClass.ts`](../../web/src/lib/components/ui/inputClass.ts)
+returns the shared text-input class string for a given error state.
+Both Create- and Rename-workspace dialogs use `$derived` validation
+that mirrors the daemon's
+[`validate_workspace_name`](../../modules/file_mgr/registry.rs) — empty
+input shows no error (the disabled submit button is signal enough),
+but the moment the operator types a structurally-invalid character
+the input border swaps to `rose-300/400`, an `aria-describedby`
+linked inline message appears below, and the submit button stays
+disabled until the validation passes.
+
+Rename additionally treats `trimmedName === currentName` as a
+no-op: not an error, but the submit button is disabled — so a
+non-mutating "Save" can't accidentally fire.
+
+### Layer-prefix stripping in error copy
+
+Daemon errors arrive as `"<layer>: <message>"` because the Rust side
+uses `thiserror` with leading-tag formats (`fs: …`, `convert: …`,
+`training: …`, `not found: …` and so on).  [`web/src/lib/utils/
+error-copy.ts`](../../web/src/lib/utils/error-copy.ts) strips one
+known leading prefix before sentence-casing + appending a period.
+Nested instances (e.g. an inner `"conflict: test"` inside the
+stripped layer) survive — only the outermost wrapper goes.
+
+The prefix set is fixed (`fs`, `file`, `config`, `mic`, `head load`,
+`head swap`, `convert`, `training`, `activation`, `invalid
+identifier`, `invalid request`, `internal`).  Adding a new layer to
+the daemon means adding it here; the regression mode is just slightly
+uglier copy, not broken UX.
+
+### Context menu + opt-in selection mode
+
+The Workspace list deliberately ships no always-visible per-card
+action icons — Rename / Delete / Select all live behind the
+right-click context menu (`ContextMenu.svelte`).  The page handles
+the `contextmenu` event on a single wrapping `<div>` and walks
+`closest('[data-workspace-id]')` to decide whether the menu opened
+on a card or on empty list area; each context produces its own
+section set in `buildMenu()`.
+
+Selection is opt-in: the header "Select" button (or the context
+menu) transitions `WorkspacesStore.mode` to `'selecting'`, at which
+point each card slides a checkbox in via `transition:fly` and the
+card body's click toggles selection instead of navigating.  The
+header swaps to a Select-all / Done / Delete-N group; no sticky
+bottom toolbar.  Selection state is `SvelteSet<Uuid>` on the store
+so the `selectedEntries` derived view re-prunes if the underlying
+list changes.
+
+Selected cards swap their border palette to
+`border-blue-300 hover:border-blue-400` for an at-a-glance batch
+preview.  Cards with a delete job in flight stay in the list with
+an `opacity-60` dim + a rose `deleting` pill until terminal.

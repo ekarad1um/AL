@@ -88,7 +88,7 @@
 
     {#if orphaned}
       <p class="mt-3 text-[11px] text-amber-800">
-        source workspace was deleted; inference continues on the orphaned activation.
+        Source workspace was deleted. Inference continues on the orphaned activation.
       </p>
     {/if}
   {/if}

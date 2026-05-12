@@ -28,6 +28,14 @@
 html,
 body {
   height: 100%;
+  /* Tailwind v4 leaves color-scheme at `normal`, so browsers render
+     native controls (checkboxes, scrollbars, the date picker, etc.)
+     in dark colours on systems that prefer dark.  The rest of this
+     app's surfaces are explicit light (white cards on zinc-50), so
+     the contrast mismatch reads as broken.  Pin `light` here; Slice
+     E's dark-mode work will swap this to `light dark` and gate the
+     palette reactively. */
+  color-scheme: light;
 }
 
 /* Visualization & Inference share a grid row at lg+ and must stay the
@@ -72,10 +80,37 @@ button {
    ring, the page's only other accent).  No border-radius override --
    browsers follow the element's own radius around an offset outline,
    so rounded-md / rounded-full controls get a matching outline shape
-   for free. */
+   for free.  `outline-offset: 1px` is a deliberate tightening over
+   the 2px we shipped originally -- the 2px gap read as a "double
+   border" against the input's own zinc-200 stroke; 1px keeps the
+   ring distinct without the extra breathing room. */
 :focus-visible {
   outline: 2px solid rgb(59 130 246 / 0.6);
-  outline-offset: 2px;
+  outline-offset: 1px;
+}
+
+/* Text inputs and the custom-styled selects use a tighter, halo-
+   style focus ring instead of the offset outline above.  The halo
+   sits flush against the element's own border (0 gap) so the focus
+   state reads as the same shape as the input, just thicker -- not
+   as a separate ring floating beside it.  Buttons / links keep the
+   global outline because a halo against a filled bg would either
+   merge with it or look muddy. */
+input:focus-visible,
+textarea:focus-visible,
+.select-chevron:focus-visible {
+  outline: none;
+  border-color: rgb(59 130 246); /* blue-500 */
+  box-shadow: 0 0 0 3px rgb(59 130 246 / 0.18);
+}
+
+/* Range inputs (sliders) bring their own focus treatment via the
+   thumb pseudo-elements; the global outline would render around the
+   whole hit-area and read as visual noise. */
+input[type='range']:focus-visible {
+  outline: none;
+  box-shadow: none;
+  border-color: transparent;
 }
 
 /* Native <select> elements render the dropdown chevron with browser-
@@ -91,10 +126,11 @@ button {
   padding-right: 1.875rem;
 }
 
-/* Selects opt out of the global outline: Chromium matches :focus-visible
-   on <select> as soon as it's clicked, so the ring would sit behind the
-   open popup and persist after picking.  The border + chevron + native
-   popup already carry every focus cue needed. */
+/* Selects opt out of the keyboard outline-style focus for the same
+   reason inputs do (the halo above wins).  Chromium matches
+   :focus-visible on <select> as soon as it's clicked, so the halo
+   would briefly flash behind the open popup; the popup itself plus
+   the new tinted border carry enough focus cue. */
 .select-chevron:focus,
 .select-chevron:focus-visible {
   outline: none;

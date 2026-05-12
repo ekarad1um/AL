@@ -1,12 +1,18 @@
 import { api, ApiError } from './http';
 import type {
   ActiveResp,
+  AsyncJobAck,
   InferenceCfg,
+  JobSnapshot,
   MicPolicy,
   MicState,
   StatusSnapshot,
   Uuid,
-  WorkspaceSummary
+  WorkspaceCreateReq,
+  WorkspaceDetail,
+  WorkspaceListEntry,
+  WorkspaceMutationResp,
+  WorkspacePatchReq
 } from './types';
 
 export const status = {
@@ -53,6 +59,33 @@ export const active = {
   setDefault: () => api.post<ActiveResp>('/api/v1/active', { default: true })
 };
 
+// Workspace CRUD.  The daemon distinguishes three response shapes:
+//  * `list` -> bare `{id, name, created_at}` rows, unwrapped from
+//    the envelope `{ workspaces: [...] }`.
+//  * `get` -> includes `workspace_revision` + `heads[]`, no `tags`.
+//  * `create` / `patch` -> include the post-mutation `tags`.
+// Delete is asynchronous -- the 202 ack carries a `job_id` and the
+// caller drains terminal state via `jobs.events()`.
 export const workspaces = {
-  list: () => api.get<WorkspaceSummary[]>('/api/v1/workspace')
+  list: () =>
+    api.get<{ workspaces: WorkspaceListEntry[] }>('/api/v1/workspace').then((r) => r.workspaces),
+  get: (id: Uuid) => api.get<WorkspaceDetail>(`/api/v1/workspace/${encodeURIComponent(id)}`),
+  create: (req: WorkspaceCreateReq) => api.post<WorkspaceMutationResp>('/api/v1/workspace', req),
+  patch: (id: Uuid, req: WorkspacePatchReq) =>
+    api.patch<WorkspaceMutationResp>(`/api/v1/workspace/${encodeURIComponent(id)}`, req),
+  delete: (id: Uuid) => api.delete<AsyncJobAck>(`/api/v1/workspace/${encodeURIComponent(id)}`)
+};
+
+// Async-job introspection.  `eventsUrl` is a path builder; the actual
+// SSE consumer lives in `$lib/api/jobs` because `EventSource` has its
+// own lifecycle (reconnect, cursor, close) outside the fetch wrapper.
+export const jobs = {
+  get: (id: Uuid) => api.get<JobSnapshot>(`/api/v1/jobs/${encodeURIComponent(id)}`),
+  eventsUrl: (id: Uuid, opts: { afterSeq?: number; logs?: boolean } = {}): string => {
+    const params = new URLSearchParams();
+    if (opts.afterSeq !== undefined) params.set('after_seq', String(opts.afterSeq));
+    if (opts.logs !== undefined) params.set('logs', String(opts.logs));
+    const q = params.toString();
+    return `/api/v1/jobs/${encodeURIComponent(id)}/events${q ? `?${q}` : ''}`;
+  }
 };

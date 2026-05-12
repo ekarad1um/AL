@@ -46,8 +46,12 @@ export default ts.config(
   },
   {
     rules: {
-      // Allow `void promise` to mark deliberate fire-and-forget.
-      '@typescript-eslint/no-confusing-void-expression': ['error', { ignoreVoidOperator: true }],
+      // Allow `() => fn()` shorthand for sync void callbacks, and
+      // `void promise` to mark deliberate fire-and-forget.
+      '@typescript-eslint/no-confusing-void-expression': [
+        'error',
+        { ignoreArrowShorthand: true, ignoreVoidOperator: true }
+      ],
       // Async handlers on DOM events return promises; that's intentional.
       '@typescript-eslint/no-misused-promises': [
         'error',
