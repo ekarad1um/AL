@@ -1003,6 +1003,69 @@ fn reset_per_channel_fir_empty_slice_is_noop() {
     assert!(empty.is_empty());
 }
 
+/// Non-native source rates must be normalized before samples enter
+/// `AudioBuffer`.  The writer head should track 44.1 kHz resampled
+/// output, not the 48 kHz source-frame count.
+#[test]
+fn process_period_resamples_48khz_source_to_canonical_buffer_rate() {
+    const PERIOD_FRAMES: usize = 960;
+    const PERIODS: usize = 50;
+    // rubato's sinc resampler has deterministic startup latency; after
+    // one second of 48 kHz input it has emitted output corresponding to
+    // about 47_104 input-rate frames, not the full 48_000 yet.
+    const CONVERTIBLE_INPUT_FRAMES_AFTER_LATENCY: f64 = 47_104.0;
+
+    let buf = AudioBuffer::new(131_072);
+    let mut writer = buf.take_writer();
+    let cfg = arb_test_cfg();
+    let candidate = MicCandidate {
+        id: MicId::from_static("mock-48k"),
+        source: CandidateSource::Mock {
+            waveforms: vec![Waveform::Silence],
+            period_size: PERIOD_FRAMES,
+            sample_rate: 48_000,
+        },
+        channels: vec![0],
+    };
+    let src = crate::audio_io::source::MockSource::open(
+        &candidate,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("open 48 kHz mock source");
+    let mut state = ArbitratorState::new();
+    state.boot(crate::audio_io::source::ActiveSource::Mock(src), &cfg);
+
+    assert_eq!(state.cached_rate, 48_000);
+    assert_eq!(state.cached_period_frames, PERIOD_FRAMES);
+    assert!(
+        state.resamplers[0].is_some(),
+        "48 kHz source must allocate a source-rate -> 44.1 kHz resampler",
+    );
+
+    for _ in 0..PERIODS {
+        state.interleaved_scratch[..PERIOD_FRAMES].fill(0.25);
+        process_period(
+            &mut state,
+            &mut writer,
+            PERIOD_FRAMES,
+            &ChannelSelection::Auto,
+            &cfg,
+            cfg.hysteresis_linear(),
+        );
+    }
+
+    let produced = writer.head_pos();
+    let expected_ideal = (CONVERTIBLE_INPUT_FRAMES_AFTER_LATENCY * 44_100.0 / 48_000.0) as u64;
+    assert!(
+        (expected_ideal - 200..=expected_ideal + 200).contains(&produced),
+        "48 kHz source should write ~44.1 kHz-resampled output; produced {produced}, expected ~{expected_ideal}",
+    );
+    assert!(
+        produced < 48_000,
+        "writer head advanced at input rate instead of canonical buffer rate: {produced}",
+    );
+}
+
 /// `single_pass_demux_and_rms` must not propagate NaN/Inf into
 /// the per-slot RMS state or per-slot scratch.  Without the
 /// clamp the slot's EMA RMS would stay NaN forever and the
@@ -1161,7 +1224,7 @@ fn integration_auto_picks_loud_channel_inside_one_mic() {
 /// test via `arb_test_cfg()`.
 #[test]
 fn integration_producer_publishes_monotonic_timing_anchor() {
-    use crate::common::time::{BufferTimingAnchor, shared_timing_anchor};
+    use crate::common::time::{shared_timing_anchor, BufferTimingAnchor};
     let buf = AudioBuffer::new(65_536);
     let writer = buf.take_writer();
     let reader = buf.reader_at(0);

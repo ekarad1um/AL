@@ -230,8 +230,13 @@ impl AlsaSource {
                 );
             }
 
-            hwp.set_rate(SampleRate::VALUE, ValueOr::Nearest)
-                .map_err(|e| format!("set_rate: {e}"))?;
+            // `set_rate` is exact even when passed `ValueOr::Nearest`
+            // (alsa-rs forwards to `snd_pcm_hw_params_set_rate`).  Use
+            // the true `_near` API so 48 kHz-only USB mics negotiate
+            // successfully; the arbitrator already resamples non-native
+            // rates back to `SampleRate::VALUE` downstream.
+            hwp.set_rate_near(SampleRate::VALUE, ValueOr::Nearest)
+                .map_err(|e| format!("set_rate_near: {e}"))?;
             // `set_period_size_near` snaps to the nearest supported value;
             // the non-`_near` form requires an exact match (the `dir`
             // arg is just a metadata hint, not a search direction).  USB
@@ -245,6 +250,27 @@ impl AlsaSource {
             hwp.set_buffer_size_near(buffer_size as alsa::pcm::Frames)
                 .map_err(|e| format!("set_buffer_size_near: {e}"))?;
             pcm.hw_params(&hwp).map_err(|e| format!("hw_params: {e}"))?;
+            // `set_channels` is exact, so post-commit readback should match
+            // the value we requested or fell back to.  Refuse a mismatch
+            // rather than risking a wrong interleaved stride downstream.
+            let neg_channels = hwp
+                .get_channels()
+                .map_err(|e| format!("get_channels: {e}"))?;
+            if neg_channels == 0 {
+                return Err(format!(
+                    "device {hw_spec} reported 0 channels after hw_params"
+                ));
+            }
+            if neg_channels > u16::MAX as u32 {
+                return Err(format!(
+                    "device {hw_spec} reports {neg_channels} channels after hw_params -- implausible, refusing",
+                ));
+            }
+            if neg_channels != actual_channels as u32 {
+                return Err(format!(
+                    "device {hw_spec} committed {neg_channels} channels after hw_params, expected {actual_channels}",
+                ));
+            }
             actual_rate = hwp.get_rate().map_err(|e| format!("get_rate: {e}"))?;
             // Read back the negotiated period size: with `ValueOr::Nearest`
             // the device may snap to a different value (USB class-compliant

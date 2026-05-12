@@ -2365,9 +2365,11 @@ async fn boot_inference(
                     crate::inference::EngineState::Running | crate::inference::EngineState::Waiting
                 );
                 let healthy = state_healthy && !stalled;
+                // `snap.state` via Display so the detail starts lowercase
+                // like every other heartbeat detail (e.g. `"encoding (...)"`).
                 let detail = if stalled {
                     format!(
-                        "{:?} seq={} emitted={} drop_nan={} drop_lag={} (stalled {}ms; no new windows)",
+                        "{} seq={} emitted={} drop_nan={} drop_lag={} (stalled {}ms; no new windows)",
                         snap.state,
                         snap.last_seq,
                         snap.frames_emitted,
@@ -2377,7 +2379,7 @@ async fn boot_inference(
                     )
                 } else {
                     format!(
-                        "{:?} seq={} emitted={} drop_nan={} drop_lag={}",
+                        "{} seq={} emitted={} drop_nan={} drop_lag={}",
                         snap.state,
                         snap.last_seq,
                         snap.frames_emitted,

@@ -24,12 +24,17 @@ class HealthStore {
     }
   }
 
-  get level(): 'unknown' | 'ok' | 'degraded' | 'down' {
-    if (this.lastError) return 'down';
+  // `unreachable` is reserved for a hard transport failure (HTTP polling
+  // raised); `unhealthy` covers the daemon-reachable case where one or
+  // more subsystems self-report a fault.  Keeping these distinct stops
+  // the badge from claiming the daemon is offline when, e.g., only the
+  // mic subsystem failed.
+  get level(): 'unknown' | 'ok' | 'degraded' | 'unhealthy' | 'unreachable' {
+    if (this.lastError) return 'unreachable';
     if (!this.snapshot) return 'unknown';
     let degraded = this.snapshot.metrics_stale;
     for (const sub of Object.values(this.snapshot.subsystems)) {
-      if (!sub.healthy) return 'down';
+      if (!sub.healthy) return 'unhealthy';
       if (sub.stale || sub.degraded_reason) degraded = true;
     }
     return degraded ? 'degraded' : 'ok';

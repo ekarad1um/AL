@@ -25,6 +25,28 @@
     return `${hz.toFixed(2)} Hz`;
   }
 
+  function formatRate(rate: unknown): string | null {
+    if (typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0) return null;
+    if (rate >= 1000) {
+      const khz = rate / 1000;
+      return `${Number.isInteger(khz) ? khz.toFixed(0) : khz.toFixed(1)} kHz`;
+    }
+    return `${rate} Hz`;
+  }
+
+  function formatSourceKind(kind: string): string {
+    if (kind === 'alsa') return 'ALSA';
+    if (!kind) return 'unknown';
+    return kind[0].toUpperCase() + kind.slice(1).replaceAll('_', ' ');
+  }
+
+  function sourceLabel(cand: (typeof candidates)[number]): string {
+    const kind = formatSourceKind(cand.source.kind);
+    const detail =
+      cand.source.kind === 'alsa' ? cand.source.hw_spec : formatRate(cand.source.sample_rate);
+    return [cand.id, kind, detail].filter(Boolean).join(' · ');
+  }
+
   // Source select holds 'auto' (= first_available) or a candidate id (=
   // fixed device); channel select holds 'auto' or a stringified channel.
   // Collapsing the policy's two-field shape into a single dropdown keeps
@@ -231,9 +253,7 @@
               >
                 <option value="auto">auto · first available</option>
                 {#each candidates as cand (cand.id)}
-                  <option value={cand.id}
-                    >{cand.id} · {cand.source.kind} · {cand.source.sample_rate} Hz</option
-                  >
+                  <option value={cand.id}>{sourceLabel(cand)}</option>
                 {/each}
               </select>
             </label>

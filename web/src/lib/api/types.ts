@@ -134,11 +134,25 @@ export interface InferenceCfg {
   top_k: number;
 }
 
-export interface MicSource {
-  kind: string;
-  sample_rate: number;
-  [key: string]: unknown;
+// Variant fields mirror `CandidateSource` in the Rust enum: mock declares a
+// static sample_rate; alsa exposes launch-time hardware fields and negotiates
+// the actual rate at open time.  Adding a new kind here forces every consumer
+// site to update its narrowing instead of silently falling through.
+export interface AlsaMicSource {
+  kind: 'alsa';
+  hw_spec: string;
+  period_size: number;
+  buffer_size: number;
 }
+
+export interface MockMicSource {
+  kind: 'mock';
+  sample_rate: number;
+  period_size: number;
+  waveforms: unknown[];
+}
+
+export type MicSource = AlsaMicSource | MockMicSource;
 
 export interface MicCandidate {
   id: string;

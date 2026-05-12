@@ -283,6 +283,23 @@ pub enum EngineState {
     Failed,
 }
 
+/// Lowercase display form for embedding in `Heartbeat::detail`
+/// strings, which are user-facing on the dashboard and follow the
+/// same lowercase-prefix convention as every other detail string in
+/// the daemon (e.g. `"encoding (...)"`, `"no audio for >=1 s"`).
+impl std::fmt::Display for EngineState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Lagged => "lagged",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        })
+    }
+}
+
 /// Owning engine.  Constructed once per daemon lifetime; moved into
 /// `spawn_blocking`; never cloned.
 ///
@@ -793,6 +810,19 @@ mod tests {
         assert_eq!(hb.state, EngineState::Starting);
         assert_eq!(hb.last_seq, 0);
         assert_eq!(hb.frames_emitted, 0);
+    }
+
+    /// Display embeds `EngineState` into `Heartbeat::detail` strings,
+    /// which are user-facing.  Pin the lowercase form so a future rename
+    /// of an enum variant can't silently change the dashboard output.
+    #[test]
+    fn engine_state_display_is_lowercase() {
+        assert_eq!(EngineState::Starting.to_string(), "starting");
+        assert_eq!(EngineState::Running.to_string(), "running");
+        assert_eq!(EngineState::Waiting.to_string(), "waiting");
+        assert_eq!(EngineState::Lagged.to_string(), "lagged");
+        assert_eq!(EngineState::Stopped.to_string(), "stopped");
+        assert_eq!(EngineState::Failed.to_string(), "failed");
     }
 
     /// `WallTime::now` returns a post-epoch value (the

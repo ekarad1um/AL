@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { streams } from '$lib/stores/streams.svelte';
+  import { nextVisualRenderAt, visualDevicePixelRatio } from './visualRuntime';
 
   interface Props {
     seconds?: number;
@@ -17,36 +18,46 @@
   onMount(() => {
     const el = canvas;
     if (!el) return;
-    const ctx = el.getContext('2d');
+    const ctx = el.getContext('2d', { alpha: false, desynchronized: true });
     if (!ctx) return;
 
-    const dpr = window.devicePixelRatio || 1;
     let hiBuf: Float32Array = new Float32Array(0);
     let loBuf: Float32Array = new Float32Array(0);
-    // Pre-allocated snapshot target so the 60 Hz draw loop doesn't
-    // churn the GC with a fresh 144k-sample Float32Array per frame.
-    const pcmBuf = new Float32Array(streams.sampleRate * seconds);
+    const windowSamples = streams.sampleRate * seconds;
 
     // ResizeObserver only records the new dimensions; the canvas reset
     // (which wipes the pixel buffer) is deferred to the next RAF so
     // reset + render happen in the same frame -- no blank flash while
     // dragging the window edge.
-    let pendingW = Math.max(1, Math.floor(el.getBoundingClientRect().width * dpr));
-    let pendingH = Math.max(1, Math.floor(el.getBoundingClientRect().height * dpr));
+    let pendingW = 1;
+    let pendingH = 1;
     let needsResize = true;
 
-    const ro = new ResizeObserver(() => {
+    const updatePendingSize = (): void => {
+      const dpr = visualDevicePixelRatio();
       const r = el.getBoundingClientRect();
       pendingW = Math.max(1, Math.floor(r.width * dpr));
       pendingH = Math.max(1, Math.floor(r.height * dpr));
       needsResize = true;
-    });
+    };
+
+    updatePendingSize();
+    const ro = new ResizeObserver(updatePendingSize);
     ro.observe(el);
+    window.addEventListener('resize', updatePendingSize, { passive: true });
 
     const fillRgba = hexToRgba(color, 0.15);
     const gridStroke = '#e4e4e7';
 
-    const draw = () => {
+    let lastRenderAt = Number.NEGATIVE_INFINITY;
+    const draw = (now: DOMHighResTimeStamp) => {
+      const renderAt = nextVisualRenderAt(now, lastRenderAt);
+      if (renderAt === null) {
+        raf = requestAnimationFrame(draw);
+        return;
+      }
+      lastRenderAt = renderAt;
+
       if (needsResize) {
         if (el.width !== pendingW) el.width = pendingW;
         if (el.height !== pendingH) el.height = pendingH;
@@ -71,22 +82,8 @@
       ctx.lineTo(w, mid + 0.5);
       ctx.stroke();
 
-      const pcm = streams.snapshot(pcmBuf.length, pcmBuf);
-
-      const samplesPerPixel = pcm.length / w;
-      for (let x = 0; x < w; x++) {
-        const start = Math.floor(x * samplesPerPixel);
-        const end = Math.min(pcm.length, Math.floor((x + 1) * samplesPerPixel));
-        let lo = 0;
-        let hi = 0;
-        for (let i = start; i < end; i++) {
-          const v = pcm[i];
-          if (v < lo) lo = v;
-          if (v > hi) hi = v;
-        }
-        hiBuf[x] = hi;
-        loBuf[x] = lo;
-      }
+      const endSample = streams.renderCursor(streams.renderLatencyMs, now);
+      streams.envelopeAt(endSample, windowSamples, w, loBuf, hiBuf);
 
       // Filled envelope (translucent).
       ctx.fillStyle = fillRgba;
@@ -120,6 +117,7 @@
       if (raf !== null) cancelAnimationFrame(raf);
       raf = null;
       ro.disconnect();
+      window.removeEventListener('resize', updatePendingSize);
     };
   });
 

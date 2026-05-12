@@ -1026,6 +1026,16 @@ Response:
 {
   "catalogue": {
     "candidates": [
+      {
+        "id": "linux-default",
+        "channels": [0],
+        "source": {
+          "kind": "alsa",
+          "hw_spec": "hw:CARD=EarPods,DEV=0",
+          "period_size": 960,
+          "buffer_size": 3840
+        }
+      },
       { "id": "default-mock", "channels": [0],
         "source": { "kind": "mock", "period_size": 512, "sample_rate": 44100, "waveforms": [...] } }
     ]
@@ -1037,6 +1047,11 @@ Response:
   "version": 42
 }
 ```
+
+Candidate `source` fields are variant-specific: `mock` declares a
+static `sample_rate`, while `alsa` exposes launch-time hardware fields
+and negotiates the actual rate when opened.  Non-native device rates are
+resampled inside the audio pipeline.
 
 ### `POST /api/v1/mic`, `POST /api/v1/mic/policy`
 

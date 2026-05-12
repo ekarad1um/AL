@@ -89,10 +89,13 @@
   // transitions rather than run a separate retry timer.  The
   // `config.error !== null` guard keeps the effect inert on the steady-
   // state path -- only a failed config + reachable backend triggers a
-  // refresh.  WS streams reconnect via the worker's own backoff.
+  // refresh.  `unhealthy` is a reachable state (subsystem fault, not
+  // transport) so it must also retry config.  WS streams reconnect via
+  // the worker's own backoff.
   $effect(() => {
     const level = health.level;
-    if ((level === 'ok' || level === 'degraded') && config.error !== null) {
+    const reachable = level === 'ok' || level === 'degraded' || level === 'unhealthy';
+    if (reachable && config.error !== null) {
       void config.refresh();
     }
   });

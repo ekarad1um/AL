@@ -81,7 +81,8 @@
     unknown: { dot: 'bg-zinc-400', label: 'connecting' },
     ok: { dot: 'bg-emerald-500', label: 'healthy' },
     degraded: { dot: 'bg-amber-500', label: 'degraded' },
-    down: { dot: 'bg-rose-500', label: 'unreachable' }
+    unhealthy: { dot: 'bg-rose-500', label: 'unhealthy' },
+    unreachable: { dot: 'bg-rose-500', label: 'unreachable' }
   } as const;
 
   let palette = $derived(COLORS[health.level]);

@@ -1,3 +1,18 @@
+## Linux first-choice ALSA candidate.  Compiled only with
+## `--features alsa-real`; otherwise FirstAvailable falls through to
+## the mock candidate below.  Replace `hw_spec` to match your
+## hardware -- `arecord -L` enumerates available capture PCMs.
+[[mic.candidates]]
+id = "linux-default"
+channels = [0]
+
+[mic.candidates.source]
+kind = "alsa"
+hw_spec = "hw:CARD=EarPods,DEV=0"
+# 960 frames at 48 kHz is 20 ms, matching the Opus stream frame.
+period_size = 960
+buffer_size = 3840
+
 [[mic.candidates]]
 id = "default-mock"
 channels = [0]
