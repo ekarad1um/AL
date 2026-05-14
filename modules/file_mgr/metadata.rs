@@ -163,32 +163,19 @@ impl WorkspaceMetadata {
 // MARK: MetadataStore
 
 impl WorkspaceMgr {
-    /// Acquire (or lazily allocate) the per-workspace
-    /// metadata lock.  Held only by [`Self::with_metadata`]
-    /// and the upload paths; callers must NOT hold it across
-    /// `.await` boundaries (`parking_lot::Mutex` doesn't
-    /// yield).
+    /// Acquire (or lazily allocate) the per-workspace metadata
+    /// lock.  Used by the upload, dataset, head rotation, head
+    /// delete, and workspace patch paths.  Callers MUST pre-check
+    /// `workspace.json` existence (the lazy `entry().or_insert_with()`
+    /// below would otherwise strand a lock for a never-created id)
+    /// and MUST NOT hold the guard across `.await`
+    /// (`parking_lot::Mutex` doesn't yield).  Entries are ejected
+    /// with the cache cell by `start_delete_workspace_inner_with_id`.
     pub(crate) fn metadata_lock(&self, id: &WorkspaceId) -> Arc<parking_lot::Mutex<()>> {
         self.metadata_locks
             .entry(*id)
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone()
-    }
-
-    /// Read the metadata, run `f` on it, write it back, all
-    /// under the per-workspace lock so concurrent uploads
-    /// can't lose updates.  The closure may fail; the lock
-    /// is released either way.
-    pub fn with_metadata<F, R>(&self, id: &WorkspaceId, f: F) -> Result<R, FileError>
-    where
-        F: FnOnce(&mut WorkspaceMetadata) -> R,
-    {
-        let lock = self.metadata_lock(id);
-        let _guard = lock.lock();
-        let mut meta = self.read_metadata(id)?;
-        let result = f(&mut meta);
-        self.write_metadata(id, &meta)?;
-        Ok(result)
     }
 
     /// Load + parse a workspace's `metadata.json`, gating

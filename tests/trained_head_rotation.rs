@@ -105,6 +105,7 @@ fn publish_one_head_lands_index_atomic() {
             mpk_tempfile: mpk.clone(),
             manifest: manifest.clone(),
         },
+        None,
     )
     .unwrap();
 
@@ -139,6 +140,7 @@ fn publish_three_heads_drops_oldest() {
                 mpk_tempfile: mpk,
                 manifest: sample_manifest(h, 1),
             },
+            None,
         )
         .unwrap();
     }
@@ -152,6 +154,7 @@ fn publish_three_heads_drops_oldest() {
             mpk_tempfile: mpk,
             manifest: sample_manifest(h3, 3),
         },
+        None,
     )
     .unwrap();
     assert_eq!(result.displaced_head_id, Some(h1));
@@ -188,6 +191,7 @@ fn publish_does_not_disturb_orphans() {
             mpk_tempfile: mpk,
             manifest: sample_manifest(h1, 1),
         },
+        None,
     )
     .unwrap();
     assert!(orphan_mpk.exists(), "rotation must not touch orphans");
@@ -246,6 +250,7 @@ fn publish_succeeds_when_displaced_files_are_already_gone() {
                 mpk_tempfile: mpk,
                 manifest: sample_manifest(h, 1),
             },
+            None,
         )
         .unwrap();
     }
@@ -262,6 +267,7 @@ fn publish_succeeds_when_displaced_files_are_already_gone() {
             mpk_tempfile: mpk,
             manifest: sample_manifest(h3, 3),
         },
+        None,
     )
     .unwrap();
     assert_eq!(result.displaced_head_id, Some(h1));
@@ -289,6 +295,7 @@ fn crash_between_steps_6_and_7_leaves_orphan_files_invisible_to_index() {
             mpk_tempfile: mpk,
             manifest: sample_manifest(h1, 1),
         },
+        None,
     )
     .unwrap();
     let pre_crash_index = read_head_index(tmp.path()).unwrap();
@@ -345,6 +352,7 @@ fn rotation_converges_after_simulated_partial_crash() {
             mpk_tempfile: mpk,
             manifest: sample_manifest(h1, 1),
         },
+        None,
     )
     .unwrap();
     assert!(result.displaced_head_id.is_none());
@@ -440,6 +448,248 @@ async fn delete_head_via_workspace_mgr_round_trip() {
     assert_eq!(err.kind(), ErrorKind::NotFound);
 }
 
+// MARK: active-source pin protection
+//
+// Pin the operator-visible contract that a workspace's active
+// source head is never auto-removed: `delete_head` returns
+// `ActiveSourcePinned` (409), and `publish_trained_head_for_workspace`
+// evicts a non-pinned tail entry instead.  The active generation
+// itself owns a separate byte copy under `active/generations/<id>/`,
+// so live inference is unaffected either way.
+
+/// Synth an active generation pointing at `(workspace_id, head_id)`.
+/// Mirrors `publish_active_generation`'s on-disk shape
+/// (`current.json` and `manifest.json`); the head bytes are not
+/// copied because the pin check reads only the manifest
+/// discriminant + ids.
+fn write_synth_active_generation(
+    root: &std::path::Path,
+    workspace_id: WorkspaceId,
+    source_head_id: HeadId,
+    workspace_revision: WorkspaceRevision,
+) -> String {
+    use acoustics_lab::common::workspace::{ActiveHeadManifest, ActiveOrigin};
+    use acoustics_lab::file_mgr::{
+        ActiveCurrentPointer, active_generation_dir, write_active_current, write_active_manifest,
+    };
+    let activation_id = "11111111-2222-4333-8444-555555555ace".to_string();
+    let gen_dir = active_generation_dir(root, &activation_id);
+    std::fs::create_dir_all(&gen_dir).unwrap();
+    let manifest = ActiveHeadManifest {
+        origin: ActiveOrigin::Head {
+            source_workspace_id: workspace_id,
+            source_head_id,
+            workspace_revision,
+        },
+        runtime_head_id: source_head_id,
+        sha256: format!("sha-of-{source_head_id}"),
+        labels_sha256: "labels-sha".to_string(),
+        n_classes: 3,
+        labels: vec!["cat".to_string(), "dog".to_string(), "bird".to_string()],
+        activated_at: "2026-05-07T12:34:56Z".to_string(),
+    };
+    write_active_manifest(root, &activation_id, &manifest).unwrap();
+    write_active_current(
+        root,
+        &ActiveCurrentPointer {
+            activation_id: activation_id.clone(),
+        },
+    )
+    .unwrap();
+    activation_id
+}
+
+/// `delete_head` refuses the active source with 409
+/// `ActiveSourcePinned`; the pin clears once the active manifest
+/// points elsewhere and the same delete then succeeds.
+#[tokio::test(flavor = "current_thread")]
+async fn delete_head_refuses_active_source_pin() {
+    use acoustics_lab::common::error::{Categorized, ErrorKind};
+    use acoustics_lab::file_mgr::{FileError, FsService, FsServiceImpl};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let create_fs: Arc<dyn FsService> = Arc::new(FsServiceImpl::new(root.clone()));
+    create_fs.ensure_root_layout().unwrap();
+    let id = create_fs.create("active-pin-test").unwrap();
+    let workspace_dir = root.join("workspaces").join(id.to_string());
+    drop(create_fs);
+
+    // Stage h1 + h2 directly on disk (skipping the rotation
+    // primitive -- this test exercises `delete_head` in isolation).
+    std::fs::create_dir_all(workspace_dir.join("heads")).unwrap();
+    let h1 = HeadId::new();
+    let h2 = HeadId::new();
+    for &h in &[h1, h2] {
+        let mpk = stage_mpk_tempfile(&workspace_dir, h);
+        std::fs::rename(&mpk, head_artifact_path(&workspace_dir, h)).unwrap();
+        let manifest = sample_manifest(h, 1);
+        std::fs::write(
+            head_manifest_path(&workspace_dir, h),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+    let mut idx = HeadIndex::default();
+    idx.heads.push(HeadRecord {
+        head_id: h2,
+        workspace_revision: rev(1),
+        sha256: format!("sha-of-{h2}"),
+        n_classes: 3,
+        size_bytes: 1024,
+        created_at: "2026-05-07T12:34:56Z".to_string(),
+    });
+    idx.heads.push(HeadRecord {
+        head_id: h1,
+        workspace_revision: rev(1),
+        sha256: format!("sha-of-{h1}"),
+        n_classes: 3,
+        size_bytes: 1024,
+        created_at: "2026-05-07T12:34:56Z".to_string(),
+    });
+    write_head_index(&workspace_dir, &idx).unwrap();
+    let mut core = read_workspace_core(&workspace_dir).unwrap();
+    core.head_count = 2;
+    write_workspace_core(&workspace_dir, &core).unwrap();
+
+    // Activate h1 (synth the active generation -- the pin only
+    // reads `origin` + ids).
+    let activation_id = write_synth_active_generation(&root, id, h1, rev(1));
+
+    // Fresh FsServiceImpl so the cache lazy-loads.
+    let fs: Arc<dyn FsService> = Arc::new(FsServiceImpl::new(root.clone()));
+
+    // Delete h1 (the active source): 409 ActiveSourcePinned;
+    // h1's bytes stay.  Downcast pins the exact variant so a
+    // regression slipping in a different Conflict discriminant
+    // (e.g. JobConflict) fails this test.
+    let err = fs.delete_head(&id, h1).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Conflict);
+    let inner = std::error::Error::source(&err)
+        .and_then(|e| e.downcast_ref::<FileError>())
+        .expect("FsError wraps a FileError for this surface");
+    assert!(
+        matches!(inner, FileError::ActiveSourcePinned { .. }),
+        "expected ActiveSourcePinned, got {inner:?}",
+    );
+    assert!(head_artifact_path(&workspace_dir, h1).is_file());
+    assert!(head_manifest_path(&workspace_dir, h1).is_file());
+    // Non-pinned head deletes normally.
+    fs.delete_head(&id, h2).unwrap();
+    assert!(!head_artifact_path(&workspace_dir, h2).exists());
+
+    // Release the pin: point the active manifest at a different
+    // (synthetic) head id.  h1 then deletes cleanly.
+    let other = HeadId::new();
+    use acoustics_lab::common::workspace::{ActiveHeadManifest, ActiveOrigin};
+    use acoustics_lab::file_mgr::write_active_manifest;
+    let new_manifest = ActiveHeadManifest {
+        origin: ActiveOrigin::Head {
+            source_workspace_id: id,
+            source_head_id: other,
+            workspace_revision: rev(1),
+        },
+        runtime_head_id: other,
+        sha256: format!("sha-of-{other}"),
+        labels_sha256: "labels-sha".to_string(),
+        n_classes: 3,
+        labels: vec!["cat".to_string(), "dog".to_string(), "bird".to_string()],
+        activated_at: "2026-05-07T12:34:56Z".to_string(),
+    };
+    write_active_manifest(&root, &activation_id, &new_manifest).unwrap();
+    fs.delete_head(&id, h1).unwrap();
+    assert!(!head_artifact_path(&workspace_dir, h1).exists());
+}
+
+/// `publish_trained_head_for_workspace` resolves the active
+/// source pin and forwards it to the primitive: with H1 active,
+/// the H3 publish displaces H2 instead of H1.  Proves the
+/// wrapper plumbs the lookup correctly (unit-level coverage
+/// lives at `publish_skips_pinned_head_during_eviction`).
+#[tokio::test(flavor = "current_thread")]
+async fn publish_through_workspace_mgr_respects_active_pin() {
+    use acoustics_lab::file_mgr::{FsService, FsServiceImpl};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let create_fs: Arc<dyn FsService> = Arc::new(FsServiceImpl::new(root.clone()));
+    create_fs.ensure_root_layout().unwrap();
+    let id = create_fs.create("active-pin-rotation").unwrap();
+    let workspace_dir = root.join("workspaces").join(id.to_string());
+    drop(create_fs);
+
+    // Stage h1 + h2 on disk via the rotation primitive so the
+    // cache matches.  Activate h1.
+    std::fs::create_dir_all(workspace_dir.join("heads")).unwrap();
+    let h1 = HeadId::new();
+    let h2 = HeadId::new();
+    let fs: Arc<dyn FsService> = Arc::new(FsServiceImpl::new(root.clone()));
+    for (h, rev_id) in [(h1, 1u64), (h2, 2)] {
+        let mpk = stage_mpk_tempfile(&workspace_dir, h);
+        fs.publish_trained_head(
+            &id,
+            PendingHead {
+                head_id: h,
+                mpk_tempfile: mpk,
+                manifest: HeadManifest {
+                    head_id: h,
+                    workspace_id: id,
+                    workspace_revision: rev(rev_id),
+                    sha256: format!("sha-of-{h}"),
+                    n_classes: 3,
+                    size_bytes: 1024,
+                    created_at: "2026-05-07T12:34:56Z".to_string(),
+                    labels: vec!["cat".to_string(), "dog".to_string(), "bird".to_string()],
+                },
+            },
+        )
+        .unwrap();
+    }
+    let summary = fs.summary(&id).unwrap();
+    assert_eq!(summary.heads.heads.len(), 2);
+
+    // Activate h1.
+    let _activation_id = write_synth_active_generation(&root, id, h1, rev(1));
+
+    // Publish h3 -- without protection h1 would be displaced (it
+    // is the chronological tail).  With the pin, h2 is displaced
+    // and h1 survives.
+    let h3 = HeadId::new();
+    let mpk3 = stage_mpk_tempfile(&workspace_dir, h3);
+    let result = fs
+        .publish_trained_head(
+            &id,
+            PendingHead {
+                head_id: h3,
+                mpk_tempfile: mpk3,
+                manifest: HeadManifest {
+                    head_id: h3,
+                    workspace_id: id,
+                    workspace_revision: rev(3),
+                    sha256: format!("sha-of-{h3}"),
+                    n_classes: 3,
+                    size_bytes: 1024,
+                    created_at: "2026-05-07T12:34:56Z".to_string(),
+                    labels: vec!["cat".to_string(), "dog".to_string(), "bird".to_string()],
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        result.displaced_head_id,
+        Some(h2),
+        "pinned h1 must survive; h2 (next-oldest non-pinned) gets evicted",
+    );
+
+    // h1 must still exist on disk + in the index.
+    let summary = fs.summary(&id).unwrap();
+    let head_ids: Vec<HeadId> = summary.heads.heads.iter().map(|r| r.head_id).collect();
+    assert!(head_ids.contains(&h1), "active source h1 survives rotation");
+    assert!(head_ids.contains(&h3), "newest head h3 lands");
+    assert!(!head_ids.contains(&h2), "non-pinned tail h2 evicted");
+    assert!(head_artifact_path(&workspace_dir, h1).is_file());
+    assert!(!head_artifact_path(&workspace_dir, h2).exists());
+    assert!(head_artifact_path(&workspace_dir, h3).is_file());
+}
+
 // MARK: published-shape pins
 //
 // The rotation primitive produces JSON blobs that downstream
@@ -468,6 +718,7 @@ fn published_manifest_carries_minimized_field_set_only() {
             mpk_tempfile: mpk,
             manifest: sample_manifest(head_id, 7),
         },
+        None,
     )
     .unwrap();
 
@@ -541,6 +792,7 @@ fn published_index_carries_minimized_record_field_set_only() {
             mpk_tempfile: mpk,
             manifest: sample_manifest(head_id, 11),
         },
+        None,
     )
     .unwrap();
 

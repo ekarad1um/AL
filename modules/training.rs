@@ -328,6 +328,15 @@ impl JobRegistry {
         });
         self.jobs.insert(job_id, entry.clone());
 
+        // Detached on purpose: the `JobEntry` (above) carries
+        // every API-visible field, and shutdown reaches the worker
+        // via the `cancel` flag (set by `cancel_all_for_shutdown`
+        // from the pre-drain hook).  The blocking pool cannot
+        // abort mid-batch, so cancel latency is bounded by one
+        // BACKBONE_BATCH (~hundreds of ms).  The semaphore
+        // `permit` is moved into the closure and dropped after
+        // the terminal state transition, restoring
+        // `max_train_jobs = 1` exactly at terminal publication.
         tokio::spawn(async move {
             let outcome = run_job(files, job, job_id, progress_tx, cancel).await;
             let mut core = entry.core.lock();

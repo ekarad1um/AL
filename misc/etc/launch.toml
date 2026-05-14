@@ -46,7 +46,7 @@ path = "misc/heads/default/head.mpk"
 labels_path = "misc/heads/default/labels.txt"
 
 [training_defaults]
-epochs = 32
+epochs = 50
 batch_size = 16
 learning_rate_e6 = 100
 

@@ -395,7 +395,7 @@ pub struct TrainingDefaults {
 impl Default for TrainingDefaults {
     fn default() -> Self {
         Self {
-            epochs: 32,
+            epochs: 50,
             batch_size: 16,
             learning_rate_e6: 100, // 1e-4
         }

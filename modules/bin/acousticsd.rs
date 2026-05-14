@@ -23,6 +23,16 @@
 // by the `mimalloc` feature (default-on).  Test builds
 // that disable default features pick the system allocator
 // instead.
+//
+// RSS plateaus above the pre-training baseline after a
+// training run: mimalloc returns the ~256 MiB feature
+// buffer ([`crate::training::finetune::extract_features`])
+// to its arena on drop but does not eagerly munmap the
+// pages.  This is documented behaviour, not a leak; the
+// arena is reused on the next run.  Deployments needing
+// tighter bounds export `MIMALLOC_PURGE_DELAY=1000` (ms)
+// before exec'ing `acousticsd`; see mimalloc's
+// `mi_option_*` docs for the full surface.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

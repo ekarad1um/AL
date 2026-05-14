@@ -84,6 +84,12 @@ pub struct HeadRotationResult {
 /// duration of this call.  The rotation is sync; never `.await`
 /// inside.
 ///
+/// `pinned_head` is the head id (if any) the rotation MUST NOT
+/// displace -- typically the active source resolved via
+/// [`crate::file_mgr::active_source_head_in_workspace`].  Eviction
+/// then drops the tail-most NON-pinned entry; passing `None`, or a
+/// pin absent from the prior index, yields the original LRU tail.
+///
 /// 10 steps in order:
 ///
 /// 1. Stage `<id>.json` to `.tmp/<random>` and atomically write
@@ -95,7 +101,9 @@ pub struct HeadRotationResult {
 ///    the per-workspace mutex serializes against any concurrent
 ///    mutation so the cache's snapshot is current).
 /// 4. Compute next `heads[]`: prepend the new entry; if
-///    `len > 2`, mark the tail for deletion.
+///    `len > MAX_HEADS_PER_WORKSPACE`, displace the tail-most
+///    non-pinned entry (the new head at position 0 is never a
+///    displacement candidate).
 /// 5. Atomically rename the staged tempfiles into
 ///    `heads/<id>.{mpk,json}`.
 /// 6. fsync `heads/`.
@@ -124,6 +132,7 @@ pub fn publish_trained_head(
     workspace_dir: &Path,
     cache: &WorkspaceCacheCell,
     pending: PendingHead,
+    pinned_head: Option<HeadId>,
 ) -> Result<HeadRotationResult, FileError> {
     if pending.manifest.head_id != pending.head_id {
         return Err(io_err(
@@ -193,14 +202,17 @@ pub fn publish_trained_head(
         next_records.push(rec.clone());
     }
     let displaced_head_id = if next_records.len() > MAX_HEADS_PER_WORKSPACE {
-        // Sliding window: drop the oldest tail entry.  The
-        // truncate-to-cap shape is deterministic so a future
-        // change to MAX_HEADS_PER_WORKSPACE only requires the
-        // common::workspace constant move.
-        next_records
-            .drain(MAX_HEADS_PER_WORKSPACE..)
-            .next()
-            .map(|r| r.head_id)
+        // Pick the tail-most non-pinned slot.  At most one slot
+        // can ever be pinned (one active source daemon-wide), and
+        // the prior `prev_heads.len() <= MAX` invariant means
+        // exactly one eviction restores the cap.  `unwrap_or(len-1)`
+        // is a defensive fallback for the impossible all-pinned
+        // case; the new head at index 0 is never a candidate.
+        let drop_idx = (1..next_records.len())
+            .rev()
+            .find(|&i| pinned_head.is_none_or(|pin| next_records[i].head_id != pin))
+            .unwrap_or(next_records.len() - 1);
+        Some(next_records.remove(drop_idx).head_id)
     } else {
         None
     };
@@ -302,6 +314,10 @@ impl WorkspaceMgr {
     ///   references this workspace (workspace-wide reference, or
     ///   any dataset reference -- the head deletion would race
     ///   the in-flight job).
+    /// - 409 [`FileError::ActiveSourcePinned`] when the head is
+    ///   the source of the current active generation: operator
+    ///   activates a different head (or the bundled default)
+    ///   first, then retries.
     /// - 404 [`FileError::AssetNotFound`] when the head id is
     ///   not in the current `heads.json`.
     /// - On success: index-atomic removal of the entry from
@@ -334,6 +350,18 @@ impl WorkspaceMgr {
         // Per-workspace mutation mutex.  Sync; never `.await`.
         let lock = self.metadata_lock(ws);
         let _guard = lock.lock();
+
+        // Active-source pin under the mutex: refuse to delete a
+        // currently-active source.  Race semantics on the helper.
+        if let Some(active_source) =
+            crate::file_mgr::active_source_head_in_workspace(&self.root, *ws)
+            && active_source == head_id
+        {
+            return Err(FileError::ActiveSourcePinned {
+                workspace_id: ws.to_string(),
+                head_id: head_id.to_string(),
+            });
+        }
 
         // Resolve the cache cell (lazy-load on first touch).
         let cell = self.cache_cell_for_head_delete(ws)?;
@@ -450,8 +478,10 @@ impl WorkspaceMgr {
         }
         let lock = self.metadata_lock(ws);
         let _guard = lock.lock();
+        // Resolve the pin under the mutex; race semantics on the helper.
+        let pinned_head = crate::file_mgr::active_source_head_in_workspace(&self.root, *ws);
         let cell = self.cache_cell_for_head_delete(ws)?;
-        publish_trained_head(&workspace_dir, &cell, pending)
+        publish_trained_head(&workspace_dir, &cell, pending, pinned_head)
     }
 }
 
@@ -547,6 +577,7 @@ mod tests {
                 mpk_tempfile: mpk.clone(),
                 manifest: manifest.clone(),
             },
+            None,
         )
         .unwrap();
 
@@ -592,6 +623,7 @@ mod tests {
                 mpk_tempfile: mpk,
                 manifest: sample_manifest(h1, 1),
             },
+            None,
         )
         .unwrap();
         // Publish h2.
@@ -604,6 +636,7 @@ mod tests {
                 mpk_tempfile: mpk,
                 manifest: sample_manifest(h2, 2),
             },
+            None,
         )
         .unwrap();
         assert_eq!(cache.heads().heads.len(), 2);
@@ -619,6 +652,7 @@ mod tests {
                 mpk_tempfile: mpk,
                 manifest: sample_manifest(h3, 3),
             },
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -668,6 +702,7 @@ mod tests {
                 mpk_tempfile: mpk,
                 manifest: sample_manifest(h1, 1),
             },
+            None,
         )
         .unwrap();
         assert!(orphan_mpk.exists(), "rotation must not touch orphans");
@@ -734,6 +769,7 @@ mod tests {
                     mpk_tempfile: mpk,
                     manifest: sample_manifest(h, 1),
                 },
+                None,
             )
             .unwrap();
         }
@@ -753,6 +789,7 @@ mod tests {
                 mpk_tempfile: mpk,
                 manifest: sample_manifest(h3, 3),
             },
+            None,
         )
         .unwrap();
         assert_eq!(result.displaced_head_id, Some(h1));
@@ -782,6 +819,7 @@ mod tests {
                 mpk_tempfile: mpk,
                 manifest: bad_manifest,
             },
+            None,
         );
         assert!(matches!(result, Err(FileError::Io { .. })));
         // Nothing landed.
@@ -806,8 +844,117 @@ mod tests {
                 mpk_tempfile: tmp.path().join(".tmp/never-staged.mpk"),
                 manifest: sample_manifest(h1, 1),
             },
+            None,
         );
         assert!(matches!(result, Err(FileError::Io { .. })));
         assert!(!head_artifact_path(tmp.path(), h1).exists());
+    }
+
+    /// Pinned head survives eviction: with H1 marked as the
+    /// active source on the H3 publish, the rotation displaces
+    /// H2 (next-oldest non-pinned) rather than H1.  Pins the
+    /// operator-visible contract that an active source is never
+    /// auto-removed.
+    #[test]
+    fn publish_skips_pinned_head_during_eviction() {
+        let (tmp, cache) = fresh_workspace();
+        let h1 = HeadId::new();
+        let h2 = HeadId::new();
+        let h3 = HeadId::new();
+
+        // Publish h1 + h2 without a pin (heads = [h2, h1]).
+        for &h in &[h1, h2] {
+            let mpk = stage_mpk_tempfile(tmp.path(), h);
+            publish_trained_head(
+                tmp.path(),
+                &cache,
+                PendingHead {
+                    head_id: h,
+                    mpk_tempfile: mpk,
+                    manifest: sample_manifest(h, 1),
+                },
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(cache.heads().heads.len(), 2);
+
+        // Publish h3 with h1 pinned (the active-source case).
+        // Eviction must drop h2 (the next-oldest non-pinned tail)
+        // rather than h1.
+        let mpk = stage_mpk_tempfile(tmp.path(), h3);
+        let result = publish_trained_head(
+            tmp.path(),
+            &cache,
+            PendingHead {
+                head_id: h3,
+                mpk_tempfile: mpk,
+                manifest: sample_manifest(h3, 3),
+            },
+            Some(h1),
+        )
+        .unwrap();
+        assert_eq!(
+            result.displaced_head_id,
+            Some(h2),
+            "pinned h1 must survive; h2 (next-oldest non-pinned) gets evicted",
+        );
+        let on_disk = crate::file_mgr::schema::read_head_index(tmp.path()).unwrap();
+        assert_eq!(on_disk.heads.len(), 2);
+        assert_eq!(on_disk.heads[0].head_id, h3, "newest first");
+        assert_eq!(on_disk.heads[1].head_id, h1, "pinned survivor at tail");
+        // h2's files were removed; h1's + h3's remain.
+        assert!(!head_artifact_path(tmp.path(), h2).exists());
+        assert!(!head_manifest_path(tmp.path(), h2).exists());
+        assert!(head_artifact_path(tmp.path(), h1).is_file());
+        assert!(head_manifest_path(tmp.path(), h1).is_file());
+        assert!(head_artifact_path(tmp.path(), h3).is_file());
+        assert!(head_manifest_path(tmp.path(), h3).is_file());
+    }
+
+    /// Stale-pin fallback: a pin id absent from the prior index
+    /// (stale active manifest, etc.) yields the original LRU
+    /// tail.  Guards against a regression where an unmatched pin
+    /// would silently protect a phantom slot.
+    #[test]
+    fn publish_falls_through_when_pinned_id_not_in_index() {
+        let (tmp, cache) = fresh_workspace();
+        let h1 = HeadId::new();
+        let h2 = HeadId::new();
+        let h3 = HeadId::new();
+        let phantom = HeadId::new(); // never published
+
+        for &h in &[h1, h2] {
+            let mpk = stage_mpk_tempfile(tmp.path(), h);
+            publish_trained_head(
+                tmp.path(),
+                &cache,
+                PendingHead {
+                    head_id: h,
+                    mpk_tempfile: mpk,
+                    manifest: sample_manifest(h, 1),
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        let mpk = stage_mpk_tempfile(tmp.path(), h3);
+        let result = publish_trained_head(
+            tmp.path(),
+            &cache,
+            PendingHead {
+                head_id: h3,
+                mpk_tempfile: mpk,
+                manifest: sample_manifest(h3, 3),
+            },
+            Some(phantom),
+        )
+        .unwrap();
+        assert_eq!(
+            result.displaced_head_id,
+            Some(h1),
+            "stale pin must not protect anyone; chronological tail evicted",
+        );
     }
 }

@@ -127,8 +127,8 @@ pub mod metrics_hooks;
 
 pub use active_head_writer::{
     ActivationError, ActivationOriginInput, ActivationResult, HeadInnerLoader, PendingActivation,
-    prune_old_generations, publish_active_generation, stage_and_validate_activation,
-    staging_path_for,
+    active_source_head_in_workspace, prune_old_generations, publish_active_generation,
+    stage_and_validate_activation, staging_path_for,
 };
 pub use cache::WorkspaceCacheCell;
 pub use dataset::{
@@ -208,11 +208,13 @@ use validate::validate_extension;
 /// either old or new bytes, never partial.  Index-atomic publishes
 /// (`heads.json` + `workspace.json`) serialize per workspace via a
 /// `parking_lot::Mutex<()>` sharded through a `DashMap`; concurrent
-/// mutations on different workspaces don't contend.  The lock map
-/// is unbounded -- a daemon that creates and deletes many
-/// workspaces accumulates ~64 B per stale id.  Production cleanup
-/// is deferred (single-workspace deployments are the dominant
-/// shape today).
+/// mutations on different workspaces don't contend.  Both the
+/// `metadata_locks` and `caches` maps are bounded by the live
+/// workspace count: entries are inserted on `create` /
+/// lazy-load and ejected by `start_delete_workspace_inner_with_id`
+/// in lockstep.  Every `metadata_lock` caller pre-checks
+/// `workspace.json` existence so a request for a never-created id
+/// cannot strand a lock entry.
 ///
 /// Method bodies are split across sibling modules:
 /// `registry.rs` (create/delete/list), `metadata.rs` (legacy

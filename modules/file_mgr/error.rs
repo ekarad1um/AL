@@ -108,6 +108,23 @@ pub enum FileError {
     /// discriminator code.  Maps to HTTP 409.
     #[error("another train job is already running daemon-wide (max_train_jobs = 1)")]
     AnotherTrainRunning,
+    /// Operation would remove the head the current active
+    /// generation was sourced from.  Inference itself survives
+    /// (the active generation owns a copy of the bytes), but the
+    /// workspace's `heads.json` row would dangle under
+    /// `GET /active`'s `source_head_id`.  Operator activates a
+    /// different head (or the bundled default) first, then
+    /// retries.  Maps to HTTP 409.
+    #[error(
+        "head {head_id} is the current active source for workspace {workspace_id}; \
+         activate a different head before evicting / deleting it"
+    )]
+    ActiveSourcePinned {
+        /// Owning workspace id.
+        workspace_id: String,
+        /// The pinned head id.
+        head_id: String,
+    },
 }
 
 /// Shorthand for `FileError::Io { path: path.to_string(), source }`.
@@ -179,6 +196,12 @@ impl crate::common::error::Categorized for FileError {
             // already at capacity.  409 Conflict matches the
             // redesign §6 / §9 wire contract.
             FileError::AnotherTrainRunning => Conflict,
+            // Operation conflicts with the active deployment's
+            // source-head pin: operator deactivates / activates
+            // a different head first, then retries.  Same 409
+            // taxonomy as the other "request well-formed,
+            // state isn't ready" shapes.
+            FileError::ActiveSourcePinned { .. } => Conflict,
             // Daemon-internal: filesystem failures mid-write,
             // malformed metadata.json a previous boot wrote,
             // tempfile-persist failures, daemon-owned metadata

@@ -35,7 +35,7 @@ use crate::file_mgr::fs_atomic::put_atomic;
 use crate::file_mgr::schema::{
     ACTIVE_HEAD_FILENAME, ACTIVE_LABELS_FILENAME, ActiveCurrentPointer, active_dir,
     active_generation_dir, active_generations_dir, active_staging_dir, head_artifact_path,
-    read_head_manifest, write_active_current,
+    read_active_current, read_active_manifest, read_head_manifest, write_active_current,
 };
 use crate::file_mgr::validate::{fsync_dir, hex_lowercase};
 
@@ -592,6 +592,40 @@ pub fn prune_old_generations<S: AsRef<str>>(
 /// created lazily by [`stage_and_validate_activation`].
 pub fn staging_path_for(root: &Path, activation_id: &str) -> PathBuf {
     active_staging_dir(root).join(activation_id)
+}
+
+/// Source head id of the current active generation, scoped to
+/// `workspace_id`.  Returns `Some(head_id)` iff the published
+/// manifest has [`ActiveOrigin::Head`] AND `source_workspace_id`
+/// matches; `None` for [`ActiveOrigin::Default`], a different
+/// source workspace, no active generation, or any IO / parse
+/// failure reading `current.json` or the generation manifest.
+///
+/// Best-effort, never errors: a transient `active/` FS hiccup
+/// returns `None` (caller proceeds without protection) rather
+/// than failing a legitimate publish.  No lock is taken; a
+/// concurrent `POST /active` may race the caller's mutation.
+/// The active deployment itself is unaffected (activation copies
+/// bytes to `active/generations/<id>/` before publishing
+/// `current.json`), so the worst case is the workspace's
+/// `heads.json` losing the entry the active manifest points at
+/// -- a pre-existing fragility this helper narrows but cannot
+/// fully close without activation coordinating on the
+/// per-workspace mutation lock.
+pub fn active_source_head_in_workspace(
+    root: &Path,
+    workspace_id: WorkspaceId,
+) -> Option<HeadId> {
+    let pointer = read_active_current(root).ok()?;
+    let manifest = read_active_manifest(root, &pointer.activation_id).ok()?;
+    match manifest.origin {
+        ActiveOrigin::Head {
+            source_workspace_id,
+            source_head_id,
+            ..
+        } if source_workspace_id == workspace_id => Some(source_head_id),
+        _ => None,
+    }
 }
 
 /// Render an active-head `labels.txt` body from the manifest's
