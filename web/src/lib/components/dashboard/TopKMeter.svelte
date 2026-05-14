@@ -1,16 +1,13 @@
 <script lang="ts">
   import { streams } from '$lib/stores/streams.svelte';
+  // Shared helper -- the dataset accordion's row header uses the same
+  // function, so a class called `cat` in the dataset shows up as
+  // `Cat` here too.  The raw token still appears in the inspector
+  // via the `<span title>` so engineers debugging a label mismatch
+  // can read the on-wire identifier verbatim.
+  import { prettyCategoryName } from '$lib/components/category/labels';
 
   let rows = $derived(streams.latestTopK);
-
-  // Daemon labels follow the Speech-Commands convention of wrapping the
-  // synthetic categories in underscores (`_unknown_`, `_background_noise_`).
-  // For display we strip leading/trailing underscores and turn internal
-  // separators into spaces -- the raw token still lives in the dom (title
-  // attribute) for engineers debugging via the inspector.
-  function prettyLabel(raw: string): string {
-    return raw.replace(/^_+/, '').replace(/_+$/, '').replace(/_+/g, ' ');
-  }
 </script>
 
 <div class="space-y-2">
@@ -21,7 +18,7 @@
       {@const pct = Math.max(0, Math.min(1, row.prob))}
       <div class="grid grid-cols-[7rem_1fr_3rem] items-center gap-3">
         <span class="truncate text-sm font-medium text-zinc-700" title={row.label}
-          >{prettyLabel(row.label)}</span
+          >{prettyCategoryName(row.label)}</span
         >
         <!-- overflow-hidden on the rounded container clips the inner fill
              into the pill shape, so tiny values render as a thin sliver

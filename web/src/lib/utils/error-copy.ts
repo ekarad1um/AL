@@ -74,11 +74,24 @@ function stripLayerPrefix(s: string): string {
 // already well-formed but occasionally arrive lower-case or without
 // terminal punctuation; normalize so call sites never have to.
 function finish(s: string): string {
-  const stripped = stripLayerPrefix(s).trim();
-  if (!stripped) return 'Something went wrong.';
-  const head = stripped[0].toUpperCase() + stripped.slice(1);
-  if (/[.!?…]$/.test(head)) return head;
-  return `${head}.`;
+  return capFirst(stripLayerPrefix(s));
+}
+
+// Sentence-case + trailing period, without the daemon-layer prefix
+// stripping that `errorCopy` applies.  Use this for messages that
+// arrive *pre-cleaned* (e.g. an SSE terminal event's `message` field,
+// which the daemon emits without the `fs:` / `convert:` etc. tag)
+// where another `stripLayerPrefix` pass would risk lopping off a
+// legitimate leading word that happens to match a known prefix.
+// The `fallback` is what we return for blank input -- call sites that
+// know the failure shape pass a domain-specific phrase (e.g. "Delete
+// failed.") so the operator doesn't see a generic "Something went
+// wrong." in a place where the action is unambiguous.
+export function capFirst(s: string, fallback = 'Something went wrong.'): string {
+  const t = s.trim();
+  if (!t) return fallback;
+  const head = t[0].toUpperCase() + t.slice(1);
+  return /[.!?…]$/.test(head) ? head : `${head}.`;
 }
 
 // Convenience guard used by stores: detect "the resource is gone"

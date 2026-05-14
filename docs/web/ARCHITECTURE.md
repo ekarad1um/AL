@@ -20,6 +20,31 @@ The system can be categorized into the Dashboard Tab (Visualization Module + Con
 
 8. Health Monitoring Badge Module: A small badge that displays the current health status of the system, including backend connectivity, inference engine status, and resource usage. Hovering over the badge provides quick access to detailed health information and troubleshooting tips.
 
+### Extra Notes:
+
+1. Dataset Management Module Layout: On the Dataset Management Module Space, category modules should be arranged vertically as rows (list view). Active categories are expanded, while inactive ones are collapsed. The system must support adding and deleting categories; however, the default "Background Noise" category must be persistent and undeletable.
+
+2. Category Module Structure: Expanded category modules are divided into two main areas: left and right (these should stack vertically on mobile devices). The left side is the Input Module Workspace, and the right side is the Slice Management Module Workspace.
+
+3. Input Module Workspace: This workspace should support input device selection, audio recording, audio clip display, and start/end trimming:
+
+    1. Input Device Selection: Allow selection between the browser microphone, device audio streams (with the current streaming device indicated), and drag-and-drop audio file uploads.
+    2. Audio Recording (Non-upload mode): After selecting an input device, record single-channel audio. Display a real-time waveform for a specific time window during recording, and show the current recording status and duration in an appropriate position.
+    3. Audio Clip Display & Trimming: For recorded or manually uploaded audio clips, use a waveform as the background to represent the length. Provide a range selection bar where users can drag the left and right edges to trim the audio (minimum length: 1s, 44,100 samples). Selected segments should be playable via click.
+    4. Other Details:
+        - After completing the above steps, users can click a "Slice" button to convert the recorded audio into standard-length slices (1s, 44,100 samples) in the right-side Slice Management Module Workspace. Each conversion acts as an "append" operation (not an overwrite).
+        - The Input Module Workspace will only retain the most recent audio clip.
+        - The recommended recording sample rate is 48kHz or 44.1kHz. Audio resampling capabilities may be required. Currently, importing formats other than WAV is not supported.
+        - Support exporting and downloading completed audio recordings.
+
+4. Slice Management Module Workspace: This workspace must support the display, playback, and deletion of slices, alongside slice quantity and quality checks:
+    1. Display: Consider rendering slices as rectangular card elements, using their Spectrogram image as the background fill.
+    2. Playback and Deletion: Allow users to click to play or delete a slice.
+    3. Quantity and Quality Check: A minimum of 20 slices is required for "Background Noise"; for all other categories, a minimum of 10 slices is required.
+
+5. Overall Frontend-Backend Interaction Flow: Upon loading the Dataset Management Module Space, synchronize the existing categories and recorded clips from the backend. After completing the dataset creation or updates, transmit the data back to the backend based on addition and deletion actions (both categories and slices). During data synchronization, consider displaying a loading animation or implementing a lazy-loading design to reduce the initial data payload.
+
+
 ## B. User Interaction Flow
 
 1. Landing on Dashboard Tab - Upon launching the frontend, users are greeted with the Dashboard Tab, where they can immediately observe the Visualization Module displaying real-time audio and inference streams. The Health Monitoring Badge provides an at-a-glance status of the system's health.

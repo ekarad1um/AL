@@ -27,6 +27,83 @@ Updated as slices ship. Anchor for future sessions to avoid re-doing.
 ### Shipped
 
 - **Slice A — Dashboard MVP** (complete; see [docs/web/NOTES.md](./NOTES.md) for design-system decisions).
+- **Slice B polish — Slice selection + bulk-delete UX** (2026-05-13):
+  - **No-confirmation slice batch delete** ([category/SlicePane.svelte](../../web/src/lib/components/category/SlicePane.svelte)): every batch entry point (toolbar `Delete N` pill, Del / Backspace on the focused grid, right-click "Delete N slices") fires `slices.deleteMany` directly on click — single-target deletes (hover trash, single-slice context-menu Delete) stay immediate, and the batch path now matches them. The earlier `BulkDeleteSlicesDialog` confirmation modal was deleted because the selecting-mode opt-in (Ctrl/Cmd-click / Cmd-Ctrl+A / right-click "Select") + the explicit per-row tick + the destructive rose toolbar pill already represent intent expressed three times; stacking a fourth "are you sure?" modal duplicated the friction without adding signal, and diverged from the single-card path that ships immediate. Targets are captured synchronously at click time (the `.filter` runs before any await) so a background upload appending mid-`deleteMany` doesn't poison the batch; `clearSelection()` fires before the pipeline starts so a follow-up toolbar click or held Backspace lands on an empty selection and bails through the existing `selectedIds.size === 0` early-return. Failed targets re-enter the selection on terminal so the operator can retry without rebuilding it. Workspaces' bulk delete keeps its modal — its blast radius (whole dataset + heads + logs) is a different magnitude from a 1 s clip.
+  - **`slices.deleteMany(targets)`** ([stores/slices.svelte.ts](../../web/src/lib/stores/slices.svelte.ts)): fans out to per-record `delete()` via `Promise.all`. Daemon-bound deletes serialise through the global `enqueueDelete` chain (the daemon's `max_delete_jobs = 1` requires it); local-only / failed / uploading targets parallelise their IDB writes since disjoint primary keys don't conflict. Returns `BulkSliceDeleteOutcome { succeeded, failed }` for future "retry failures" surfaces.
+  - **In-flight delete protection** ([stores/slices.svelte.ts](../../web/src/lib/stores/slices.svelte.ts) + [category/SliceCard.svelte](../../web/src/lib/components/category/SliceCard.svelte) + [category/SlicePane.svelte](../../web/src/lib/components/category/SlicePane.svelte)): the slices store exposes a reactive `deletingIds: SvelteSet<string>` populated/cleared by `delete()`'s `try/finally` (with an idempotency early-return so a re-entrant call on an already-mid-flight id is a no-op). Per-row chrome on `SliceCard` is _static_ — `opacity-50` + `pointer-events-none` + `aria-busy` on the wrapper, plus `disabled={deleting}` on every interactive descendant (card body, trash, checkbox, retry) so a keyboard Enter on a focused card can't bypass the mouse-only pointer-events block. The ONLY animated affordance lives in the toolbar's Delete button: when `deletingIds.size > 0` it label-swaps to "Deleting N…" with an `animate-spin` glyph and disables. Centralising the animation is the performance call — a 30-slice batch previously meant 30 simultaneous spinners (30 transform recalcs + 30 compositor layers / frame on top of the live-audio RAF loop); now it's one spinner regardless of batch size. `SlicePane`'s `selectAll` / `toggleSelection` / `selectRange` / `play` / `retryUpload` / `bulkDelete` / `onGridContextMenu` all filter or bail on deleting ids; `Del`/`Backspace` and the header click both gate on `isAnyDeleting` so a held-down Backspace or a re-clicked toolbar button can't fire a fresh `slices.deleteMany` over the drain; `allSelected` is computed against the non-deleting eligible subset so the toolbar's `Select all` / `Deselect all` toggle flips correctly even when one row is mid-flight. Mirrors the workspaces store's `deleting: SvelteSet<Uuid>` + WorkspaceCard's `isDeleting` pattern for cross-module consistency.
+  - **Daemon-as-master reconciliation on `slices.refresh`** ([stores/slices.svelte.ts](../../web/src/lib/stores/slices.svelte.ts)): refresh now splits local IDB rows into `kept` + `orphans` against the daemon's category listing. An orphan is a local `committed` row whose filename is absent from the daemon — i.e., the daemon-side delete completed but the local cleanup didn't (most commonly: page closed mid-batch-delete between the SSE-terminal landing and `idbDeleteSlice` firing). Orphans get GC'd from IDB + their spectrogram / blob caches revoked, so on next mount the operator sees the daemon-truthful state with no phantom committed cards that would 404 on play. `local` / `uploading` / `failed` rows are preserved unconditionally — those have no daemon presence by definition, and `resumePending` re-queues them through the upload pool from the same mount cycle. This makes the page-close-mid-delete failure mode self-healing: the daemon job runs independently to terminal, refresh reconciles, no persistent "this delete is in flight" marker has to survive the tab dying.
+  - **InputPane height parity across modes** ([category/InputPane.svelte](../../web/src/lib/components/category/InputPane.svelte), [category/CategoryRow.svelte](../../web/src/lib/components/category/CategoryRow.svelte)): waveform row's `flex-1 min-h-32` → `flex-1 min-h-0` so the pane's outer height stays welded to the grid's `min-h-80` (320 px) floor across every state — previously, `min-h-32` plus the action row + selection-status line + a recorder error banner + an "Imported from" footnote drove cumulative intrinsic content past 320 px, the grid row grew to absorb it, and SlicePane stretched to match. The "InputPane jumps a notch taller when an error fires" feel is gone; the waveform absorbs whatever fixed chrome is present (down to ~70-90 px in worst-case error-heavy states), but every other piece is layout-stable. Outer pane also picks up `min-h-0 overflow-hidden` as a defensive cap.
+  - **Operator-facing caps** ([category/InputPane.svelte](../../web/src/lib/components/category/InputPane.svelte), [category/labels.ts](../../web/src/lib/components/category/labels.ts)): two new limits mirror existing patterns elsewhere in the app. (a) `MAX_IMPORT_BYTES = 64 MiB`: drag-and-drop / file-picker imports check `file.size` BEFORE the decode pipeline fires, so an oversized WAV never reaches the Float32Array decode that would inflate it 4× and OOM the tab. Rejection copy includes both sizes and a "trim shorter and re-export" hint. Dropzone tooltip surfaces the cap so the operator sees it before they drop. (b) `MAX_SLICES_PER_CATEGORY = 200` (in `labels.ts` next to the training thresholds): per-category cumulative slice cap. The Slice button degrades to a disabled "At cap · N/MAX" label-swap identical to the Workspace list's "At cap" New-workspace pattern; if a batch would push past the cap (count + projectedSliceCount > MAX) the button stays in standard shape but disables, with the Selection status line spelling out the remaining headroom so the operator can trim the selection to fit. The 60-slices-per-click hard cap (matching the 60-second recording cap) is unchanged and orthogonal.
+  - **Mode FSM converged with the workspaces list** ([category/SlicePane.svelte](../../web/src/lib/components/category/SlicePane.svelte)): pane-local `mode: 'normal' | 'selecting'` matches the workspaces store's selection FSM so the chrome reads as one primitive across the app. Normal mode = playback-curate shape (bare clicks play, header is just "Slices" + quota chip). Selecting mode = three left-aligned **pill buttons** in the header (`Select all` / `Deselect all`, `Done`, `Delete N`), always-visible top-right checkbox on every card replacing the hover trash, and bare clicks toggle selection instead of playing. All three pills share the same shape (`inline-flex items-center rounded-md border px-2 py-0.5 text-[10px] font-medium`); the destructive accent rides on rose-50/rose-200 colour alone, not on a different container shape, so the row reads as one toolbar instead of "two text-links + a button". Title Case labels match the workspaces toolbar so the two bulk-action surfaces feel like the same primitive. Selection mutators (`toggleSelection`, `selectRange`, `selectAll`) call `enterSelecting()` unconditionally — it's idempotent — so the FSM transition flows from any selection-shaped action (Ctrl/Cmd-click, Shift-click range, right-click "Select", Cmd/Ctrl+A) without callsite plumbing. Auto-exits when the grid empties post-delete so the toolbar never hangs over an empty-state body.
+  - **Slice-specific tweaks over the workspaces' baseline FSM**: no "Select" entry button in the idle header (slice pane is dense + lives inside a category accordion; the right-click menu + `Ctrl/Cmd-click` + `Cmd/Ctrl+A` cover the entry path). No "N selected" counter — the toolbar starts flush at the header's left edge and the count is already baked into the rightmost `Delete N` button. "Select all" is hidden until in selecting mode, then surfaces as a label-swap toggle (`select all` ⇄ `deselect all`). Right-click on an unselected card while in selecting mode keeps a single-card immediate `Delete` entry so an operator can drop one stray card without exiting + re-selecting through the toolbar (Finder-style precedent; blast radius is one 1 s clip). `Retry failed in selection` rides as a conditional tail item in the right-click menu — no workspace equivalent because workspaces have no per-record failure state.
+  - **Shared `capFirst(s, fallback)` util** ([utils/error-copy.ts](../../web/src/lib/utils/error-copy.ts)): the message-normalisation helper that was module-private in `workspaces.svelte.ts` is now exported. Slices use it from `deleteMany`'s failure path so SSE-terminal error messages (which arrive pre-cleaned by the daemon, without the `fs:` / `convert:` layer prefix `errorCopy` strips) get the same sentence-case + trailing-period treatment as the workspaces equivalent.
+- **Slice B.6 — Backend sync** (2026-05-13) — **Slice B complete.**
+  - **SliceRecord.blob nullable** ([idb/db.ts](../../web/src/lib/idb/db.ts)). Three blob-less flavours converge cleanly:
+    - `state === 'committed'` after upload: the bytes live on the daemon; the IDB row drops the blob to free origin quota.
+    - Synthesised server-only rows from category sync (operator uploaded from another tab / browser).
+    - Re-mount after the page is reloaded, where the upload pipeline had previously committed.
+  - **Lazy slice-fetch cache** ([audio/slice-fetch.ts](../../web/src/lib/audio/slice-fetch.ts)): `getSliceBlob(slice)` returns the local blob when present, else `fetch`es `GET /assets/datasets/<class>/<filename>` and caches per-id with an `inflight` dedup. `revokeSliceBlobs(ids)` drops the cache on per-row delete / per-category clear / per-workspace forget.
+  - **XHR upload helper** ([api/upload.ts](../../web/src/lib/api/upload.ts)): `xhrPut<T>` with `upload.onprogress` (the only reliable upload-progress signal in a browser) + caller-supplied `AbortSignal`. Maps non-2xx to a real `ApiError` so the existing `errorCopy` machinery handles operator copy. `UploadPool` class caps concurrent tasks at a constructor-supplied limit (default 3 in the slices store) and drains FIFO.
+  - **Endpoint additions** ([api/endpoints.ts](../../web/src/lib/api/endpoints.ts)): `assets.deleteSlice(workspaceId, category, filename)` issues `DELETE /assets/datasets/<class>/<filename>` (async job ack, drains through the global delete chain). `assets.slicePutPath` / `assets.sliceAssetPath` build the daemon URLs for upload / fetch consumers (called from slice-fetch + the slices store).
+  - **Slices store overhaul** ([stores/slices.svelte.ts](../../web/src/lib/stores/slices.svelte.ts)):
+    - `enqueueUpload(sliceId)` → upload pool → `runUpload` walks `local | failed → uploading → committed | failed` with IDB + in-memory writes at every state transition. Progress updates are memory-only (`patchInMemory` swaps the entries array) so the XHR's many tiny `onprogress` events don't thrash IDB.
+    - Per-slice `AbortController` registry: `delete` / `clearForCategory` / `forget` abort in-flight uploads before tearing the slice down so the runUpload's `signal.aborted` branch skips the state-machine update we'd otherwise race against.
+    - `delete` now branches: server-side `committed` slices go through `enqueueDelete` → `DELETE /assets/datasets/<class>/<filename>` → SSE-terminal; local / uploading / failed bypass the daemon. Both paths revoke spectrogram + blob caches.
+    - `refresh` merges local IDB + `GET /assets/datasets/<class>` (with 404 → empty as the fresh-category case). Server-only files become synthesised `srv:<ws>:<cat>:<filename>` committed rows (deterministic id so re-sync is idempotent); persisted to IDB so future sessions read from cache.
+    - `resumePending(workspaceId)` re-queues every slice in `local | uploading | failed`. Called by the PendingUploadsBanner's resume button.
+    - `latestRevisionFor(workspaceId)` exposes the highest `workspace_revision_id` seen on an upload receipt this session; the workspace detail's revision chip max'es this against its loaded value.
+  - **InputPane** ([category/InputPane.svelte](../../web/src/lib/components/category/InputPane.svelte)) — `performSlice` now collects newly-appended slice ids and fires `slices.enqueueUpload(id)` for each. Fire-and-forget; the pool throttles concurrency. Operator clicks Slice and uploads start immediately.
+  - **SliceCard state chrome** ([category/SliceCard.svelte](../../web/src/lib/components/category/SliceCard.svelte)): `uploading` cards show a bottom progress bar tracking `slice.upload_progress`; `failed` cards get a rose ring + an inline `retry` badge in the bottom-left that fires `onRetry`. Tooltips telegraph the state on the play-button title.
+  - **SlicePane** ([category/SlicePane.svelte](../../web/src/lib/components/category/SlicePane.svelte)) — `getSliceBlob` powers playback for both local + committed slices. Context menu adds a "Retry upload" item for `state === 'failed'` rows.
+  - **PendingUploadsBanner** ([category/PendingUploadsBanner.svelte](../../web/src/lib/components/category/PendingUploadsBanner.svelte)): mounts at the workspace detail level, auto-hides when nothing is pending, shows aggregate progress while uploads are in flight, and surfaces a Resume / Retry button when the pool is idle but uploads remain.
+  - **Live revision chip** ([routes/workspace/[id]/+page.svelte](../../web/src/routes/workspace/[id]/+page.svelte)) — the detail's revision chip now max's the loaded `workspace_revision.id` against `slices.latestRevisionFor(detail.id)` and tags a small `live` badge when the upload-driven value has advanced past the snapshot, avoiding a per-upload `GET /workspace/{id}` round-trip.
+- **Slice B.5 — Slice Management + Spectrogram cards** (2026-05-13):
+  - **Plasma colormap** ([audio/palette.ts](../../web/src/lib/audio/palette.ts)): eight RGB stops digitised from matplotlib's `plasma`, linear interpolation between adjacent stops. Chosen because plasma's high-energy end is yellow (not white) — keeps peak energies readable against the white card surround.
+  - **Spectrogram engine** ([audio/spectrogram.ts](../../web/src/lib/audio/spectrogram.ts)): per-slice 512-point Hann-windowed STFT (hop 256), log-magnitude in a fixed [-80, 0] dB range (avoids the auto-range pitfall of amplifying noise on silent slices), plasma-colormapped image into an `OffscreenCanvas`, `convertToBlob` → blob URL. Module-scope cache keyed by slice id; `inflight` map dedups concurrent generation. `revokeSliceSpectrograms(ids)` exposes the GC path called by the slices store on delete / clearForCategory / forget.
+  - **Slices store extensions** ([stores/slices.svelte.ts](../../web/src/lib/stores/slices.svelte.ts)): `refreshForWorkspace(workspaceId, categoryNames)` does one IDB query and partitions every slice in the workspace into the per-category map — including empty categories (so collapsed rows transition to `loaded: true` and per-category refreshes short-circuit). Guarded by a `workspacesLoaded` `SvelteSet` so re-mount of CategoryList doesn't re-do the IDB walk. `countFor(workspaceId, categoryName)` exposes the badge value. All delete paths (`delete`, `clearForCategory`, `forget`) now revoke the affected slices' spectrogram URLs in lock-step so the browser GCs the image blobs immediately.
+  - **SliceCard component** ([category/SliceCard.svelte](../../web/src/lib/components/category/SliceCard.svelte)): per-slice 96 × 64 px card with the spectrogram PNG as its `<img>` source. `data-slice-id` on the wrapper for the parent's right-click walk. Hover-revealed trash icon (focus-within keeps it visible during keyboard navigation; `pointer-events-none` at rest so the no-hover state doesn't block the card-body click). Spectrogram fetch is lazy + cancellable; failures fall back to a neutral wave-icon placeholder so the card stays clickable.
+  - **SlicePane rebuild** ([category/SlicePane.svelte](../../web/src/lib/components/category/SlicePane.svelte)): `grid-cols-[repeat(auto-fit,96px)] content-start justify-evenly gap-2` — fixed-width 96 px tracks with `space-evenly` distributing leftover width into equal edge + inter-card slots (`gap-2` is the 8 px floor so cards never touch); flows 8-12 cards per row at desktop. `content-start` pins the row tracks at their 64 px content height so the y-gap stays a literal 8 px regardless of row count — without it, the spec's `align-content: normal` would stretch the auto-sized row tracks to fill the `flex-1` height and inflate the visible between-row distance for 2/3-row partials. `scrollbar-gutter-stable` reserves the scrollbar gutter up front so flipping into overflow on a fresh batch doesn't yank horizontal real estate out from under the existing cards. Single shared `AudioContext` lazily constructed on first play; `AudioBufferSourceNode` per click with `onended` resetting `playingId`. Right-click handled at the grid wrapper, walks `[data-slice-id]` to identify the slice and shows a Play / Delete `ContextMenu`. Quantity chip in the pane header (`<count>/<threshold>`, emerald with checkmark when satisfied, amber otherwise). Empty state telegraphs the path back to the Input pane's Slice button.
+  - **CategoryRow header badge** ([category/CategoryRow.svelte](../../web/src/lib/components/category/CategoryRow.svelte)): the same `<count>/<threshold>` chip on collapsed rows so an operator can scan the dataset list at a glance ("which categories still need more slices"). Threshold lookup via `labels.thresholdFor` (20 for `_background_noise_`, 10 elsewhere).
+  - **Workspace bulk-load wiring** ([category/CategoryList.svelte](../../web/src/lib/components/category/CategoryList.svelte)): once the categories list resolves, fires `slices.refreshForWorkspace` so the badges on every row light up without forcing the operator to expand each category. `untrack`-wrapped to avoid the reactive-loop trap.
+  - **Incidental fix in [dashboard/SpectrogramCanvas.svelte](../../web/src/lib/components/dashboard/SpectrogramCanvas.svelte)**: an `OffscreenCanvas | HTMLCanvasElement` union confused TS's overload resolution for `.getContext('2d')` (resolving to the generic `RenderingContext | null` fallback). Narrowed via `instanceof OffscreenCanvas` so each branch picks the right 2D-context overload.
+- **Slice B.4 — Trim + Slice action** (2026-05-13):
+  - IDB schema v4 adds the `slices` object store ([idb/db.ts](../../web/src/lib/idb/db.ts), [idb/slices.ts](../../web/src/lib/idb/slices.ts)). Keyed by uuid; indexes `by-workspace` (workspace-delete cleanup) and `by-workspace-category` (per-category listing). Optional `trim_start_samples` / `trim_end_samples` added to `DraftRecord` -- absent on legacy B.3 rows; readers default to (0, sample_count). No schema migration required.
+  - Slicer ([audio/slicer.ts](../../web/src/lib/audio/slicer.ts)): `chunkPcmToSlices` chunks the trimmed range into fixed-length 44 100-sample windows; a sub-window trailing remainder is **dropped** (floor-divide) so every emitted slice carries 1 s of _real_ audio rather than a half-silence padded tail (which degraded background-noise training quality and surprised operators by inflating slice counts past the audio that justified them). The daemon's [`to_waveform`](../../modules/preproc/wav_io.rs) already pads or truncates each input to its 44 032-sample preproc frame, so the prior web-side padding was never load-bearing downstream. `sliceCountFor` telegraphs the projected count on the Slice button label; the selection-status hint surfaces the unused remainder so the operator can extend the trim to reclaim it.
+  - Reactive slices store ([stores/slices.svelte.ts](../../web/src/lib/stores/slices.svelte.ts)): per-`(workspace_id, category_name)` list in a `SvelteMap`. `refresh / append / delete / clearForCategory / forget`. Same in-flight short-circuit + `untrack` discipline as the categories + drafts stores.
+  - Drafts store gains `patchTrim` ([stores/drafts.svelte.ts](../../web/src/lib/stores/drafts.svelte.ts)): in-memory update happens synchronously (so the trim handle's drag-commit flows through the parent's `$effect` without resetting), IDB write trails asynchronously.
+  - **TrimWaveform component** ([category/TrimWaveform.svelte](../../web/src/lib/components/category/TrimWaveform.svelte)): wraps `StaticWaveform` with two pointer-draggable handles, a translucent mask over the unselected regions, and a blue contour bracket around the selection. Controlled component: parent owns the trim state and receives both `onChange` (every pointermove for smooth visual) + `onCommit` (on pointerup for IDB persistence). Min-1 s gap enforced at the constraint layer so handles can't cross or shrink below the slicer minimum. Pointer capture on the wrapper (not the 3 px handle) so a fast drag doesn't escape the hit area.
+  - **Basic SlicePane** ([category/SlicePane.svelte](../../web/src/lib/components/category/SlicePane.svelte)): per-category count + filename list + per-row delete. Utilitarian B.4 surface; B.5 replaces it with spectrogram-background cards + quantity badge + click-to-play. The store / IDB layer is already shaped for B.5's needs so the rebuild is purely presentational.
+  - **InputPane integration** ([category/InputPane.svelte](../../web/src/lib/components/category/InputPane.svelte)):
+    - `StaticWaveform` replaced by `TrimWaveform` in the draft state.
+    - Selection status line surfaces `<duration> · <N> slices of 1 s each` plus `· <Y>s unused` when the trim has a >= 10 ms sub-slice remainder the floor-divide will drop (or an amber "Drag to ≥ 1 s" prompt when below the minimum) so the Slice button's `disabled` state and the slice count both stay legible.
+    - **Play selection**: a single shared `AudioContext` + cached `AudioBuffer` per draft; `AudioBufferSourceNode.start(0, offset, duration)` plays exactly the trimmed range. Button collapses to a Stop affordance while a source is alive; `onended` resets the button. Teardown on pane unmount + on draft removal.
+    - **Slice button**: primary CTA when a draft exists. Label tracks `projectedSliceCount` (`Slice · 6`) so the operator sees what the click will produce. Disabled below 1 s with a tooltip; loading-spinned during the encode loop. Sequential per-slice append so a partial IDB-quota failure leaves the earlier slices visible.
+  - **CategoryRow integration**: dashed Slices placeholder replaced by the live `SlicePane`.
+  - **Cleanup wiring** ([stores/categories.svelte.ts](../../web/src/lib/stores/categories.svelte.ts), [stores/workspaces.svelte.ts](../../web/src/lib/stores/workspaces.svelte.ts)): category delete now also drops the per-category slice list (both IDB-only and server-side paths); workspace delete GCs every slice IDB row + forgets the in-memory cache via the same chain that already covers categories + drafts.
+- **Slice B.3 — Input Module per category** (2026-05-13):
+  - IDB schema v3 adds the `drafts` object store keyed by `[workspace_id, category_name]` ([idb/db.ts](../../web/src/lib/idb/db.ts), [idb/drafts.ts](../../web/src/lib/idb/drafts.ts)). The composite key enforces single-slot semantics structurally -- a second `put` to the same key overwrites in place, which is what we want when an operator re-records or replaces via import.
+  - Recorder runtime extended ([audio/recorder.svelte.ts](../../web/src/lib/audio/recorder.svelte.ts)) with a rolling-window PCM ring (3 s capacity at the native capture rate) plus `liveSampleRate` / `liveTotalSamples` / `liveWindowSamples` / `liveEnvelopeAt(...)` public API mirroring the dashboard `streams` store's shape. The live ring is allocated per-Recorder on first start; the worklet message handler now writes both the chunk accumulator (used at finalize) and the live ring (used by the live-waveform canvas at RAF).
+  - WAV decode helpers ([audio/wav-decode.ts](../../web/src/lib/audio/wav-decode.ts)): `verifyWavMagic` / `readWavMagic` reject non-WAV imports early with a clear operator-facing message ("not a WAV"), avoiding the vague `decodeAudioData` "EncodingError"; `decodeCanonicalWav` / `decodeCanonicalWavSync` bypass `AudioContext.decodeAudioData` for stored drafts (the bytes are always in our canonical encoder format, so a direct PCM-16 read is faster and preserves the 44 100-sample alignment B.4 needs).
+  - Reactive drafts store ([stores/drafts.svelte.ts](../../web/src/lib/stores/drafts.svelte.ts)): per-`(workspace_id, category_name)` slice in a `SvelteMap`. `refresh`, `save`, `clear`, `forget`. Optimistic loading slice preserves the prior draft so the waveform canvas doesn't flicker through empty state mid-refresh.
+  - Two waveform components:
+    - [category/LiveRecorderWaveform.svelte](../../web/src/lib/components/category/LiveRecorderWaveform.svelte) -- recorder-driven scrolling waveform during capture. Reads from `recorder.liveEnvelopeAt`, RAF-coalesced resize, same render style as the dashboard's `WaveformCanvas`.
+    - [category/StaticWaveform.svelte](../../web/src/lib/components/category/StaticWaveform.svelte) -- one-shot envelope render of a Float32Array. Re-renders on resize + when the `pcm` prop reference flips. Designed as the base for B.4's trim-handle overlay (additive extension, not a rewrite).
+  - Input Module orchestrator ([category/InputPane.svelte](../../web/src/lib/components/category/InputPane.svelte)) -- per-category state machine across `idle` / `recording` / `finalizing` / `importing` / `draft` / `error`. Fixed-height waveform area (128 px) toggles between live and static renders without layout shift. Action row collapses through Record / Re-record / Stop / Discard / Export / Delete / Import depending on state. Inline rose banner per failure. Drop-anywhere drag handling on the pane wrapper.
+  - WAV-only import: 12-byte magic verified before `decodeAudioData`; non-WAV input rejected with "Not a WAV file (missing RIFF magic)." File picker `accept` restricted to `.wav,audio/wav,audio/wave,audio/x-wav,audio/vnd.wave`. Multi-file drops rejected -- the slot only holds one clip.
+  - Export: `URL.createObjectURL(blob)` + anchor `download` attribute. Filename pattern `<workspace>-<category>-<rfc3339>.wav` (colons stripped because Windows). URL revoked on the next tick after click.
+  - CategoryRow integration: the prior dashed "Input" placeholder is replaced by a live `InputPane` mount; the Slices pane stays a placeholder until B.5. The `workspaceName` prop threads through `CategoryList -> CategoryRow -> InputPane` for the export filename.
+  - Draft cleanup: deleting a category (IDB-only or server-side) now clears its draft slot ([stores/categories.svelte.ts](../../web/src/lib/stores/categories.svelte.ts)); deleting a workspace GCs every per-workspace category + draft row in IDB ([stores/workspaces.svelte.ts](../../web/src/lib/stores/workspaces.svelte.ts), [idb/drafts.ts](../../web/src/lib/idb/drafts.ts)). Both flows swallow IDB errors -- daemon-side delete is load-bearing; local GC is housekeeping.
+- **Slice B.2 — Foundation alignment + Category lifecycle** (2026-05-13):
+  - WAV pipeline retargeted to 44.1 kHz ([audio/wav.ts](../../web/src/lib/audio/wav.ts)). New `SLICE_SAMPLES = WAV_SAMPLE_RATE` constant locks the 1-second slice grid to a single source of truth for B.4 and B.5.
+  - IDB schema v2: `categories` store keyed by `[workspace_id, name]` with a `by-workspace` index ([idb/db.ts](../../web/src/lib/idb/db.ts), [idb/categories.ts](../../web/src/lib/idb/categories.ts)). The deviated v1 `recordings` store is dropped at upgrade time on any browser that carries it over.
+  - Shared global delete queue ([api/delete-queue.ts](../../web/src/lib/api/delete-queue.ts)): one chain spans every feature area because the daemon's `max_delete_jobs = 1` slot covers Workspace + Dataset + Converter + \*\_Logs. The B.1 workspaces store was refactored to consume the shared queue so workspace and category deletes serialise correctly across features.
+  - Reactive categories store ([stores/categories.svelte.ts](../../web/src/lib/stores/categories.svelte.ts)) merges three sources by exact-byte name: mandatory synthetic (`_background_noise_`, code-only), operator-added local (IDB-persisted), and server-listed (`GET /assets/datasets`). Server > IDB > mandatory on conflict. Single-expand UX (`expandedName: string | null`). Async DELETE flows through the shared queue with SSE-terminal awaiting.
+  - Per-category accordion UI ([category/CategoryList.svelte](../../web/src/lib/components/category/CategoryList.svelte), [category/CategoryRow.svelte](../../web/src/lib/components/category/CategoryRow.svelte)). Right-click context menu carries Delete (disabled for mandatory); empty-area right-click and the header CTA both open Add Category. Expanded body renders two dashed placeholder panes ("Input" / "Slices") so the future B.3/B.5 wiring is purely a placeholder swap.
+  - Add Category dialog ([category/AddCategoryDialog.svelte](../../web/src/lib/components/category/AddCategoryDialog.svelte)) with live AssetPath validation ([category/name-validate.ts](../../web/src/lib/components/category/name-validate.ts)) mirroring [`AssetPath`](../../modules/common/asset_path.rs) (`[A-Za-z0-9._-]`, no leading `.`, ≤ 255 bytes). Case-insensitive uniqueness check beyond byte-equal: blocks `Cat` when `cat` exists because most filesystems collapse the difference.
+  - Delete Category dialog ([category/DeleteCategoryDialog.svelte](../../web/src/lib/components/category/DeleteCategoryDialog.svelte)) handles both flavours: IDB-only deletes complete inline (no daemon round-trip); server-side deletes are fire-and-forget through the global queue with a "deleting" pill on the row until terminal.
+  - Label utilities ([category/labels.ts](../../web/src/lib/components/category/labels.ts)): mandatory name + threshold constants, `prettyCategoryName()` mirroring the dashboard's `prettyLabel` for Speech-Commands synthetics.
+  - Asset endpoints ([api/endpoints.ts](../../web/src/lib/api/endpoints.ts)): `assets.listRoot`, `assets.listDatasets`, `assets.listCategory`, `assets.deleteCategory`. `DatasetListing` + `AssetEntry` types in [api/types.ts](../../web/src/lib/api/types.ts).
+  - Workspace detail page ([routes/workspace/[id]/+page.svelte](../../web/src/routes/workspace/[id]/+page.svelte)) wires the live `CategoryList`. The dashed placeholder from the course-correction turn is gone; the operator now sees the real accordion.
 - **Slice B.1 — Workspace CRUD foundation**:
   - List / detail routes, async-job-tracked delete, create dialog, inline rename, delete + bulk-delete dialogs.
   - Right-click context menu is the canonical surface for Rename / Delete / Select (on cards) and New / Select all / Done (on the empty list area). No always-visible per-card action icons.
@@ -39,10 +116,14 @@ Updated as slices ship. Anchor for future sessions to avoid re-doing.
   - `color-scheme: light` pinned globally so native form controls (checkboxes, scrollbars) don't render dark on systems with `prefers-color-scheme: dark`. Slice E's dark-mode work flips this to `light dark` and gates reactively.
   - Toast / Drawer / Tooltip primitives still deferred to Slice E.
 
+### Partial / superseded
+
+- **Slice B.2 (prior draft, deviated)** — IDB `recordings` + flat-list recorder + import. Shipped 2026-05-12 but did not match the Dataset Management Module described in [ARCHITECTURE.md §A.4 "Extra Notes"](./ARCHITECTURE.md): wrong sample rate (16 kHz vs the spec's 44.1 kHz), wrong organisation (flat per-workspace list vs the spec's per-category accordion), wrong input-slot semantics (64-recording list vs single most-recent clip per category), no mandatory `_background_noise_`, no trim or Slice action, no spectrogram cards, no backend sync. Audio infrastructure ([wav.ts](../../web/src/lib/audio/wav.ts), [resample.ts](../../web/src/lib/audio/resample.ts), [recorder.svelte.ts](../../web/src/lib/audio/recorder.svelte.ts), [fft.ts](../../web/src/lib/audio/fft.ts), [format.ts](../../web/src/lib/utils/format.ts)) is salvageable and remains in the tree; the IDB / store / UI seam is being rebuilt under the revised B.2–B.6 below. The deviated Dataset section has been removed from the workspace detail page so the misalignment is not user-visible while the rebuild proceeds. See [NOTES.md §"Slice B course correction"](./NOTES.md) for the deviation map + salvage discipline.
+
 ### In flight / not started
 
-- **Slice B.2** — IDB drafts + recorder + audio import. Detail page is still the management surface only; recording UI lands here.
-- **Slice B.3** — Slicer UI + commit flow (XHR upload with progress, resumability prompt on reload).
+Slice B (Workspace + Dataset Management) is complete. Remaining slices:
+
 - **Slice C** — Training + SSE job events with `event_gap` recovery + history.
 - **Slice D** — Converter tab + Tiny Dashboard.
 - **Slice E** — Polish + remaining primitive extractions (Toast, Drawer, Tooltip, Tabs, …).
@@ -58,13 +139,19 @@ The original Slice B prose assumed wire shapes that don't match the actual API. 
 
 ### Sub-slice strategy for Slice B
 
-The PLAN.md prose for Slice B describes the full end state; in practice we are shipping it in three gates so each gate verifies independently against the daemon:
+The PLAN.md prose for Slice B describes the full end state; in practice we ship it in six gates so each gate verifies independently against the daemon. The original three-gate split (B.1/B.2/B.3) under-specified the Dataset Management Module's per-category structure (see [ARCHITECTURE.md §A.4 "Extra Notes"](./ARCHITECTURE.md)); the revised plan below decomposes the "audio + slice + commit" path into four narrower slices so each ends in a 5–10-minute manual verification gate.
 
-- **B.1 — CRUD foundation** (done): workspace lifecycle + selection + bulk delete; Toast + primitives + error-copy infrastructure.
-- **B.2 — Local audio**: IDB schema, getUserMedia recorder, file import + decode + resample, drafts list under workspace detail.
-- **B.3 — Slicer + commit**: segment editor, WAV PCM-16 encoder, XHR upload with progress, commit state machine, resumability.
+- **B.1 — CRUD foundation** (done): workspace lifecycle + selection + bulk delete; primitives + error-copy infrastructure.
+- **B.2 — Foundation alignment + Category lifecycle** (done): WAV pipeline at 44.1 kHz; IDB schema v2 (`categories`); category accordion; Add / Delete category; mandatory `_background_noise_`; sync read of `GET /assets/datasets`; shared global delete queue across feature areas.
+- **B.3 — Input Module per category** (done): IDB schema v3 (`drafts`); recorder ring + envelope API; live + static waveform components; per-category Input pane with state machine; WAV-only import with magic-byte validation; single-slot drafts; export/download; draft cleanup on category + workspace delete.
+- **B.4 — Trim + Slice action** (done): IDB schema v4 (`slices` + optional trim fields on drafts); slicer floor-divides the trimmed range into 1 s windows (sub-window remainder dropped) so every emitted slice is real audio; reactive slices store; `patchTrim` for in-memory-first persistence; TrimWaveform component with pointer-captured draggable handles and the ≥ 1 s constraint; selection playback via `AudioBufferSourceNode`; Slice button producing per-category appended slice rows; basic SlicePane (count + list + delete) bridging to B.5; slice cleanup on category + workspace delete.
+- **B.5 — Slice Management + Spectrogram cards** (done): plasma colormap; FFT-driven spectrogram engine with module-scope cache + revoke API; bulk `refreshForWorkspace` populates collapsed-row badges via a single IDB query; SliceCard with hover-trash + right-click menu; SlicePane grid with shared AudioContext + click-to-play; quantity chip on both the SlicePane header and the collapsed CategoryRow header.
+- **B.6 — Backend sync** (done): nullable `SliceRecord.blob`; lazy slice-fetch cache; XHR upload with `onprogress` + UploadPool (default 3); per-slice state machine (`local → uploading → committed | failed`) wired through the slices store; server merge on `refresh` (404 → empty as the fresh-category case, synthetic `srv:...` records for server-only files); remote DELETE through the global delete chain; `resumePending` + PendingUploadsBanner for cross-reload upload recovery; SliceCard surfaces progress + retry; live revision chip on the workspace detail.
+- **B.4 — Trim + Slice action**: range-select handles over the draft waveform; min 1 s gap; Slice produces 44,100-sample chunks appended to the per-category slice list (local-only).
+- **B.5 — Slice Management + Spectrogram cards**: pre-rendered spectrogram backgrounds; click-to-play; delete; quantity badges (≥ 20 / ≥ 10).
+- **B.6 — Backend sync**: lazy GET on expand; XHR PUT with progress on Slice; DELETE on slice removal; reload resumability for in-flight uploads.
 
-Each sub-slice ends in a manual verification gate against the running daemon (no automated tests per project policy).
+Each sub-slice ends in its own manual verification gate (no automated tests per project policy). Gate details live inline with each sub-slice's deliverables above.
 
 ## Strategy: vertical slices
 
@@ -77,10 +164,11 @@ Instead: five vertical slices, each delivering working user value. Shared founda
 **User outcome**: open the app, see waveform/spectrogram of mic input, see live top-K classifications, see daemon health badge.
 
 Deliverables:
+
 1. SvelteKit scaffolding: `package.json`, `vite.config.ts`, `svelte.config.js`, `tsconfig.json`, `tailwind.config.js`, `postcss.config.js`, `app.html`, `app.css`, path aliases (`$lib`, `$proto`).
 2. `src/routes/+layout.ts` → `prerender = true; ssr = false`. `+layout.svelte` → tab shell + badge slot.
 3. Vite dev proxy for `/api`, `/stream/audio` (with `ws: true`), `/stream/infer` (with `ws: true`) to `127.0.0.1:8787`.
-4. Proto decoder: a hand-written ~150 LOC decoder at [src/lib/stream/proto.ts](../../web/src/lib/stream/proto.ts). The schemas are tiny (4 messages, 14 fields total) and stable per [PROTO.md](../PROTO.md) (no third-party peers; wire-breaking changes ship as full replacements). Source-of-truth remains [modules/proto/*.proto](../../modules/proto); the TS decoder is kept in 1:1 correspondence by inspection — desync surfaces as a runtime decode warning, not a build break, but the cost of a codegen step + Long.js runtime + 200 KB of protobufjs/ts-proto outweighs the safety gain at this scope.
+4. Proto decoder: a hand-written ~150 LOC decoder at [src/lib/stream/proto.ts](../../web/src/lib/stream/proto.ts). The schemas are tiny (4 messages, 14 fields total) and stable per [PROTO.md](../PROTO.md) (no third-party peers; wire-breaking changes ship as full replacements). Source-of-truth remains [modules/proto/\*.proto](../../modules/proto); the TS decoder is kept in 1:1 correspondence by inspection — desync surfaces as a runtime decode warning, not a build break, but the cost of a codegen step + Long.js runtime + 200 KB of protobufjs/ts-proto outweighs the safety gain at this scope.
 5. Fetch wrapper `src/lib/api/http.ts`: typed JSON helper with error envelope parsing (`{ error, code }`), default 5 s timeout, surfaces `code` on rejection for store-level handling.
 6. WS client `src/lib/stream/socket.ts`: opens with `Sec-WebSocket-Protocol: acoustics`, auto-reconnect with capped exponential backoff (200 ms → 5 s), exposes a `MessagePort`-style consumer API. **Operates in a Web Worker** to keep envelope decode + Opus decode off the main thread. Main thread receives postMessage transferables.
 7. Opus decoder: WebCodecs `AudioDecoder` with `{ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 }`. Feature-detect `'AudioDecoder' in self`; if missing, show a clear "browser not supported" placeholder. **No WASM Opus fallback in v1** (defer until a real user has Safari ≤16).
@@ -90,6 +178,7 @@ Deliverables:
 11. Configuration drawer: mic policy (`GET/POST /api/v1/mic` with `?min_version=N` read-your-writes gate), inference cadence (`GET/POST /api/v1/inference`), active head selection (`GET/POST /api/v1/active` with `{ default: true }` option).
 
 Critical files to create:
+
 - [web/package.json](../../web/package.json), [web/vite.config.ts](../../web/vite.config.ts), [web/svelte.config.js](../../web/svelte.config.js), [web/tsconfig.json](../../web/tsconfig.json), [web/tailwind.config.js](../../web/tailwind.config.js)
 - [web/src/app.html](../../web/src/app.html), [web/src/app.css](../../web/src/app.css)
 - [web/src/routes/+layout.ts](../../web/src/routes/+layout.ts), [web/src/routes/+layout.svelte](../../web/src/routes/+layout.svelte)
@@ -107,6 +196,7 @@ Slice A done means: `pnpm dev` shows live waveform + spectrogram + top-K + healt
 **User outcome**: create a workspace, record/upload audio, slice into labeled samples, commit to backend, see workspace revision update.
 
 Deliverables:
+
 1. Workspace list + detail routes: `/workspace`, `/workspace/[id]` (dynamic, client-rendered, no prerender).
 2. CRUD via `POST/GET/PATCH/DELETE /api/v1/workspace[/{id}]`. Async delete: returns `{ job_id }` → subscribe to job events until terminal state. Workspace store tracks deletion-in-flight UI.
 3. **Client-side filter**: workspaces tagged `__converter__` excluded from this tab's list.
@@ -126,6 +216,7 @@ Deliverables:
 9. Revision UX: workspace card shows `rev N` chip. Heads list (when populated by Slice C) shows per-head `current` (green) or `stale (rev X → Y)` (amber) pill.
 
 Critical files:
+
 - [web/src/routes/workspace/+page.svelte](../../web/src/routes/workspace/+page.svelte), [web/src/routes/workspace/[id]/+page.svelte](../../web/src/routes/workspace/[id]/+page.svelte)
 - [web/src/lib/idb/db.ts](../../web/src/lib/idb/db.ts), [web/src/lib/idb/drafts.ts](../../web/src/lib/idb/drafts.ts)
 - [web/src/lib/audio/recorder.ts](../../web/src/lib/audio/recorder.ts), [web/src/lib/audio/wav.ts](../../web/src/lib/audio/wav.ts), [web/src/lib/audio/resample.ts](../../web/src/lib/audio/resample.ts)
@@ -138,6 +229,7 @@ Critical files:
 **User outcome**: configure hyperparameters, launch a train job, watch real-time progress, browse past runs.
 
 Deliverables:
+
 1. Train form: epochs (1–1000), batch_size (1–4096), learning_rate (>0, ≤1.0), seed (optional), validation_split (0–1). Submit → `POST /api/v1/workspace/{id}/train` → receive `{ head_id, job_id }`.
 2. **`subscribeJob(jobId)` helper** with the full state machine:
    - Open `GET /api/v1/jobs/{job_id}/events?after_seq=<cursor>` (SSE via `EventSource`).
@@ -150,6 +242,7 @@ Deliverables:
 7. History view: `GET /api/v1/jobs` for memory ring; per workspace, also list `training_logs/` and `converter_logs/` via `GET /api/v1/workspace/{id}/assets/training_logs?after_seq=&limit=` directory listing, page through JSONL files for older entries. Merge + dedupe by `job_id`, sort by `created_at`. Filter by type (train / convert / dataset_delete / converter_delete / workspace_delete) and status.
 
 Critical files:
+
 - [web/src/lib/api/jobs.ts](../../web/src/lib/api/jobs.ts) — `subscribeJob`, JSONL pager, gap-recovery state machine
 - [web/src/lib/components/training/](../../web/src/lib/components/training/) — `TrainForm.svelte`, `JobProgress.svelte`, `MetricsChart.svelte`, `LogViewer.svelte`, `HeadCard.svelte`
 - [web/src/lib/components/history/HistoryList.svelte](../../web/src/lib/components/history/HistoryList.svelte)
@@ -160,12 +253,14 @@ Critical files:
 **User outcome**: drop TFJS bundle, convert to MPK, hot-swap converted head. Tiny Dashboard floats anywhere.
 
 Deliverables:
+
 1. Converter tab route `/converter`. Shows only workspaces tagged `__converter__`.
 2. New conversion wizard: drop TFJS files (`model.json` + shards + labels) → auto-create workspace with name `converter-<uuid8>` and tags `['__converter__']` → PUT each file to `/api/v1/workspace/{id}/assets/converters/<filename>` → POST `/api/v1/workspace/{id}/convert` with `{ converter_type: 'tfjs', model_json_path, shards: [...], labels_path, labels_format }` → reuse `subscribeJob` from Slice C.
 3. Post-conversion: download converted MPK button, "activate as inference head" button, "free up workspace" button (async DELETE with job tracking).
 4. **Tiny Dashboard** as a floating, draggable card available on Workspace and Converter tabs. Reuses Slice A's streams + components (`WaveformCanvas`, `TopKMeter`). The shared Worker is always running; Tiny Dashboard just subscribes to its ring buffer. Toggle pinned/hidden via header icon. Persists open/closed state in `localStorage`.
 
 Critical files:
+
 - [web/src/routes/converter/+page.svelte](../../web/src/routes/converter/+page.svelte), [web/src/routes/converter/new/+page.svelte](../../web/src/routes/converter/new/+page.svelte)
 - [web/src/lib/components/converter/](../../web/src/lib/components/converter/) — `ConvertWizard.svelte`, `ConverterCard.svelte`
 - [web/src/lib/components/TinyDashboard.svelte](../../web/src/lib/components/TinyDashboard.svelte)
@@ -175,6 +270,7 @@ Critical files:
 **User outcome**: app feels finished. Polished feedback, keyboard navigation, responsive layout.
 
 Deliverables:
+
 1. Extract primitives **now** (after 4 slices of inline use): `Button`, `IconButton`, `Modal`, `Drawer`, `Toast`, `Tooltip`, `Tabs`, `Select`, `Slider`, `Toggle`, `Input`, `ProgressBar`, `Spinner`, `EmptyState`. Each tuned to the variants we actually used.
 2. Global toast system: errors from API surface as toasts with `code`-aware copy ("Conflict: another training job is already running" for `another_train_running`, etc.).
 3. Accessibility pass: semantic HTML, ARIA on interactive widgets, visible focus rings, full Tab/Enter/Space keyboard nav, contrast ≥ WCAG AA.
@@ -185,6 +281,7 @@ Deliverables:
 8. Optional: light/dark mode + i18n scaffolding deferred per [ARCHITECTURE.md §E.5.7](./ARCHITECTURE.md). Note locations where deferred work plugs in.
 
 Critical files:
+
 - [web/src/lib/components/ui/](../../web/src/lib/components/ui/) — extracted primitives
 - [web/src/lib/components/Toast.svelte](../../web/src/lib/components/Toast.svelte), [web/src/lib/stores/toasts.ts](../../web/src/lib/stores/toasts.ts)
 - [web/src/lib/utils/error-copy.ts](../../web/src/lib/utils/error-copy.ts) — code → message map
@@ -192,33 +289,40 @@ Critical files:
 ## Cross-cutting conventions
 
 ### Proto decoder
-- Source-of-truth: [modules/proto/*.proto](../../modules/proto). Never copied into `web/`.
+
+- Source-of-truth: [modules/proto/\*.proto](../../modules/proto). Never copied into `web/`.
 - Implementation: hand-written decoder at [src/lib/stream/proto.ts](../../web/src/lib/stream/proto.ts) covering `Envelope`, `AudioFrame`, `InferenceFrame`, `TopK`. ~150 LOC, zero deps.
 - Wire-format dispatch on field tag: receiver silently drops unknown tags per proto3 unknown-field semantics ([PROTO.md](../PROTO.md)).
 - When `.proto` files change, the TS decoder must be updated in lockstep. The total field count is tiny enough that visual inspection suffices; consider adding back codegen only if the schema grows.
 
 ### Error envelope handling
+
 - All API responses parsed for `{ error, code }`. Fetch wrapper rejects with a typed `ApiError { status, code, message }`.
 - Stores translate `ApiError.code` → user-facing copy via [src/lib/utils/error-copy.ts](../../web/src/lib/utils/error-copy.ts).
 - The one special case: SSE `event_gap` (409) is **not** an error — it triggers JSONL backfill in `subscribeJob`.
 
 ### Read-your-writes — mic policy
+
 - `POST /api/v1/mic` returns new `version`. Immediately re-GET with `?min_version=<new>`, retry on 425 `too_early` with backoff (≤3 attempts), then surface success. Without this, the UI flickers back to the pre-write state.
 
 ### WS lifecycle
+
 - Single shared Worker owns both `/stream/audio` and `/stream/infer`. Drains continuously regardless of UI visibility (backpressure threshold 64 frames = 1.28 s at 50 Hz — never let the renderer be the consumer).
 - Renderer subscribes to Worker's ring via `postMessage` transferables. Audio frames decoded in Worker; main thread receives `Float32Array` PCM windows.
 - On WS close (1011 lagged): full reconnect, accept frame loss (no replay). Show momentary "stream interrupted" indicator.
 
 ### Active head provenance
+
 - Header strip displays `head_id[:8]@v{head_version}` from latest inference frame. Hover → popover with `source_workspace_id`, `workspace_revision`, `labels`.
 - If `GET /api/v1/active` returns `source_workspace_alive: false`, header strip turns amber: "active head's source workspace deleted".
 
 ### TypeScript types match Rust
+
 - All domain types in [src/lib/api/types.ts](../../web/src/lib/api/types.ts). Use discriminated unions where Rust uses tagged enums (e.g., `ActiveResp` with `origin: 'head' | 'default'` discriminates on whether `source_*` fields exist).
 - Keep `as const` enums for codes/states. No string literals scattered in feature code.
 
 ### Vite proxy
+
 ```ts
 server: {
   proxy: {
@@ -228,9 +332,11 @@ server: {
   }
 }
 ```
+
 Forgetting `ws: true` is silent — upgrade fails and debugging takes an hour. Lock this in Slice A.
 
 ### `__converter__` tag convention
+
 - Set on workspace creation in the converter wizard. Filtered out of Workspace Tab's list (`tags.includes('__converter__')` excludes). Shown in Converter Tab.
 - Backend doesn't know about the marker; it's purely a frontend convention.
 
@@ -239,6 +345,7 @@ Forgetting `ws: true` is silent — upgrade fails and debugging takes an hour. L
 End-to-end manual verification per slice. No automated tests.
 
 **Slice A**:
+
 1. Run daemon (`cargo run --release`) and `pnpm dev` (in `web/`).
 2. Open `http://localhost:5173`. Confirm waveform draws live mic audio.
 3. Confirm Top-K bars update at ~4 Hz with the bundled default head's classifications.
@@ -246,6 +353,7 @@ End-to-end manual verification per slice. No automated tests.
 5. Open dev tools: confirm exactly one `/stream/audio` and one `/stream/infer` WS open. Disconnect Wi-Fi, reconnect, confirm auto-reconnect.
 
 **Slice B**:
+
 1. Create workspace "test-1" via UI. Confirm appears in list with `rev 0`.
 2. Open detail. Record 3 clips, slice into 2 segments each (6 total), label as `dog`/`cat` (3 each). Confirm drafts persist after page reload.
 3. Commit. Watch per-segment progress. Confirm `GET /api/v1/workspace/{id}` shows `workspace_revision.id` advanced to 6, `head_count: 0`.
@@ -253,6 +361,7 @@ End-to-end manual verification per slice. No automated tests.
 5. Delete the workspace; confirm async job completes and workspace disappears from list.
 
 **Slice C**:
+
 1. With committed dataset from Slice B, open Train form. Submit defaults (e.g., 5 epochs, batch 32, lr 1e-3).
 2. Confirm SSE progress streams in. Confirm per-epoch loss/acc chart updates. Confirm phase indicator advances Loading → FeatureExtract → Train → Saving → Done.
 3. After completion, confirm head appears in Heads list with `current` pill.
@@ -262,12 +371,14 @@ End-to-end manual verification per slice. No automated tests.
 7. Cancel an in-flight train; confirm SSE terminates with `state: cancelled`.
 
 **Slice D**:
+
 1. In Converter Tab, run the wizard with a Teachable Machine TFJS export. Confirm `converter-<uuid8>` workspace appears here, **not** in Workspace Tab.
 2. Confirm conversion job streams progress, completes; confirm download MPK works; confirm "Activate" updates inference head globally.
 3. Open Tiny Dashboard on the Workspace Tab; confirm it shows the same live waveform + Top-K as the main Dashboard.
 4. Free up the converter workspace; confirm async deletion.
 
 **Slice E**:
+
 1. Tab through every interactive control on every tab; confirm focus rings visible, Enter/Space activate correctly.
 2. Force every error code path (e.g., POST `/train` while one is running → `another_train_running` 409) and confirm a toast surfaces with helpful copy.
 3. Resize browser to 1280 px, 1024 px, 768 px; confirm layouts hold.

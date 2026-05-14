@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
@@ -13,6 +14,12 @@
   import ContextMenu, { type MenuSection } from '$lib/components/ui/ContextMenu.svelte';
   import DeleteWorkspaceDialog from '$lib/components/workspace/DeleteWorkspaceDialog.svelte';
   import { formatRelative } from '$lib/utils/time';
+  // Dataset Management surface per [ARCHITECTURE.md] §A.4
+  // "Extra Notes": per-workspace category accordion with per-category
+  // Input Module + Slice Management; backend slice sync.
+  import CategoryList from '$lib/components/category/CategoryList.svelte';
+  import { slices } from '$lib/stores/slices.svelte';
+  import { WorkspacePoller } from '$lib/stores/workspace-poller';
 
   // Local state.  No dedicated store yet -- B.1 has a single
   // consumer for detail data, and the rename/delete mutations flow
@@ -30,13 +37,60 @@
   // workspace from a tab + back-button history).
   let lastId = $state<string | null>(null);
 
+  // One poller per page instance.  Started on first successful
+  // load, restarted on workspace swap, stopped on destroy / 404.
+  // The poller drives revision-driven cache invalidation in the
+  // categories + slices stores (lazy refresh fires on expand);
+  // here it just keeps `detail` live so the rev chip, heads
+  // section, and name stay in sync without forcing the operator
+  // to navigate away and back.
+  const poller = new WorkspacePoller();
+
   async function load(id: string): Promise<void> {
     loading = true;
     error = null;
     notFound = false;
+    // Stop any prior poller before the await so a stale tick
+    // can't land on the new workspace's `detail` mid-swap.
+    poller.stop();
     try {
       detail = await wsApi.get(id);
       lastId = id;
+      // Begin polling for this workspace.  Detail re-binds on
+      // every successful tick; `liveRevision` derives from it +
+      // the slices store, so the chip updates automatically.
+      poller.start(detail, {
+        onDetail: (fresh) => {
+          // Defensive: only adopt the polled detail if we're
+          // still on this workspace.  A late-arriving tick after
+          // route swap is otherwise filtered by the poller, but
+          // an extra guard here costs nothing.
+          if (lastId === fresh.id) detail = fresh;
+        },
+        onGone: () => {
+          // Workspace deleted out from under us (this tab,
+          // another tab, or the daemon CLI).  Surface the same
+          // "not found" empty state the initial 404 path uses;
+          // the operator clicks Back to workspaces to escape.
+          //
+          // Deliberately keep `lastId` pointing at the now-gone
+          // workspace.  The `$effect` below tracks both
+          // `page.params.id` and `lastId`; resetting `lastId` to
+          // null while we're still on the same URL would re-fire
+          // the effect, re-enter `load()`, and burn a redundant
+          // 404 GET to arrive at the same EmptyState.  Component
+          // unmount on route change still tears everything down.
+          detail = null;
+          notFound = true;
+        },
+        onError: (e) => {
+          // Transient -- the next tick recovers.  Log so
+          // engineers can see persistent breakage in devtools
+          // without surfacing per-tick noise on the operator's
+          // screen.
+          console.warn('[workspace-poller] tick failed', e);
+        }
+      });
     } catch (e) {
       detail = null;
       notFound = isNotFound(e);
@@ -50,6 +104,36 @@
     const id = page.params.id;
     if (id && id !== lastId) void load(id);
   });
+
+  onDestroy(() => {
+    poller.stop();
+  });
+
+  // Defensive lifecycle cleanup: a route param change (browser
+  // back / forward, or a programmatic `goto` to a sibling
+  // workspace) keeps this component instance alive while the
+  // detail re-fetches.  Any context menu that was open before
+  // the swap would otherwise re-render at the stale (x, y) anchor
+  // against the new workspace's state.  Closing it on id change
+  // means the menu can't survive a workspace transition.
+  $effect(() => {
+    void page.params.id;
+    menuOpen = false;
+  });
+
+  // The revision chip can advance ahead of the loaded detail as
+  // uploads commit -- the slices store stashes each receipt's
+  // `workspace_revision_id` so we can promote the chip without a
+  // detail re-fetch.  `revisionAdvanced` drives the `live` badge.
+  const sliceLatestRevision = $derived(detail ? slices.latestRevisionFor(detail.id) : null);
+  const liveRevision = $derived(
+    detail ? Math.max(detail.workspace_revision.id, sliceLatestRevision ?? 0) : 0
+  );
+  const revisionAdvanced = $derived(
+    detail !== null &&
+      sliceLatestRevision !== null &&
+      sliceLatestRevision > detail.workspace_revision.id
+  );
 
   let editingName = $state(false);
   let deleteOpen = $state(false);
@@ -210,8 +294,16 @@
       <div>
         <h3 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">Revision</h3>
         <p class="mt-1 font-mono text-xs text-zinc-700">
-          rev {detail.workspace_revision.id}
+          rev {liveRevision}
           <span class="text-zinc-400">· at {formatRelative(detail.workspace_revision.at)}</span>
+          {#if revisionAdvanced}
+            <span
+              class="ml-1 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-800"
+              title="Advanced by recent upload(s); reload to refresh `at` timestamp."
+            >
+              live
+            </span>
+          {/if}
         </p>
       </div>
       <div class="min-w-0">
@@ -221,6 +313,15 @@
         </p>
       </div>
     </section>
+
+    <!-- Dataset section.  CategoryList self-mounts: refreshes from
+         the store and re-renders reactively on every mutation.
+         Per-category sync state surfaces in each row's badge;
+         CategoryList also auto-resumes any pending uploads on mount
+         so a tab reload mid-batch picks up where it left off. -->
+    <div class="mb-6">
+      <CategoryList workspaceId={detail.id} workspaceName={detail.name} />
+    </div>
 
     <!-- Heads section.  B.1 ships the read-only listing; Slice C
          layers Train / Activate / Delete affordances on top.  Empty

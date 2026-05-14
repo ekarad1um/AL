@@ -92,3 +92,22 @@ export function trackJob(jobId: Uuid, opts: TrackJobOptions = {}): JobTracker {
     cancel: close
   };
 }
+
+// Subscribe to `jobId` and resolve when it reaches `succeeded`;
+// reject on any other terminal state or connection error.  Used by
+// the delete paths in the workspaces / categories / slices stores,
+// each of which followed the same 8-line `new Promise(...)`
+// boilerplate before this helper.  `operation` flavours the
+// fallback rejection message when the daemon emits a terminal
+// without a `message` field.
+export function awaitJobTerminal(jobId: Uuid, operation = 'delete'): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    trackJob(jobId, {
+      onTerminal: (ev) => {
+        if (ev.state === 'succeeded') resolve();
+        else reject(new Error(ev.message ?? `${operation} ${ev.state ?? 'ended without success'}`));
+      },
+      onError: (reason) => reject(new Error(reason))
+    });
+  });
+}

@@ -68,7 +68,7 @@
   aria-label={ariaLabel}
   {title}
   {onclick}
-  class="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-md border font-medium transition active:scale-[0.98] disabled:cursor-not-allowed disabled:active:scale-100 {SIZE_CLASSES[
+  class="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-md border font-medium transition duration-200 ease-out active:scale-[0.98] disabled:cursor-not-allowed disabled:active:scale-100 {SIZE_CLASSES[
     size
   ]} {VARIANT_CLASSES[variant]} {loading ? 'cursor-wait' : ''} {extraClass}"
 >

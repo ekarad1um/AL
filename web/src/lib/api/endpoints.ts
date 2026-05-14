@@ -2,6 +2,7 @@ import { api, ApiError } from './http';
 import type {
   ActiveResp,
   AsyncJobAck,
+  DatasetListing,
   InferenceCfg,
   JobSnapshot,
   MicPolicy,
@@ -74,6 +75,73 @@ export const workspaces = {
   patch: (id: Uuid, req: WorkspacePatchReq) =>
     api.patch<WorkspaceMutationResp>(`/api/v1/workspace/${encodeURIComponent(id)}`, req),
   delete: (id: Uuid) => api.delete<AsyncJobAck>(`/api/v1/workspace/${encodeURIComponent(id)}`)
+};
+
+// Workspace asset surface.  Unified `/assets/{*path}` family
+// where the HTTP method picks the operation (`GET` reads / lists,
+// `PUT` writes, `DELETE` removes -- see [docs/API.md §"Workspace
+// assets"]).  All listing endpoints share the `DatasetListing`
+// shape.  `encodeURIComponent` per path component encodes `/` as
+// `%2F`, so a single segment can't smuggle separators.
+function buildPaging(opts: { offset?: number; limit?: number }): string {
+  const params = new URLSearchParams();
+  if (opts.offset !== undefined) params.set('offset', String(opts.offset));
+  if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+  const q = params.toString();
+  return q ? `?${q}` : '';
+}
+
+// Shared URL builder for one slice's asset path.  GET / PUT / DELETE
+// all share this URI; exporting it as a stand-alone function (rather
+// than reaching for `assets.sliceAssetPath` inside the object) keeps
+// the two member aliases below from depending on `this`, which would
+// break under destructuring.
+export function sliceAssetPath(workspaceId: Uuid, category: string, filename: string): string {
+  return `/api/v1/workspace/${encodeURIComponent(workspaceId)}/assets/datasets/${encodeURIComponent(category)}/${encodeURIComponent(filename)}`;
+}
+
+// Async DELETE acks (`deleteCategory` / `deleteSlice`) MUST flow
+// through `enqueueDelete` in [api/delete-queue.ts] to avoid 409s
+// against concurrent delete-family jobs.
+export const assets = {
+  // Workspace root listing -- direct children (`datasets`,
+  // `converters`, ...).  Categories themselves live under
+  // `datasets/`, fetched by `listDatasets`.
+  listRoot: (workspaceId: Uuid, opts: { offset?: number; limit?: number } = {}) =>
+    api.get<DatasetListing>(
+      `/api/v1/workspace/${encodeURIComponent(workspaceId)}/assets${buildPaging(opts)}`
+    ),
+  // Categories with at least one slice on disk.  Empty-on-disk
+  // categories (operator-added, no slices yet) are absent here;
+  // the categories store synthesises them from IDB.
+  listDatasets: (workspaceId: Uuid, opts: { offset?: number; limit?: number } = {}) =>
+    api.get<DatasetListing>(
+      `/api/v1/workspace/${encodeURIComponent(workspaceId)}/assets/datasets${buildPaging(opts)}`
+    ),
+  // Slices inside one category.
+  listCategory: (
+    workspaceId: Uuid,
+    category: string,
+    opts: { offset?: number; limit?: number } = {}
+  ) =>
+    api.get<DatasetListing>(
+      `/api/v1/workspace/${encodeURIComponent(workspaceId)}/assets/datasets/${encodeURIComponent(category)}${buildPaging(opts)}`
+    ),
+  // Async whole-tree delete of one category directory.
+  deleteCategory: (workspaceId: Uuid, category: string) =>
+    api.delete<AsyncJobAck>(
+      `/api/v1/workspace/${encodeURIComponent(workspaceId)}/assets/datasets/${encodeURIComponent(category)}`
+    ),
+  // Async single-file delete inside a category.
+  deleteSlice: (workspaceId: Uuid, category: string, filename: string) =>
+    api.delete<AsyncJobAck>(
+      `/api/v1/workspace/${encodeURIComponent(workspaceId)}/assets/datasets/${encodeURIComponent(category)}/${encodeURIComponent(filename)}`
+    ),
+  // Slice asset URI -- GET for download, PUT for upload, DELETE for
+  // removal.  Both names survive for grep + call-site intent; the
+  // upload path-builder is just the same URI with a different verb.
+  sliceAssetPath,
+  slicePutPath: sliceAssetPath
 };
 
 // Async-job introspection.  `eventsUrl` is a path builder; the actual

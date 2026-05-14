@@ -2,6 +2,12 @@
   import { onMount } from 'svelte';
   import { streams } from '$lib/stores/streams.svelte';
   import { fftRadix2, hannWindow } from '$lib/audio/fft';
+  import {
+    buildPlasmaLut,
+    magnitudeToPaletteIndex,
+    SPECTROGRAM_DB_CEILING,
+    SPECTROGRAM_DB_FLOOR
+  } from '$lib/audio/palette';
   import { nextVisualRenderAt, visualDevicePixelRatio } from './visualRuntime';
 
   interface Props {
@@ -12,10 +18,15 @@
     fftSize?: number;
     smoothing?: number;
   }
+  // Defaults pull from `palette.ts` so the per-slice spectrogram
+  // (`spectrogram.ts`) and this live renderer share one dB → colour
+  // mapping.  Overriding via Props is still allowed for ad-hoc
+  // surfaces but the matching default is what gives a 4 kHz band
+  // on a slice card the same colour on the dashboard.
   let {
     seconds = 3,
-    minDb = -90,
-    maxDb = -10,
+    minDb = SPECTROGRAM_DB_FLOOR,
+    maxDb = SPECTROGRAM_DB_CEILING,
     maxHz = 12_000,
     fftSize = 512,
     smoothing = 0.6
@@ -67,31 +78,42 @@
 
     let pixelW = 1;
     let pixelH = 1;
-    // 256-entry viridis-ish RGB lookup, pre-computed once.  Replaces a
-    // per-pixel function call + array allocation with two table reads.
-    // Uint8ClampedArray clamps writes to 0..255 so the build code can
-    // drop the per-channel Math.min/Math.max.
+    // 256-entry plasma RGB lookup, pre-computed once and shared
+    // with the per-slice spectrogram renderer
+    // ([spectrogram.ts](../../audio/spectrogram.ts)) -- both
+    // surfaces now read from the same LUT in
+    // [palette.ts](../../audio/palette.ts), so a 4 kHz band that
+    // reads as bright yellow on a slice card reads as bright
+    // yellow on the live dashboard too.  The clamped array also
+    // lets the inner loop drop per-channel Math.min/Math.max.
     const PALETTE_N = 256;
-    const palette = new Uint8ClampedArray(PALETTE_N * 3);
-    for (let i = 0; i < PALETTE_N; i++) {
-      const t = i / (PALETTE_N - 1);
-      const o = i * 3;
-      palette[o] = 255 * (t * 3 - 1.4);
-      palette[o + 1] = 255 * (t * 1.7);
-      palette[o + 2] = 255 * (0.6 + (0.5 - t) * 1.4);
-    }
+    const palette = buildPlasmaLut(PALETTE_N);
     const emptyColor = `rgb(${palette[0]}, ${palette[1]}, ${palette[2]})`;
 
     // Native raster stage: one spectrogram column is one source-canvas pixel.
     // RAF rendering only scales/scrolls this tiny image via drawImage instead
     // of rebuilding a full DPR-sized ImageData buffer on the main thread.
-    const raster =
-      typeof OffscreenCanvas === 'function'
-        ? new OffscreenCanvas(historyColumns, useBins)
-        : document.createElement('canvas');
+    //
+    // The OffscreenCanvas / HTMLCanvasElement union confuses TS's
+    // overload resolution for `.getContext('2d')` (the common
+    // signature on both isn't the 2D one, it's the generic
+    // `RenderingContext | null` fallback), so we narrow via a
+    // typeof-guarded flag below -- both contexts share the methods
+    // used here, so typing as the union is safe at runtime.
+    const hasOffscreenCanvas = typeof OffscreenCanvas === 'function';
+    const raster: OffscreenCanvas | HTMLCanvasElement = hasOffscreenCanvas
+      ? new OffscreenCanvas(historyColumns, useBins)
+      : document.createElement('canvas');
     raster.width = historyColumns;
     raster.height = useBins;
-    const rasterCtx = raster.getContext('2d', { alpha: false });
+    // Reuse the typeof guard for the overload-resolution narrowing.
+    // A bare `raster instanceof OffscreenCanvas` would ReferenceError
+    // on browsers where the identifier doesn't exist (Safari < 16.4),
+    // since the right-hand side of `instanceof` is evaluated even when
+    // the LHS came from the fallback branch.
+    const rasterCtx = hasOffscreenCanvas
+      ? (raster as OffscreenCanvas).getContext('2d', { alpha: false })
+      : (raster as HTMLCanvasElement).getContext('2d', { alpha: false });
     if (!rasterCtx) return;
     rasterCtx.imageSmoothingEnabled = false;
     const columnImage = rasterCtx.createImageData(1, useBins);
@@ -145,10 +167,11 @@
         const mag = Math.hypot(real[k], imag[k]) * magScale;
         const sm = smoothing * smoothedMag[k] + (1 - smoothing) * mag;
         smoothedMag[k] = sm;
-        const db = 20 * Math.log10(Math.max(1e-10, sm));
-        let p = (((db - minDb) * (PALETTE_N - 1)) / (maxDb - minDb)) | 0;
-        if (p < 0) p = 0;
-        else if (p >= PALETTE_N) p = PALETTE_N - 1;
+        // Shared helper -- both the per-slice renderer and this
+        // dashboard surface route their normalised magnitudes
+        // through the same dB → palette index path, so colour at
+        // a given energy level reads identical across surfaces.
+        const p = magnitudeToPaletteIndex(sm, PALETTE_N, minDb, maxDb);
         const src = p * 3;
         const y = useBins - 1 - k;
         const dst = y * 4;
@@ -236,7 +259,7 @@
       lastRenderAt = renderAt;
 
       applyResizeIfNeeded();
-      const endSample = streams.renderCursor(streams.renderLatencyMs, now);
+      const endSample = streams.renderCursor(now);
       ingestUntil(endSample);
       render(endSample);
       raf = requestAnimationFrame(tick);

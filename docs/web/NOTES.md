@@ -28,19 +28,24 @@ status.
 
 Backend labels follow the Speech-Commands convention of marking synthetic
 classes with surrounding underscores: `_unknown_`, `_background_noise_`.
-The wire format is treated as data; the display layer maps it via
-`prettyLabel()` in
-[`TopKMeter.svelte`](../../web/src/lib/components/dashboard/TopKMeter.svelte):
+The wire format is treated as data; the display layer normalises it via
+the shared `prettyCategoryName()` in
+[`labels.ts`](../../web/src/lib/components/category/labels.ts), used by
+both the dataset accordion and the dashboard's `TopKMeter`:
 
 ```ts
-raw.replace(/^_+/, '').replace(/_+$/, '').replace(/_+/g, ' ')
-// _unknown_         -> "unknown"
-// _background_noise_ -> "background noise"
-// stop              -> "stop"
+// Strip outer `_` / `-`, split on `_` / `-` / whitespace, uppercase.
+// _unknown_          -> "UNKNOWN"
+// _background_noise_ -> "BACKGROUND NOISE"
+// stop               -> "STOP"
+// my-class_42        -> "MY CLASS 42"
 ```
 
-The raw label still lives in the `title` attribute for engineers
-inspecting with devtools.
+UPPERCASE rendering reads as a label (banner / chip), not a shell
+identifier, and gives the dataset row header, the top-K meter row,
+and the slice card label a consistent visual weight regardless of
+on-disk casing.  The raw label still lives in the `title` attribute
+for engineers inspecting via devtools.
 
 ## Corner radius and padding scale
 
@@ -744,3 +749,268 @@ Selected cards swap their border palette to
 `border-blue-300 hover:border-blue-400` for an at-a-glance batch
 preview.  Cards with a delete job in flight stay in the list with
 an `opacity-60` dim + a rose `deleting` pill until terminal.
+
+## Slice B course correction (2026-05-12)
+
+The Dataset Management surface in [ARCHITECTURE.md §A.4 "Extra Notes"](./ARCHITECTURE.md)
+is the design contract; the prior B.2 draft missed it on several
+load-bearing axes.  Recording the deviation here so the rebuild does
+not repeat the mistakes -- and so the salvaged pieces don't get
+re-thrown-out the next time someone reads the directory.
+
+### The architecture spec, restated
+
+A workspace's dataset is a **vertical list of categories** (one row
+per category).  Each row is independently expand/collapse; expanding
+splits into two panes: **Input Module** (left) and **Slice
+Management** (right).  The Input module retains *one* in-progress
+audio clip at a time; the Slice button chunks the trimmed range into
+**1-second slices @ 44,100 samples** and appends them to the right
+pane.  Slice cards render with their spectrogram as the card's
+background fill.  `_background_noise_` is mandatory and undeletable;
+threshold for training-ready is 20 slices on `_background_noise_`,
+10 on everything else.
+
+### Deviations the prior B.2 draft shipped
+
+| Axis | Spec | Prior B.2 | Recovery |
+|---|---|---|---|
+| Pipeline sample rate | 44.1 kHz | 16 kHz | Flip `WAV_SAMPLE_RATE` to 44 100. |
+| Per-workspace structure | Per-category accordion | Flat recording list | Replace UI in revised B.2. |
+| Mandatory category | `_background_noise_` undeletable | — | New in revised B.2. |
+| Input slot | Single most-recent clip / category | 64-recording list / workspace | Replace data model. |
+| Workflow | record → trim → Slice → cards | (record / import) only | Add trim + Slice (B.4). |
+| Import format | WAV only | audio/* | Restrict + magic-byte check (B.3). |
+| Slice rendering | Spectrogram-bg cards | Native `<audio controls>` rows | Replace (B.5). |
+| Quantity gate | ≥ 20 / ≥ 10 | — | New (B.5). |
+| Backend sync | GET / PUT / DELETE per slice | Local-only IDB | New (B.6). |
+| Recording visual | Real-time waveform | RMS level meter only | Upgrade (B.3). |
+| Export | Download clip as WAV | — | New (B.3). |
+
+### Why 44.1 kHz, not 16 kHz
+
+The daemon's training preprocessor targets exactly
+`TARGET_SR = 44_100` ([modules/preproc/wav_io.rs:21](../../modules/preproc/wav_io.rs#L21))
+and consumes 44,032 samples per inference frame
+([modules/preproc.rs:6](../../modules/preproc.rs#L6)).  The
+architecture spec's "1 s, 44,100 samples" maps 1:1 to this.
+Shipping 16 kHz on the client would have forced the daemon to
+upsample on every batch -- needless cost, lower spectral fidelity,
+and a divergence between the wire format and the architecture spec.
+
+The mic capture rate is whatever the device gives (`AudioContext.
+sampleRate`, typically 48 kHz on macOS / 44.1 kHz on Linux ALSA);
+the existing [recorder.svelte.ts](../../web/src/lib/audio/recorder.svelte.ts)
+resampler already pipes through `WAV_SAMPLE_RATE`, so flipping the
+constant retargets the entire pipeline.
+
+### Salvage map (what survives the rebuild)
+
+These files are reusable foundation; B.2's rebuild does NOT touch
+them except for the sample-rate constant flip:
+
+- [audio/wav.ts](../../web/src/lib/audio/wav.ts) -- PCM-16 mono WAV
+  encoder.
+- [audio/resample.ts](../../web/src/lib/audio/resample.ts) --
+  parametric on target rate; downmix + `OfflineAudioContext`
+  resample + `decodeAudioFile` helper.
+- [audio/recorder.svelte.ts](../../web/src/lib/audio/recorder.svelte.ts)
+  -- `getUserMedia` + inline `AudioWorklet` (blob URL) + state
+  machine.  B.3 will extend this to expose a `snapshot(samples,
+  out)` API so the live-waveform canvas can read mic PCM without
+  the global `streams` ring being involved.
+- [audio/fft.ts](../../web/src/lib/audio/fft.ts) -- radix-2
+  Cooley-Tukey FFT (legacy Slice A artifact).  Re-promoted as the
+  B.5 spectrogram engine.  Offline render in a Worker; no
+  AnalyserNode dependency.
+- [utils/format.ts](../../web/src/lib/utils/format.ts) -- byte /
+  duration formatters.
+
+These files are deleted as part of the B.2 rebuild because their
+design assumed the flat-recordings model:
+
+- `idb/recordings.ts`
+- `stores/recordings.svelte.ts`
+- `components/dataset/RecordingList.svelte`
+- `components/dataset/RecordingCard.svelte`
+- `components/dataset/DeleteRecordingDialog.svelte` (folded into
+  a generic `ConfirmDeleteDialog.svelte` primitive)
+- `components/dataset/Recorder.svelte` / `ImportZone.svelte` --
+  rebuilt under the per-category layout, not raw-replaced.
+
+[idb/db.ts](../../web/src/lib/idb/db.ts) keeps the open / upgrade /
+WeakMap-cache skeleton; the `recordings` store definition gets
+replaced by `drafts` + `slices` under schema v2 (no migration --
+the deviated v1 was never user-facing).
+
+### Inline AudioWorklet via blob: URL
+
+(Preserved from the prior B.2 notes -- still correct.)
+
+`MediaRecorder` would have given us audio bytes without an
+AudioWorklet, but only after a lossy opus/webm/ogg round-trip --
+unacceptable for our master copy.  `AudioWorklet` hands us raw
+Float32 frames directly off the audio graph; no codec, no precision
+loss.  Bonus: Safari 14.5+ supports it where MediaRecorder audio
+is patchy.
+
+We register the worklet from an *inline* string sealed inside a
+`Blob` + object URL, not from a separate `.ts` module:
+
+```ts
+const blob = new Blob([WORKLET_SOURCE], { type: 'application/javascript' });
+const url = URL.createObjectURL(blob);
+await ctx.audioWorklet.addModule(url).finally(() => URL.revokeObjectURL(url));
+```
+
+Why not a separate module file?  The worklet processor is ~20 lines.
+Shipping it via Vite's worklet bundling adds build-graph machinery
+(an extra chunk, an extra URL to register, fingerprinted assets)
+for zero functional gain.  The blob URL is revoked the moment
+`addModule` resolves so it doesn't leak.
+
+### Five-state recorder, explicit dispose
+
+(Preserved from the prior B.2 notes -- still correct.)
+
+The Recorder runtime lives in `audio/recorder.svelte.ts` so `$state`
+class fields work.  Lifecycle is *explicit*: the component creating
+the Recorder owns `onDestroy(() => recorder.dispose())`.  Five-state
+machine:
+
+```
+idle → requesting → recording ─stop()─▶ finalizing → idle
+        │              │                    │
+        └─ error ◀─────┴──── error ◀────────┘
+```
+
+`stop()` is idempotent; `cancel()` is the manual-discard path;
+`dispose()` funnels into it.  `start()` is gated on `state ∈ {idle,
+error}` so double-clicks are no-ops.
+
+### `decodeAudioData` discards the file's native sample rate
+
+(Preserved -- the rebuild's WAV-only path will read the rate from
+the WAV header directly, sidestepping this lossy detour.)
+
+`AudioContext.decodeAudioData` resamples the input to the *context's*
+rate before exposing the AudioBuffer to JS, so `decoded.sampleRate`
+is the context's rate, not the file's native rate.  Recovering the
+true rate requires a per-format header parser; B.3 only needs WAV,
+which is a 44-byte header read.
+
+### `Float32Array<ArrayBuffer>` at Web Audio boundaries
+
+(Preserved -- TS 5.7's narrower typed-array discriminator still
+applies wherever we cross into Web Audio.)
+
+TS 5.7 tightened the typed-array generic to `Float32Array<ArrayBuffer-
+Like>`.  Web Audio's `copyToChannel` and `getFloatTimeDomainData`
+require `Float32Array<ArrayBuffer>`.  We add explicit
+`as Float32Array<ArrayBuffer>` casts at boundary call sites.
+
+### Sequential file imports
+
+(Preserved -- B.3 keeps the single-file import semantics; the input
+slot is single-clip per category so there is nothing to parallelise
+within one row.)
+
+### SvelteMap mutations need fresh values
+
+Cross-cutting, learned during the prior B.2 -- still applies to the
+revised B.2's `categories` / `drafts` / `slices` stores.
+
+SvelteMap is reactive on `.set` / `.delete` / `.clear`, but values
+stored inside it are *not* deeply reactive -- mutating
+`slice.loading = true` on a reference returned from `.get()` triggers
+no `$effect` / `$derived` rerun.  Every store mutation in these
+files therefore re-`.set`s a *fresh* object reference.  An early draft
+mutated the existing reference then called `.set` with the same
+reference; reactivity skipped the change because the reference did
+not change.  Always-fresh-object is the cheap discipline.
+
+### `$effect` + `refresh()` reactive-loop trap
+
+Discovered during the B.3 verification gate: entering a workspace
+detail page felt sluggish and queued dozens of redundant
+`GET /assets/datasets` requests.  Root cause was a self-perpetuating
+microtask loop between the `$effect` that bootstraps a per-workspace
+fetch and the store method it calls.
+
+The shape of the bug:
+
+```ts
+// store
+async refresh(workspaceId: Uuid): Promise<void> {
+  const existing = this.slices.get(workspaceId); // tracked read
+  if (existing?.loaded && !existing.error) return;
+  this.slices.set(workspaceId, { loading: true, loaded: false }); // write
+  await Promise.all([...]);                                       // first await
+  this.slices.set(workspaceId, { loading: false, loaded: true }); // final write
+}
+
+// caller
+$effect(() => {
+  void store.refresh(workspaceId);
+});
+```
+
+Svelte 5's `$effect` tracks reads that happen during its synchronous
+execution -- and that tracking propagates across method calls.  So
+the inner `this.slices.get(...)` registers the slice as a dependency
+of the outer effect, and the write that follows it *invalidates*
+that dependency.  In the next microtask the effect re-fires, calls
+`refresh` again, reads the (now `loading: true, loaded: false`)
+slice, falls through the short-circuit (because `loaded` is still
+false), writes again, re-queues, ... until Svelte's
+`effect_update_depth_exceeded` guard fires.  Every iteration kicks
+off a fresh `Promise.all([fetch, ...])`.
+
+Two reasons it stayed silent through B.2:
+
+1. With a fast daemon the inner `Promise.all` resolves in tens of
+   milliseconds, so the loop terminates after a few iterations and
+   the user doesn't notice the queued fetches.
+2. The `datasets/` directory under a workspace is **not** laid down
+   at workspace-create time (only `training_logs/` /
+   `converter_logs/` are).  A first `GET
+   /workspace/{id}/assets/datasets` therefore returns 404
+   ([docs/API.md](../API.md) §"Workspace assets").  The catch
+   handler then writes `error: <404>` onto the slice -- which
+   `existing.error` flips the loaded-cache short-circuit OFF on
+   subsequent iterations, so even the steady-state cache hit no
+   longer saves us.  B.3's testing scenario (fresh workspaces with
+   no slices yet) hits this case head-on.
+
+Three coordinated fixes:
+
+1. **`if (existing?.loading && !force) return;` short-circuit** in
+   every reactive `refresh()` ([categories](../../web/src/lib/stores/categories.svelte.ts),
+   [drafts](../../web/src/lib/stores/drafts.svelte.ts)) before the
+   slice-write.  Once one refresh is in flight, the second iteration
+   bails on this gate.  Load-bearing for correctness, not just perf.
+2. **`untrack(() => store.refresh(id))` at call sites** in
+   `$effect` ([CategoryList](../../web/src/lib/components/category/CategoryList.svelte),
+   [InputPane](../../web/src/lib/components/category/InputPane.svelte)).
+   The effect tracks only the props it reads outside the wrapper
+   (`workspaceId`, `categoryName`); reads inside the wrapper don't
+   accrue dependencies.  Belt-and-suspenders -- the in-flight guard
+   alone fixes the loop, but `untrack` documents intent at the call
+   site so a future refactor of the store doesn't silently re-open
+   the door.
+3. **`isNotFound` catch on `assets.listDatasets`**: a fresh
+   workspace's missing `datasets/` directory is the empty case, not
+   an error.  Return an empty `DatasetListing` and let the merge
+   logic produce mandatory + IDB-only rows.  Other errors
+   propagate.
+
+Together they reduce workspace-detail entry from N redundant GETs
+(growing until Svelte's guard fires) to exactly one IDB read + one
+GET, with a clean empty list on fresh workspaces.
+
+`workspaces.refresh()` is NOT affected because its synchronous
+portion writes (`this.loading = true`) but doesn't read any state
+the outer effect tracks -- the effect's body just contains
+`void workspaces.refresh()`, no slice access at all.  The same
+in-flight guard is still cheap defence; left absent for now to keep
+the diff minimal.

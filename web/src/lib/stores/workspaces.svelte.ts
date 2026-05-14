@@ -1,7 +1,13 @@
 import { SvelteSet } from 'svelte/reactivity';
 import { workspaces as workspacesApi } from '$lib/api/endpoints';
-import { trackJob } from '$lib/api/jobs';
-import { errorCopy } from '$lib/utils/error-copy';
+import { awaitJobTerminal } from '$lib/api/jobs';
+import { enqueueDelete } from '$lib/api/delete-queue';
+import { deleteCategoriesForWorkspace } from '$lib/idb/categories';
+import { deleteDraftsForWorkspace } from '$lib/idb/drafts';
+import { deleteSlicesForWorkspace } from '$lib/idb/slices';
+import { drafts as draftsStore } from '$lib/stores/drafts.svelte';
+import { slices as slicesStore } from '$lib/stores/slices.svelte';
+import { capFirst, errorCopy } from '$lib/utils/error-copy';
 import type {
   WorkspaceCreateReq,
   WorkspaceListEntry,
@@ -149,63 +155,62 @@ class WorkspacesStore {
     return resp;
   }
 
-  // Serializes every workspace delete (single-item AND bulk).  The
-  // daemon's `JobRegistry` admits one job from the delete family
-  // (Dataset / Converter / *_Logs / Workspace) at a time globally
-  // (`max_delete_jobs = 1`); firing N parallel DELETEs would 409 the
-  // overflow.  Each new request chains onto the previous promise so
-  // the next DELETE only fires after the previous job's terminal SSE
-  // event; the per-link `.catch(() => undefined)` keeps the chain
-  // advancing past individual failures.
-  private deleteChain: Promise<unknown> = Promise.resolve();
+  // Workspace deletes flow through the global `enqueueDelete` queue
+  // ([api/delete-queue.ts]) so they serialise with the daemon's
+  // single delete-family slot (`max_delete_jobs = 1`).  The queue
+  // covers `WorkspaceDelete` + `DatasetDelete` + `ConverterDelete`
+  // + `*LogsDelete`, so categories / slices in B.2+ share the same
+  // chain without a separate local queue.
 
   // Public single-item delete.  Awaits the full lifecycle (queue ->
   // DELETE ack -> SSE terminal) so the caller knows whether the
   // workspace is actually gone.  Throws on any failure path.
   async delete(id: Uuid): Promise<void> {
-    await this.enqueueDelete(id);
-  }
-
-  // Enqueues one workspace delete behind any currently-running
-  // delete.  Resolves on terminal `succeeded`; rejects on the
-  // DELETE ack failing, on terminal `failed` / `cancelled`, or on
-  // the SSE stream closing before terminal.  Updates `deleting`
-  // while in flight, then `all` / `selected` on terminal success.
-  // The caller owns surfacing the outcome.
-  private enqueueDelete(id: Uuid): Promise<void> {
-    const work = this.deleteChain.then(() => this.runDelete(id));
-    // Keep the chain advancing even if `work` rejects -- otherwise
-    // a single bad delete would stall every subsequent enqueue.
-    this.deleteChain = work.catch(() => undefined);
-    return work;
+    await enqueueDelete(() => this.runDelete(id));
   }
 
   private async runDelete(id: Uuid): Promise<void> {
-    const ack = await workspacesApi.delete(id);
-    this.deleting.add(id);
+    // Bracket the entire deletion (ack-stage + drain) as one
+    // workspace mutation so the detail page's poller defers its
+    // revision check until we're settled.  The daemon renames the
+    // workspace tree under the per-workspace mutex BEFORE the 202
+    // ack returns, so without this bracket the poller could fire
+    // a 404 between our `workspacesApi.delete` ack and the
+    // dialog's success flow -- flashing an EmptyState behind the
+    // still-open dialog.  `slicesStore.forget(id)` on the success
+    // path also clears the counter, so the outer `endMutation`
+    // becomes a defensive no-op in that branch.
+    slicesStore.beginMutation(id);
     try {
-      await new Promise<void>((resolve, reject) => {
-        trackJob(ack.job_id, {
-          onTerminal: (ev) => {
-            if (ev.state === 'succeeded') {
-              resolve();
-            } else {
-              reject(new Error(ev.message ?? `delete ${ev.state ?? 'ended without success'}`));
-            }
-          },
-          onError: (reason) => reject(new Error(reason))
-        });
-      });
-      // Terminal succeeded: drop from list + selection.
-      this.all = this.all.filter((w) => w.id !== id);
-      this.selected.delete(id);
-    } catch (e) {
-      // Terminal failure leaves the workspace on disk -- refresh
-      // so the list reflects truth.  Re-throw for the queue caller.
-      void this.refresh();
-      throw e;
+      const ack = await workspacesApi.delete(id);
+      this.deleting.add(id);
+      try {
+        await awaitJobTerminal(ack.job_id);
+        // Terminal succeeded: drop from list + selection, then GC the
+        // per-workspace IDB rows (categories + drafts + slices) so a
+        // long session doesn't accumulate orphan blobs (slices alone
+        // are ~88 KB each).  IDB failures here are housekeeping --
+        // swallowed because the daemon-side delete is the load-
+        // bearing one and a stale local row reaches no UI surface.
+        this.all = this.all.filter((w) => w.id !== id);
+        this.selected.delete(id);
+        draftsStore.forget(id);
+        slicesStore.forget(id);
+        await Promise.all([
+          deleteCategoriesForWorkspace(id).catch(() => 0),
+          deleteDraftsForWorkspace(id).catch(() => 0),
+          deleteSlicesForWorkspace(id).catch(() => 0)
+        ]);
+      } catch (e) {
+        // Terminal failure leaves the workspace on disk -- refresh
+        // so the list reflects truth.  Re-throw for the queue caller.
+        void this.refresh();
+        throw e;
+      } finally {
+        this.deleting.delete(id);
+      }
     } finally {
-      this.deleting.delete(id);
+      slicesStore.endMutation(id);
     }
   }
 
@@ -268,10 +273,11 @@ class WorkspacesStore {
     await Promise.all(
       targets.map(async (entry) => {
         try {
-          await this.enqueueDelete(entry.id);
+          await enqueueDelete(() => this.runDelete(entry.id));
           succeeded++;
         } catch (e) {
-          const message = e instanceof Error && e.message ? capFirst(e.message) : errorCopy(e);
+          const message =
+            e instanceof Error && e.message ? capFirst(e.message, 'Delete failed.') : errorCopy(e);
           failed.push({ id: entry.id, name: entry.name, error: message });
         }
       })
@@ -281,19 +287,6 @@ class WorkspacesStore {
 
     return { succeeded, failed };
   }
-}
-
-// Capitalize the first character.  Used when bubbling up an
-// `Error.message` from a daemon-classified failure -- Rust
-// thiserror messages are lowercase, but inline copy reads better
-// with a leading capital + period.  Daemon JSON-encoded SSE
-// messages don't carry the `fs:` etc. layer prefix, so unlike
-// `errorCopy` this path skips prefix stripping.
-function capFirst(s: string): string {
-  const t = s.trim();
-  if (!t) return 'Delete failed.';
-  const head = t[0].toUpperCase() + t.slice(1);
-  return /[.!?…]$/.test(head) ? head : `${head}.`;
 }
 
 export const workspaces = new WorkspacesStore();

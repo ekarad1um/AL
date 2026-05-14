@@ -225,6 +225,27 @@ export interface MicState {
   version: number;
 }
 
+// One direct-child entry in a dataset listing -- file or directory.
+// `size_bytes` is null on directories per the daemon (the listing
+// path never walks).  `mtime` is RFC3339 UTC.
+export interface AssetEntry {
+  name: string;
+  kind: 'file' | 'dir';
+  size_bytes: number | null;
+  mtime: Rfc3339;
+}
+
+// `GET /api/v1/workspace/{id}/assets[/{*path}]` directory response.
+// File reads return raw bytes; directory reads return this shape.
+// `offset` / `limit` echo the request parameters (defaults: 0 / 100,
+// max limit 1000 per the daemon).
+export interface DatasetListing {
+  entries: AssetEntry[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
 export interface TfjsConvertParams {
   converter_type: 'tfjs';
   model_json_path: string;
