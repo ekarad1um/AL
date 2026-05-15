@@ -53,20 +53,19 @@ pub const MAX_LOG_PAGE_LIMIT: usize = 1000;
 /// in `payload` via `#[serde(flatten)]`.  Producers
 /// (`ConvertJobLog`, `TrainJobLog`) own their per-line schema:
 /// the converter writes `{state, progress, message}` triples;
-/// the training producer writes `{schema_version, kind, ...}`
-/// typed events under a discriminator.  Either shape
-/// round-trips through this type because unknown fields land in
-/// `payload` rather than failing the parse.
+/// the training producer writes typed events tagged on `kind`.
+/// Either shape round-trips through this type because unknown
+/// fields land in `payload` rather than failing the parse.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogEvent {
     pub seq: u64,
     pub at: String,
     /// Per-producer payload fields.  For the converter today
     /// this is `{state, progress?, message?}`; for the training
-    /// producer it is `{schema_version, kind, ...event-specific
-    /// fields}`.  Consumers downcast based on producer (which
-    /// JSONL tree the file lives under) or the `kind`
-    /// discriminator within `payload`.
+    /// producer it is `{kind, ...event-specific fields}`.
+    /// Consumers downcast based on producer (which JSONL tree
+    /// the file lives under) or the `kind` discriminator within
+    /// `payload`.
     #[serde(flatten)]
     pub payload: serde_json::Map<String, serde_json::Value>,
 }

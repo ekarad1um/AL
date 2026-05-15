@@ -74,10 +74,14 @@ pub struct TrainingJob {
 // MARK: typed events
 //
 // Wire shape for the durable JSONL log + the cross-cutting SSE
-// bridge.  Every line is a [`TrainLogLine`] envelope
-// (`schema_version` + `seq` + `at` + flattened [`TrainEvent`]),
-// so a tab-refresh hydrates from the JSONL with no shape
-// divergence from the live SSE stream.
+// bridge.  Every line is a [`TrainLogLine`] envelope (`seq` +
+// `at` + flattened [`TrainEvent`]), so a tab-refresh hydrates
+// from the JSONL with no shape divergence from the live SSE
+// stream.  Forward-compat is carried by the `kind` discriminator
+// and `#[non_exhaustive]` on `TrainEvent` (consumers must
+// tolerate unknown variants); a future wire-breaking change can
+// introduce versioning lazily by adding a `schema_version` field
+// only at that point (absence on a line means today's shape).
 
 /// Operator-vs-internal axis for [`TrainEvent::JobFailed`].
 /// Derived from [`crate::common::error::Categorized::kind`] on
@@ -255,7 +259,6 @@ pub enum TrainEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         best_val_epoch: Option<u32>,
         #[serde(
-            default,
             skip_serializing_if = "Option::is_none",
             serialize_with = "serialize_finite_or_null_opt"
         )]
@@ -296,23 +299,16 @@ pub enum TrainEvent {
     JobCancelled { stage: Stage, reason: CancelReason },
 }
 
-/// Wire envelope for one JSONL line.  `schema_version` is pinned
-/// at 1 today; readers branch on the value to handle a future
-/// v2.  `seq` is monotonic per file (best-effort; one-line loss
-/// from a crash mid-write is tolerated by the page reader).
+/// Wire envelope for one JSONL line.  `seq` is monotonic per
+/// file (best-effort; one-line loss from a crash mid-write is
+/// tolerated by the page reader).
 #[derive(Debug, Serialize)]
 struct TrainLogLine<'a> {
-    schema_version: u8,
     seq: u64,
     at: String,
     #[serde(flatten)]
     event: &'a TrainEvent,
 }
-
-/// Wire envelope schema version.  Bumped on a wire-shape
-/// breaking change; the page reader switches behaviour by
-/// branching on this field.
-const TRAIN_LOG_SCHEMA_VERSION: u8 = 1;
 
 /// Lift the algorithmic event variants from `finetune` into
 /// the wrapper's wire shape.  The variant pairs are 1:1; field
@@ -1446,13 +1442,12 @@ impl TrainJobLog {
     }
 
     /// Append one JSONL line carrying a typed [`TrainEvent`].
-    /// The wire envelope is [`TrainLogLine`] (`schema_version` +
-    /// `seq` + `at` + flattened event payload).
+    /// The wire envelope is [`TrainLogLine`] (`seq` + `at` +
+    /// flattened event payload).
     fn emit(&mut self, event: &TrainEvent) -> Result<(), TrainingError> {
         use std::io::Write as _;
         self.seq = self.seq.saturating_add(1);
         let line = TrainLogLine {
-            schema_version: TRAIN_LOG_SCHEMA_VERSION,
             seq: self.seq,
             at: now_rfc3339(),
             event,
@@ -1834,10 +1829,10 @@ mod tests {
 
     /// `TrainJobLog::open` materialises
     /// `<workspace>/training_logs/<job_id>.jsonl` and writes one
-    /// JSONL line per [`TrainJobLog::emit`] call.  Pinned because
-    /// the unified `GET /assets/training_logs/<id>.jsonl` reader
-    /// expects every line to carry `schema_version`, `seq`, `at`,
-    /// `kind`, plus event-specific fields under the `kind`
+    /// JSONL line per [`TrainJobLog::emit`] call.  Pinned
+    /// because the unified `GET /assets/training_logs/<id>.jsonl`
+    /// reader expects every line to carry `seq`, `at`, `kind`,
+    /// plus event-specific fields under the `kind`
     /// discriminator -- a writer-side regression here would
     /// silently break the page response.
     #[test]
@@ -1873,13 +1868,11 @@ mod tests {
         assert_eq!(lines.len(), 3, "one JSONL line per emit() call");
 
         let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(first["schema_version"], 1);
         assert_eq!(first["seq"], 1);
         assert_eq!(first["kind"], "job_running");
         assert!(first["at"].as_str().unwrap().ends_with('Z'));
 
         let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(second["schema_version"], 1);
         assert_eq!(second["seq"], 2);
         assert_eq!(second["kind"], "epoch_completed");
         assert_eq!(second["epoch"], 3);
@@ -1890,7 +1883,6 @@ mod tests {
         assert_eq!(second["elapsed_ms"], 750);
 
         let third: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
-        assert_eq!(third["schema_version"], 1);
         assert_eq!(third["seq"], 3);
         assert_eq!(third["kind"], "job_cancelled");
         assert_eq!(third["stage"], "train");

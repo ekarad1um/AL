@@ -479,8 +479,7 @@ async fn train_emits_started_then_terminal_jsonl_event() {
     // and a terminal event (`job_completed`, `job_failed`, or
     // `job_cancelled`); a regression that only writes one (or
     // neither) is the failure mode this test pins.  Each line
-    // carries a `kind` discriminator under the schema-versioned
-    // wire shape (`schema_version: 1`).
+    // carries a `kind` discriminator (snake_case).
     let resp = call(
         &r,
         Method::GET,
@@ -516,12 +515,4 @@ async fn train_emits_started_then_terminal_jsonl_event() {
             .any(|k| matches!(*k, "job_completed" | "job_failed" | "job_cancelled")),
         "expected a terminal event; got {kinds:?}; on-disk body=\n{body}",
     );
-    // Every line carries the schema_version pin.
-    for e in events {
-        assert_eq!(
-            e["schema_version"].as_u64(),
-            Some(1),
-            "every JSONL line must carry schema_version=1; got line={e}",
-        );
-    }
 }
