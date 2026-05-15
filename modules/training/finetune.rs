@@ -516,25 +516,23 @@ fn run_inner(
     event(Event::PhaseStarted {
         phase: Stage::DatasetScan,
     });
-    progress(&Progress::new(
-        Stage::DatasetScan,
-        0,
-        0,
-        format!("scan dataset: {}", cfg.data.display()),
-    ));
+    // Operator-facing progress messages never carry server
+    // filesystem paths -- the typed `TrainEvent::DatasetScanned`
+    // (emitted just below on success) carries the structured
+    // `n_classes` / `classes` / `n_examples_total` payload that
+    // tells the operator what was actually loaded.
+    progress(&Progress::new(Stage::DatasetScan, 0, 0, "scan dataset"));
     let (classes, examples) = scan_dataset(&cfg.data)?;
     let n_classes = classes.len();
     if n_classes < 2 {
         return Err(FinetuneError::InvalidConfig(format!(
-            "need at least 2 classes; found {n_classes} in {}",
-            cfg.data.display()
+            "need at least 2 classes; found {n_classes} under datasets/"
         )));
     }
     if examples.is_empty() {
-        return Err(FinetuneError::InvalidConfig(format!(
-            "dataset {} contains no .wav examples",
-            cfg.data.display()
-        )));
+        return Err(FinetuneError::InvalidConfig(
+            "datasets/ contains no .wav examples".into(),
+        ));
     }
     // Reject post-scan empty classes BEFORE
     // any feature extraction or optimizer step.  `scan_dataset`
@@ -573,12 +571,11 @@ fn run_inner(
     ));
     check_cancel(cancel)?;
 
-    progress(&Progress::new(
-        Stage::DatasetScan,
-        0,
-        1,
-        format!("load backbone: {}", cfg.backbone.display()),
-    ));
+    // No path on the wire -- `TrainEvent::JobSubmitted.backbone`
+    // already carries the basename of the artifact this job
+    // selected; the watch-channel scrollback only needs the
+    // stage indicator.
+    progress(&Progress::new(Stage::DatasetScan, 0, 1, "load backbone"));
     let backbone = Backbone::<InnerB>::load_mpk(&cfg.backbone, &device_inner)?;
     check_cancel(cancel)?;
 
@@ -662,9 +659,12 @@ fn run_inner(
         let loaded = Head::<AutoB>::load_mpk(p, &device_auto)?;
         let loaded_n = loaded.linear.weight.val().dims()[1];
         if loaded_n != n_classes {
+            // Don't echo the init_head path: this branch only
+            // fires from the unit-test path (the daemon's wrapper
+            // always passes `init_head: None`), but the
+            // operator-facing diagnostic shape stays uniform.
             return Err(FinetuneError::InvalidConfig(format!(
-                "init_head {} has {loaded_n} classes; dataset has {n_classes}",
-                p.display()
+                "init_head has {loaded_n} classes; dataset has {n_classes}"
             )));
         }
         loaded
@@ -705,12 +705,11 @@ fn run_inner(
     event(Event::PhaseStarted {
         phase: Stage::Save,
     });
-    progress(&Progress::new(
-        Stage::Save,
-        0,
-        2,
-        format!("save head: {}", cfg.out.display()),
-    ));
+    // No path on the wire -- the typed `TrainEvent::HeadPublished`
+    // (emitted by the wrapper after the rotation primitive
+    // succeeds) carries the public `head_id` the operator
+    // already received from `POST /train`.
+    progress(&Progress::new(Stage::Save, 0, 2, "save head"));
     // Compute final metrics from the in-memory head first;
     // `save_mpk_atomic` consumes `head_inner` via Burn's owning
     // `into_record`, and the saved bytes are byte-for-byte

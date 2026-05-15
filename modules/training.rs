@@ -375,18 +375,44 @@ impl From<finetune::Event> for TrainEvent {
     }
 }
 
+/// Strip the workspace_dir prefix from `path` so operator-facing
+/// failure cards render workspace-relative paths
+/// (`datasets/cat`) instead of server-absolute ones
+/// (`/var/.../workspaces/<id>/datasets/cat`).  Non-matching
+/// paths (e.g. daemon-internal artefacts outside the workspace
+/// tree) pass through unchanged.  `workspace_dir == None` is
+/// the test-only no-strip mode.
+fn strip_workspace_prefix(path: &str, workspace_dir: Option<&std::path::Path>) -> String {
+    let Some(wd) = workspace_dir else {
+        return path.to_string();
+    };
+    let prefix = wd.display().to_string();
+    if let Some(rest) = path.strip_prefix(&prefix) {
+        rest.trim_start_matches('/').to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 /// Map a [`TrainingError`] to the typed [`FailPayload`].  Used
-/// at the wrapper's terminal transition to build the
-/// `JobFailed` event without losing structure.
-fn fail_payload_from_error(err: &TrainingError) -> FailPayload {
+/// at the wrapper's terminal transition to build the `JobFailed`
+/// event without losing structure.  `workspace_dir` is stripped
+/// from the structured `path` field of path-bearing variants so
+/// the operator sees workspace-relative paths; pass `None` from
+/// tests that don't care.
+fn fail_payload_from_error(
+    err: &TrainingError,
+    workspace_dir: Option<&std::path::Path>,
+) -> FailPayload {
     use finetune::FinetuneError as F;
+    let strip = |p: &str| strip_workspace_prefix(p, workspace_dir);
     match err {
         TrainingError::BadDataset { path, reason } => FailPayload::BadDataset {
-            path: path.clone(),
+            path: strip(path),
             reason: reason.clone(),
         },
         TrainingError::DatasetRead { path, reason } => FailPayload::DatasetRead {
-            path: path.clone(),
+            path: strip(path),
             reason: reason.clone(),
         },
         TrainingError::Finetune(F::EmptyClassAfterScan {
@@ -428,11 +454,11 @@ fn fail_payload_from_error(err: &TrainingError) -> FailPayload {
             detail: e.to_string(),
         },
         TrainingError::Io { path, source } => FailPayload::Io {
-            path: path.clone(),
+            path: strip(path),
             detail: source.to_string(),
         },
         TrainingError::Finetune(F::Io { path, source }) => FailPayload::Io {
-            path: path.clone(),
+            path: strip(path),
             detail: source.to_string(),
         },
         TrainingError::Finetune(F::Panic(detail)) => FailPayload::Panic {
@@ -1116,7 +1142,7 @@ async fn run_job(
                 stage: stage_now,
                 severity: severity_from_error(e),
                 error: e.to_string(),
-                payload: fail_payload_from_error(e),
+                payload: fail_payload_from_error(e, Some(&workspace_dir)),
             }
         }
     };
@@ -2005,7 +2031,7 @@ mod tests {
             path: "/ws/datasets".into(),
             reason: "no class folders".into(),
         };
-        match fail_payload_from_error(&err) {
+        match fail_payload_from_error(&err, None) {
             FailPayload::BadDataset { path, reason } => {
                 assert_eq!(path, "/ws/datasets");
                 assert_eq!(reason, "no class folders");
@@ -2018,7 +2044,7 @@ mod tests {
             class: "cat".into(),
             per_class_kept: vec![("cat".into(), 0), ("dog".into(), 5)],
         });
-        match fail_payload_from_error(&err) {
+        match fail_payload_from_error(&err, None) {
             FailPayload::EmptyClass {
                 class,
                 per_class_kept,
@@ -2038,7 +2064,7 @@ mod tests {
             per_class_kept: vec![("cat".into(), 35), ("dog".into(), 35)],
             per_class_dropped: vec![("cat".into(), 15), ("dog".into(), 15)],
         });
-        match fail_payload_from_error(&err) {
+        match fail_payload_from_error(&err, None) {
             FailPayload::DropRatioExceeded {
                 dropped,
                 total,
@@ -2060,7 +2086,7 @@ mod tests {
             path: "/ws/.tmp".into(),
             source: std::io::Error::other("disk full"),
         };
-        match fail_payload_from_error(&err) {
+        match fail_payload_from_error(&err, None) {
             FailPayload::Io { path, detail } => {
                 assert_eq!(path, "/ws/.tmp");
                 assert!(detail.contains("disk full"));
@@ -2080,5 +2106,61 @@ mod tests {
             source: std::io::Error::other("y"),
         };
         assert_eq!(severity_from_error(&io), Severity::Internal);
+    }
+
+    /// `fail_payload_from_error` strips the workspace_dir prefix
+    /// from path-bearing variants so the operator's failure card
+    /// renders workspace-relative paths (`datasets/cat`) instead
+    /// of server-absolute ones (`/var/.../workspaces/<id>/...`).
+    /// Non-matching paths pass through unchanged; the test-only
+    /// `None` mode disables stripping entirely.
+    #[test]
+    fn fail_payload_strips_workspace_prefix() {
+        use std::path::PathBuf;
+        let workspace_dir = PathBuf::from("/var/data/workspaces/abc-123");
+
+        // Path under the workspace -> stripped to relative.
+        let err = TrainingError::BadDataset {
+            path: "/var/data/workspaces/abc-123/datasets/cat".into(),
+            reason: "empty".into(),
+        };
+        match fail_payload_from_error(&err, Some(&workspace_dir)) {
+            FailPayload::BadDataset { path, .. } => assert_eq!(path, "datasets/cat"),
+            other => panic!("expected BadDataset, got {other:?}"),
+        }
+
+        // Io path under the workspace -> stripped.
+        let err = TrainingError::Io {
+            path: "/var/data/workspaces/abc-123/.tmp/blob".into(),
+            source: std::io::Error::other("ENOSPC"),
+        };
+        match fail_payload_from_error(&err, Some(&workspace_dir)) {
+            FailPayload::Io { path, .. } => assert_eq!(path, ".tmp/blob"),
+            other => panic!("expected Io, got {other:?}"),
+        }
+
+        // Path outside the workspace tree -> verbatim (daemon-
+        // internal artefact; Internal severity, operator can't
+        // act anyway).
+        let err = TrainingError::Io {
+            path: "/opt/acoustics/backbone.mpk".into(),
+            source: std::io::Error::other("permission denied"),
+        };
+        match fail_payload_from_error(&err, Some(&workspace_dir)) {
+            FailPayload::Io { path, .. } => assert_eq!(path, "/opt/acoustics/backbone.mpk"),
+            other => panic!("expected Io, got {other:?}"),
+        }
+
+        // `None` mode (tests): no stripping.
+        let err = TrainingError::BadDataset {
+            path: "/var/data/workspaces/abc-123/datasets/cat".into(),
+            reason: "empty".into(),
+        };
+        match fail_payload_from_error(&err, None) {
+            FailPayload::BadDataset { path, .. } => {
+                assert_eq!(path, "/var/data/workspaces/abc-123/datasets/cat");
+            }
+            other => panic!("expected BadDataset, got {other:?}"),
+        }
     }
 }
