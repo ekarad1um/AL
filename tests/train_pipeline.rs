@@ -474,20 +474,24 @@ async fn train_emits_started_then_terminal_jsonl_event() {
     }
 
     // Page the JSONL through the unified surface.  We assert
-    // the producer wrote BOTH a `started` event and a terminal
-    // event; a regression that only writes one (or neither) is
-    // the failure mode this test pins.
+    // the producer wrote BOTH a `job_submitted` event (the
+    // typed envelope replaces the old `state: "started"` line)
+    // and a terminal event (`job_completed`, `job_failed`, or
+    // `job_cancelled`); a regression that only writes one (or
+    // neither) is the failure mode this test pins.  Each line
+    // carries a `kind` discriminator under the schema-versioned
+    // wire shape (`schema_version: 1`).
     let resp = call(
         &r,
         Method::GET,
-        &format!("/api/v1/workspace/{ws}/assets/training_logs/{job_id}.jsonl?limit=10",),
+        &format!("/api/v1/workspace/{ws}/assets/training_logs/{job_id}.jsonl?limit=20",),
         None,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v: serde_json::Value = json_body(resp).await;
     let events = v["events"].as_array().expect("events array");
-    let states: Vec<&str> = events.iter().filter_map(|e| e["state"].as_str()).collect();
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e["kind"].as_str()).collect();
     // For diagnostic clarity if the assertion fails: dump the
     // on-disk JSONL.  fresh_router roots the FsService at
     // `dir`, so the workspace dir is `dir/workspaces/<id>/`.
@@ -503,13 +507,21 @@ async fn train_emits_started_then_terminal_jsonl_event() {
         .join(format!("{job_id}.jsonl"));
     let body = std::fs::read_to_string(&log_path).unwrap_or_default();
     assert!(
-        states.contains(&"started"),
-        "expected `started` event; got {states:?}; on-disk body=\n{body}",
+        kinds.contains(&"job_submitted"),
+        "expected `job_submitted` event; got {kinds:?}; on-disk body=\n{body}",
     );
     assert!(
-        states
+        kinds
             .iter()
-            .any(|s| matches!(*s, "completed" | "failed" | "cancelled")),
-        "expected a terminal event; got {states:?}; on-disk body=\n{body}",
+            .any(|k| matches!(*k, "job_completed" | "job_failed" | "job_cancelled")),
+        "expected a terminal event; got {kinds:?}; on-disk body=\n{body}",
     );
+    // Every line carries the schema_version pin.
+    for e in events {
+        assert_eq!(
+            e["schema_version"].as_u64(),
+            Some(1),
+            "every JSONL line must carry schema_version=1; got line={e}",
+        );
+    }
 }

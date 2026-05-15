@@ -19,22 +19,39 @@
 //! Sized`.  `Arc<dyn TrainingRegistry>` is constructible.
 
 use crate::common::ids::{JobId, WorkspaceId};
-use crate::file_mgr::FsService;
+use crate::file_mgr::{FsService, JobHandle};
 use crate::training::{JobRegistry, JobView, TrainingError, TrainingJob};
 use std::sync::Arc;
 
 /// Submit + observe + cancel in-process training jobs.
-/// Production impl: [`JobRegistry`] (DashMap-backed; one
-/// in-flight job at a time per redesign §9 `max_train_jobs = 1`).
+/// Production impl: [`JobRegistry`] (DashMap-backed).
+///
+/// Admission against `max_train_jobs = 1` is enforced by the
+/// cross-cutting [`crate::file_mgr::JobRegistry`] via
+/// `register_train_job` at the api boundary; the resulting
+/// [`JobHandle`] is passed through `spawn` so the worker can
+/// fan typed events out to the SSE bridge and consume the
+/// handle at terminal.
 pub trait TrainingRegistry: Send + Sync + std::fmt::Debug {
     /// Submit a training job.  Validates the wire `TrainingCfg`
-    /// and runs the admission gate (one running train job
-    /// daemon-wide) before returning a [`JobId`]; the actual
-    /// training runs on a `spawn_blocking` worker.  Returns the
-    /// wrapped `FileError::AnotherTrainRunning` if another job
-    /// is already in flight, mapped to HTTP 409 with the
-    /// `another_train_running` discriminator code.
-    fn spawn(&self, files: Arc<dyn FsService>, job: TrainingJob) -> Result<JobId, TrainingError>;
+    /// (defence-in-depth — the api route already validated)
+    /// and registers the job in the in-memory map; the actual
+    /// training runs on a `spawn_blocking` worker.
+    ///
+    /// `job_handle` is the cross-cutting [`JobHandle`] obtained
+    /// from `FsService::register_train_job`.  When `Some`, the
+    /// worker bridges typed events into the `/jobs` + SSE
+    /// surface and consumes the handle at terminal.  When
+    /// `None` (test-only path), the worker still writes the
+    /// JSONL backstop and surfaces state via
+    /// `/workspace/{id}/training/{job}` but no `/jobs`-side
+    /// snapshot is created.
+    fn spawn(
+        &self,
+        files: Arc<dyn FsService>,
+        job: TrainingJob,
+        job_handle: Option<JobHandle>,
+    ) -> Result<JobId, TrainingError>;
 
     /// Cancel an in-flight job.  The training task observes
     /// the cancel flag at its next progress emit and exits;
@@ -61,8 +78,13 @@ pub trait TrainingRegistry: Send + Sync + std::fmt::Debug {
 }
 
 impl TrainingRegistry for JobRegistry {
-    fn spawn(&self, files: Arc<dyn FsService>, job: TrainingJob) -> Result<JobId, TrainingError> {
-        JobRegistry::spawn(self, files, job)
+    fn spawn(
+        &self,
+        files: Arc<dyn FsService>,
+        job: TrainingJob,
+        job_handle: Option<JobHandle>,
+    ) -> Result<JobId, TrainingError> {
+        JobRegistry::spawn(self, files, job, job_handle)
     }
     fn cancel(&self, workspace_id: &WorkspaceId, job_id: JobId) -> Result<(), TrainingError> {
         JobRegistry::cancel(self, workspace_id, job_id)

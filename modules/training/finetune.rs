@@ -75,25 +75,56 @@ impl FinetuneConfig {
     }
 }
 
-/// Coarse-grained phase for user-facing progress.
+/// Pipeline stage emitted on every `Event::PhaseStarted` and
+/// included in the terminal `JobFailed` / `JobCancelled` events
+/// so operator tooling can attribute a failure to the step that
+/// produced it.  Wire form is snake_case (`prepare`,
+/// `dataset_scan`, `feature_extract`, `train`, `save`, `publish`).
+///
+/// Six variants instead of the original five (`Loading`,
+/// `FeatureExtract`, `Train`, `Saving`, `Done`) because
+/// "Loading" conflated workspace prep + dataset scan and
+/// "Saving" conflated the local atomic write + the published
+/// rotation.  Splitting them gives the operator-fixable vs
+/// internal axis a clean stage tag (`dataset_scan` failures are
+/// nearly all operator-fixable; `publish` failures are not).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Phase {
-    Loading,
+pub enum Stage {
+    /// Pre-scan workspace + tempdir setup; runs in `training.rs`.
+    Prepare,
+    /// Walking `<workspace>/datasets/`; emitted just before
+    /// `scan_dataset`.
+    DatasetScan,
+    /// Frozen-backbone feature extraction.
     FeatureExtract,
+    /// Head fine-tune loop (per-epoch SGD + best-val tracking).
     Train,
-    Saving,
-    Done,
+    /// `save_mpk_atomic` write of the trained head + sibling
+    /// labels.txt under `<workspace>/.tmp/`.
+    Save,
+    /// Rotation primitive publishes the staged `.mpk` into
+    /// `<workspace>/heads/<head_id>.mpk`.  Runs in `training.rs`
+    /// after `finetune::run` returns.
+    Publish,
 }
 
-/// Per-epoch metrics attached to `Phase::Train` progress events.
+/// Per-epoch metrics attached to `Stage::Train` progress events
+/// and to durable [`Event::EpochCompleted`] lines.
+///
+/// `val_acc` and `best_val_acc` carry `f32::NAN` when
+/// `val_split == 0.0`; both serialise to JSON `null` so the
+/// `JobView` endpoint round-trips cleanly (serde_json refuses
+/// non-finite floats by default).
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct EpochMetrics {
     pub epoch: usize,
     pub epochs: usize,
     pub train_loss: f64,
     pub train_acc: f32,
+    #[serde(serialize_with = "serialize_finite_or_null")]
     pub val_acc: f32,
+    #[serde(serialize_with = "serialize_finite_or_null")]
     pub best_val_acc: f32,
 }
 
@@ -101,7 +132,7 @@ pub struct EpochMetrics {
 /// `tokio::sync::watch` channel by the daemon-side training crate.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Progress {
-    pub phase: Phase,
+    pub phase: Stage,
     pub current: usize,
     pub total: usize,
     pub message: String,
@@ -110,7 +141,7 @@ pub struct Progress {
 }
 
 impl Progress {
-    fn new(phase: Phase, current: usize, total: usize, message: impl Into<String>) -> Self {
+    fn new(phase: Stage, current: usize, total: usize, message: impl Into<String>) -> Self {
         Self {
             phase,
             current,
@@ -122,12 +153,114 @@ impl Progress {
 
     fn with_metrics(message: impl Into<String>, metrics: EpochMetrics) -> Self {
         Self {
-            phase: Phase::Train,
+            phase: Stage::Train,
             current: metrics.epoch,
             total: metrics.epochs,
             message: message.into(),
             metrics: Some(metrics),
         }
+    }
+}
+
+/// One class entry surfaced in [`Event::DatasetScanned`].
+#[derive(Clone, Debug, Serialize)]
+pub struct ClassCount {
+    pub name: String,
+    pub n_samples: u64,
+}
+
+/// Algorithmic events emitted by `finetune::run` to the durable
+/// log + cross-cutting SSE bridge.  The wrapper crate
+/// (`crate::training`) lifts each variant into a `TrainEvent`
+/// (its superset that adds job-lifecycle events the algorithm
+/// itself doesn't know about: `JobSubmitted`, `JobRunning`,
+/// `HeadPublished`, `JobCompleted`, `JobFailed`, `JobCancelled`).
+///
+/// Distinct from [`Progress`]: `Progress` is the *latest snapshot*
+/// pushed through a `tokio::sync::watch` channel for `GET
+/// /workspace/{id}/training/{job}` polling; `Event` is the
+/// *lossless transcript* persisted to JSONL and broadcast over
+/// SSE.  Both originate at the same emit point so they can never
+/// disagree about what happened.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Event {
+    /// Stage transition; emitted just before each stage's work
+    /// begins.  The wrapper uses this to set the `current_stage`
+    /// tracker that terminal `JobFailed` / `JobCancelled`
+    /// payloads carry.
+    PhaseStarted { phase: Stage },
+    /// Dataset scan completed; carries the per-class breakdown
+    /// and total example count.  Useful as an early signal that
+    /// the operator's upload landed correctly.
+    DatasetScanned {
+        n_classes: u32,
+        classes: Vec<ClassCount>,
+        n_examples_total: u64,
+    },
+    /// Feature extraction completed.  `kept` + `dropped_*` sum
+    /// to the input example count; large `dropped_io` values
+    /// indicate corrupt `.wav` files.
+    FeatureExtractCompleted {
+        kept: u64,
+        dropped_nan: u64,
+        dropped_io: u64,
+        elapsed_ms: u64,
+    },
+    /// Stratified train/val split landed.
+    TrainSplit { train_n: u64, val_n: u64 },
+    /// One epoch completed.  `val_acc` and `best_val_acc` are
+    /// `null` on the wire when `val_split == 0.0` (NaN sentinel
+    /// converted via `serialize_finite_or_null`).
+    EpochCompleted {
+        epoch: u32,
+        epochs: u32,
+        train_loss: f64,
+        train_acc: f32,
+        #[serde(serialize_with = "serialize_finite_or_null")]
+        val_acc: f32,
+        #[serde(serialize_with = "serialize_finite_or_null")]
+        best_val_acc: f32,
+        lr: f32,
+        elapsed_ms: u64,
+    },
+    /// Training loop returned (post-best-snapshot rehydration).
+    TrainCompleted {
+        epochs_run: u32,
+        total_elapsed_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        best_val_epoch: Option<u32>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_finite_or_null_opt"
+        )]
+        best_val_acc: Option<f32>,
+    },
+}
+
+/// Serialise `f32::NAN` / `f32::INFINITY` / `f32::NEG_INFINITY`
+/// as JSON `null`.  serde_json refuses non-finite floats by
+/// default (the produced JSON would not be parseable by spec-
+/// compliant decoders); using `null` keeps the wire shape
+/// compact and lossless for the "no data yet" case.
+fn serialize_finite_or_null<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    if v.is_finite() {
+        s.serialize_f32(*v)
+    } else {
+        s.serialize_none()
+    }
+}
+
+/// Optional variant of [`serialize_finite_or_null`]; serialises
+/// `Some(NaN)` and `None` identically as `null`.
+fn serialize_finite_or_null_opt<S: serde::Serializer>(
+    v: &Option<f32>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(f) if f.is_finite() => s.serialize_f32(*f),
+        _ => s.serialize_none(),
     }
 }
 
@@ -324,19 +457,31 @@ pub const MAX_DROP_RATIO: f32 = 0.10;
 
 /// Run a complete fine-tune job.
 ///
-/// `progress` is called synchronously from the training thread.  During
-/// feature extraction it may be called by rayon workers, so the callback
-/// must be `Sync`.
+/// `progress` is the latest-snapshot channel: called synchronously
+/// from the training thread (and during feature extraction may be
+/// called by rayon workers, so the callback must be `Sync`).
+/// Forwarded into the daemon's `tokio::sync::watch<Progress>` for
+/// `GET /workspace/{id}/training/{job}` polling.
 ///
-/// `cancel` is polled between expensive units of work.  It intentionally
-/// cannot preempt a single wav/resample/spectrogram operation.
+/// `event` is the lossless transcript channel: one call per
+/// algorithmic milestone (`PhaseStarted`, `DatasetScanned`,
+/// `FeatureExtractCompleted`, `TrainSplit`, `EpochCompleted`,
+/// `TrainCompleted`).  Forwarded by the wrapper to the JSONL log
+/// and the cross-cutting SSE broadcast.  Both callbacks fire from
+/// the same emit point so they can never disagree about what
+/// happened.
+///
+/// `cancel` is polled between expensive units of work.  It
+/// intentionally cannot preempt a single wav/resample/spectrogram
+/// operation.
 pub fn run(
     cfg: &FinetuneConfig,
     progress: &(dyn Fn(&Progress) + Sync),
+    event: &(dyn Fn(Event) + Sync),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<FinetuneOutput, FinetuneError> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_inner(cfg, progress, cancel)
+        run_inner(cfg, progress, event, cancel)
     }));
     match result {
         Ok(r) => r,
@@ -347,6 +492,7 @@ pub fn run(
 fn run_inner(
     cfg: &FinetuneConfig,
     progress: &(dyn Fn(&Progress) + Sync),
+    event: &(dyn Fn(Event) + Sync),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<FinetuneOutput, FinetuneError> {
     cfg.validate()?;
@@ -368,8 +514,11 @@ fn run_inner(
     <InnerB as Backend>::seed(&device_inner, cfg.seed);
     <AutoB as Backend>::seed(&device_auto, cfg.seed);
 
+    event(Event::PhaseStarted {
+        phase: Stage::DatasetScan,
+    });
     progress(&Progress::new(
-        Phase::Loading,
+        Stage::DatasetScan,
         0,
         0,
         format!("scan dataset: {}", cfg.data.display()),
@@ -405,8 +554,20 @@ fn run_inner(
                 .collect(),
         });
     }
+    event(Event::DatasetScanned {
+        n_classes: n_classes as u32,
+        classes: classes
+            .iter()
+            .zip(pre_scan_counts.iter())
+            .map(|(name, n)| ClassCount {
+                name: name.clone(),
+                n_samples: *n as u64,
+            })
+            .collect(),
+        n_examples_total: examples.len() as u64,
+    });
     progress(&Progress::new(
-        Phase::Loading,
+        Stage::DatasetScan,
         examples.len(),
         examples.len(),
         format!("classes: {:?}  total examples: {}", classes, examples.len()),
@@ -414,7 +575,7 @@ fn run_inner(
     check_cancel(cancel)?;
 
     progress(&Progress::new(
-        Phase::Loading,
+        Stage::DatasetScan,
         0,
         1,
         format!("load backbone: {}", cfg.backbone.display()),
@@ -422,15 +583,26 @@ fn run_inner(
     let backbone = Backbone::<InnerB>::load_mpk(&cfg.backbone, &device_inner)?;
     check_cancel(cancel)?;
 
+    event(Event::PhaseStarted {
+        phase: Stage::FeatureExtract,
+    });
     progress(&Progress::new(
-        Phase::FeatureExtract,
+        Stage::FeatureExtract,
         0,
         examples.len(),
         "extract features...",
     ));
     let preproc = Preproc::new();
     let total_in = examples.len();
-    let (feats, labels) = extract_features(&backbone, &preproc, &examples, progress, cancel)?;
+    let t_extract = Instant::now();
+    let (feats, labels, drop_counts) =
+        extract_features(&backbone, &preproc, &examples, progress, cancel)?;
+    event(Event::FeatureExtractCompleted {
+        kept: feats.len() as u64,
+        dropped_nan: drop_counts.dropped_nan,
+        dropped_io: drop_counts.dropped_io,
+        elapsed_ms: t_extract.elapsed().as_millis() as u64,
+    });
     if feats.is_empty() {
         return Err(FinetuneError::InvalidConfig(
             "all examples were dropped during feature extraction".into(),
@@ -463,8 +635,15 @@ fn run_inner(
             labels.len(),
         )));
     }
+    event(Event::PhaseStarted {
+        phase: Stage::Train,
+    });
+    event(Event::TrainSplit {
+        train_n: train_idx.len() as u64,
+        val_n: val_idx.len() as u64,
+    });
     progress(&Progress::new(
-        Phase::Train,
+        Stage::Train,
         0,
         cfg.epochs,
         format!(
@@ -508,17 +687,27 @@ fn run_inner(
         lr: cfg.lr,
         seed: cfg.seed,
     };
-    let head_auto = train_head(head_auto, train_data, train_settings, progress, cancel)?;
+    let train_outcome = train_head(head_auto, train_data, train_settings, progress, event, cancel)?;
+    let head_auto = train_outcome.head;
+    event(Event::TrainCompleted {
+        epochs_run: train_outcome.epochs_run as u32,
+        total_elapsed_ms: t_train.elapsed().as_millis() as u64,
+        best_val_epoch: train_outcome.best_val_epoch.map(|e| e as u32),
+        best_val_acc: train_outcome.best_val_acc,
+    });
     progress(&Progress::new(
-        Phase::Train,
+        Stage::Train,
         cfg.epochs,
         cfg.epochs,
         format!("train wall: {:.2?}", t_train.elapsed()),
     ));
     check_cancel(cancel)?;
 
+    event(Event::PhaseStarted {
+        phase: Stage::Save,
+    });
     progress(&Progress::new(
-        Phase::Saving,
+        Stage::Save,
         0,
         2,
         format!("save head: {}", cfg.out.display()),
@@ -580,15 +769,11 @@ fn run_inner(
         classes,
         head_id,
     };
-    progress(&Progress::new(
-        Phase::Done,
-        cfg.epochs,
-        cfg.epochs,
-        format!(
-            "final train_acc={:.4}  val_acc={:.4}",
-            out.final_train_acc, out.final_val_acc
-        ),
-    ));
+    // No `Phase::Done` progress tick: the wrapper emits the
+    // typed `JobCompleted` / `HeadPublished` events on the
+    // wire.  The watch channel's last `Stage::Save` snapshot
+    // remains the "what happened last" pin until the wrapper's
+    // terminal transition replaces the JobView state.
     Ok(out)
 }
 
@@ -1080,13 +1265,29 @@ fn check_feature_buffer_cap(total: usize) -> Result<(), FinetuneError> {
     Ok(())
 }
 
+/// Per-class accounting from the feature-extract pass.  Carried
+/// out alongside `(feats, labels)` so the wrapper can emit
+/// `Event::FeatureExtractCompleted { kept, dropped_nan,
+/// dropped_io, elapsed_ms }` without re-scanning the labels vec.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ExtractDropCounts {
+    pub dropped_nan: u64,
+    pub dropped_io: u64,
+}
+
+/// Return shape of [`extract_features`]: aliased so the type-
+/// complexity lint stays quiet.  The three components are
+/// always returned together (they're computed in lockstep) and
+/// the call site destructures them on the next line.
+type ExtractOutput = (Vec<[f32; FEATURE_DIM]>, Vec<usize>, ExtractDropCounts);
+
 fn extract_features(
     backbone: &Backbone<InnerB>,
     preproc: &Preproc,
     examples: &[(PathBuf, usize)],
     progress_cb: &(dyn Fn(&Progress) + Sync),
     cancel: &(dyn Fn() -> bool + Sync),
-) -> Result<(Vec<[f32; FEATURE_DIM]>, Vec<usize>), FinetuneError> {
+) -> Result<ExtractOutput, FinetuneError> {
     let device: burn::tensor::Device<InnerB> = Default::default();
     let t0 = Instant::now();
     let dropped_nan = AtomicUsize::new(0);
@@ -1228,7 +1429,7 @@ fn extract_features(
         let cur_milestone = processed / DEFAULT_PROGRESS_EVERY;
         if cur_milestone > prev_milestone && processed != total {
             progress_cb(&Progress::new(
-                Phase::FeatureExtract,
+                Stage::FeatureExtract,
                 processed,
                 total,
                 format!(
@@ -1242,19 +1443,26 @@ fn extract_features(
         }
     }
 
+    let dropped_nan_total = dropped_nan.load(Ordering::Relaxed);
+    let dropped_io_total = dropped_io.load(Ordering::Relaxed);
     progress_cb(&Progress::new(
-        Phase::FeatureExtract,
+        Stage::FeatureExtract,
         feats.len(),
         total,
         format!(
-            "feature extraction: {} kept, {} dropped (NaN), {} dropped (IO); total={:.1?}",
+            "feature extraction: {} kept, {dropped_nan_total} dropped (NaN), {dropped_io_total} dropped (IO); total={:.1?}",
             feats.len(),
-            dropped_nan.load(Ordering::Relaxed),
-            dropped_io.load(Ordering::Relaxed),
             t0.elapsed()
         ),
     ));
-    Ok((feats, labels))
+    Ok((
+        feats,
+        labels,
+        ExtractDropCounts {
+            dropped_nan: dropped_nan_total as u64,
+            dropped_io: dropped_io_total as u64,
+        },
+    ))
 }
 
 /// Index of the maximum element in `xs`.  NaN compares as
@@ -1341,13 +1549,36 @@ struct TrainSettings {
     seed: u64,
 }
 
+/// Output of [`train_head`].  Splits `head` (the published
+/// snapshot — best-val-acc epoch if validation was enabled, last
+/// epoch otherwise) from the bookkeeping fields the wrapper needs
+/// for `Event::TrainCompleted`.
+struct TrainOutcome {
+    head: Head<AutoB>,
+    /// Number of epochs the loop actually ran.  Equals
+    /// `settings.epochs` on a clean run; smaller only if cancel
+    /// fired mid-loop, in which case the caller returns the
+    /// `Cancelled` error and this field is never read by the
+    /// emit path -- but it stays accurate for any future
+    /// consumer.
+    epochs_run: usize,
+    /// 1-based epoch index where the best `val_acc` was observed.
+    /// `None` when `val_split == 0.0` (no validation set) or
+    /// when every observed `val_acc` was non-finite.
+    best_val_epoch: Option<usize>,
+    /// Best observed `val_acc`.  `None` for the same reasons as
+    /// `best_val_epoch`.
+    best_val_acc: Option<f32>,
+}
+
 fn train_head(
     mut head: Head<AutoB>,
     data: TrainData<'_>,
     settings: TrainSettings,
     progress: &(dyn Fn(&Progress) + Sync),
+    event: &(dyn Fn(Event) + Sync),
     cancel: &(dyn Fn() -> bool + Sync),
-) -> Result<Head<AutoB>, FinetuneError> {
+) -> Result<TrainOutcome, FinetuneError> {
     let TrainData {
         n_classes,
         feats,
@@ -1369,6 +1600,7 @@ fn train_head(
     // `val_idx` is empty (`val_split == 0.0`); `evaluate` returns NaN
     // for empty splits and the update below ignores non-finite values.
     let mut best_val = f32::NAN;
+    let mut best_val_epoch: Option<usize> = None;
     // Snapshot the head whenever a strictly better val_acc is
     // observed, return that snapshot at end of training (fall back to
     // the last-epoch head only when val_idx is empty and best_val
@@ -1393,8 +1625,10 @@ fn train_head(
     // produced by `shuffle_indices(n, seed)`, since refilling from
     // `train_idx` and applying the same swaps yields the same gather.
     let mut order: Vec<usize> = Vec::with_capacity(train_idx.len());
+    let mut epochs_run = 0usize;
     for epoch in 0..epochs {
         check_cancel(cancel)?;
+        let t_epoch = Instant::now();
         order.clear();
         order.extend_from_slice(train_idx);
         shuffle_in_place(&mut order, seed.wrapping_add(epoch as u64));
@@ -1450,6 +1684,7 @@ fn train_head(
         let val_acc = evaluate(&head.valid(), n_classes, feats, labels, val_idx);
         if val_acc.is_finite() && (best_val.is_nan() || val_acc > best_val) {
             best_val = val_acc;
+            best_val_epoch = Some(epoch + 1);
             // Internal best-epoch snapshot stays in raw Burn
             // recorder format: it never leaves the daemon and
             // round-trips through `Head::load_mpk` below.  The
@@ -1479,11 +1714,28 @@ fn train_head(
             ),
             metrics,
         ));
+        event(Event::EpochCompleted {
+            epoch: (epoch + 1) as u32,
+            epochs: epochs as u32,
+            train_loss: avg_loss,
+            train_acc,
+            val_acc,
+            best_val_acc: best_val,
+            lr,
+            elapsed_ms: t_epoch.elapsed().as_millis() as u64,
+        });
+        epochs_run = epoch + 1;
     }
-    match best_path {
-        Some(p) => Ok(Head::<AutoB>::load_mpk(&p, &device_auto)?),
-        None => Ok(head),
-    }
+    let head_out = match best_path {
+        Some(p) => Head::<AutoB>::load_mpk(&p, &device_auto)?,
+        None => head,
+    };
+    Ok(TrainOutcome {
+        head: head_out,
+        epochs_run,
+        best_val_epoch,
+        best_val_acc: best_val_epoch.map(|_| best_val),
+    })
 }
 
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -1710,8 +1962,9 @@ mod tests {
             lr: 0.5,
             seed: 7,
         };
-        let head_3 =
-            train_head(init_3, data, settings_3, &progress, &cancel).expect("3-epoch train");
+        let head_3 = train_head(init_3, data, settings_3, &progress, &|_| {}, &cancel)
+            .expect("3-epoch train")
+            .head;
 
         let metrics = captured.into_inner();
         assert_eq!(metrics.len(), 3, "one EpochMetrics per epoch");
@@ -1746,8 +1999,9 @@ mod tests {
             lr: 0.5,
             seed: 7,
         };
-        let head_ref =
-            train_head(init_ref, data_ref, settings_ref, &|_| {}, &cancel).expect("ref train");
+        let head_ref = train_head(init_ref, data_ref, settings_ref, &|_| {}, &|_| {}, &cancel)
+            .expect("ref train")
+            .head;
 
         let w3 = weights_of(&head_3);
         let wref = weights_of(&head_ref);
@@ -1794,9 +2048,11 @@ mod tests {
                 seed: 7,
             },
             &progress,
+            &|_| {},
             &cancel,
         )
-        .expect("2-epoch train (no val)");
+        .expect("2-epoch train (no val)")
+        .head;
 
         let data1 = TrainData {
             n_classes,
@@ -1815,9 +2071,11 @@ mod tests {
                 seed: 7,
             },
             &progress,
+            &|_| {},
             &cancel,
         )
-        .expect("1-epoch train (no val)");
+        .expect("1-epoch train (no val)")
+        .head;
 
         let w2 = weights_of(&head_2);
         let w1 = weights_of(&head_1);
@@ -1862,7 +2120,7 @@ mod tests {
             val_split: 0.2,
             seed: 1,
         };
-        let err = run(&cfg, &|_| {}, &|| false).expect_err("empty class must reject");
+        let err = run(&cfg, &|_| {}, &|_| {}, &|| false).expect_err("empty class must reject");
         match err {
             FinetuneError::BadDataset { path, reason } => {
                 assert!(

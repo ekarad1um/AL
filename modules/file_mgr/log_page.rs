@@ -14,21 +14,26 @@
 //!
 //! - **Forward-only.**  We scan the file from the start; the
 //!   typical caller asks for `?after_seq=N` where `N` is close
-//!   to the latest written seq, but the JSONL is small enough
-//!   (capped by `max_log_line_bytes` per line and rotated on
-//!   delete) that a re-scan is fine.  No mtime or seek index.
+//!   to the latest written seq.  Per-job JSONL files stay small
+//!   in practice (~10-15 events per training run) so re-scan is
+//!   cheap; no mtime or seek index.  Producers do not enforce
+//!   a per-line byte cap -- structured fields like
+//!   `dataset_scanned.classes` can be large, and the JSONL is
+//!   the authoritative copy.  The cross-cutting SSE bridge has
+//!   its own `max_log_line_bytes` cap on `JobEvent.message`,
+//!   which clients can backfill from the JSONL when the cap is
+//!   hit.
 //! - **Malformed lines silently skipped.**  The registry's
 //!   broadcast channel is the authoritative event source; the
 //!   JSONL is a backstop.  A truncated mid-write line should not
 //!   500 the page.  The skipped lines do **not** advance the
-//!   cursor — the caller's next `?after_seq=` is the highest
+//!   cursor -- the caller's next `?after_seq=` is the highest
 //!   `seq` actually returned.
 //! - **Missing file is empty page.**  A page on a file that has
 //!   not been created yet (the producer hasn't emitted an event)
 //!   returns `events: []` with `next_after_seq` echoing the
-//!   caller's input — no 404 surface for "no events yet".
+//!   caller's input -- no 404 surface for "no events yet".
 
-use crate::file_mgr::JobProgress;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
@@ -43,25 +48,27 @@ pub const DEFAULT_LOG_PAGE_LIMIT: usize = 200;
 pub const MAX_LOG_PAGE_LIMIT: usize = 1000;
 
 /// One line of a JSONL backstop, deserialised forgivingly.  The
-/// shape mirrors [`crate::file_mgr::JobEvent`] but drops the
-/// `state: Option<JobState>` typing in favour of `Option<String>`:
-/// producers (`ConvertJobLog`, `TrainJobLog`) emit free-form
-/// lifecycle phases (`"started"`, `"read_model_json"`,
-/// `"completed"`, `"failed"`, ...) that are richer than the
-/// registry's terminal-state enum and would otherwise drop on
-/// the strict deserialize.  `progress` and `message` are typed
-/// the same way as `JobEvent` so the wire surfaces are
-/// byte-compatible for non-state fields.
+/// shape extracts only the two cursor-relevant fields (`seq` for
+/// pagination, `at` for sorting) and carries every other field
+/// in `payload` via `#[serde(flatten)]`.  Producers
+/// (`ConvertJobLog`, `TrainJobLog`) own their per-line schema:
+/// the converter writes `{state, progress, message}` triples;
+/// the training producer writes `{schema_version, kind, ...}`
+/// typed events under a discriminator.  Either shape
+/// round-trips through this type because unknown fields land in
+/// `payload` rather than failing the parse.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogEvent {
     pub seq: u64,
     pub at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub progress: Option<JobProgress>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    /// Per-producer payload fields.  For the converter today
+    /// this is `{state, progress?, message?}`; for the training
+    /// producer it is `{schema_version, kind, ...event-specific
+    /// fields}`.  Consumers downcast based on producer (which
+    /// JSONL tree the file lives under) or the `kind`
+    /// discriminator within `payload`.
+    #[serde(flatten)]
+    pub payload: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Page response shape echoed to the wire by the route layer.

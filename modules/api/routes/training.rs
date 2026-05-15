@@ -11,7 +11,8 @@
 use std::sync::Arc;
 
 use crate::common::ids::{HeadId, JobId, WorkspaceId};
-use crate::file_mgr::{FsService, TrainingCfg, validate_training_cfg};
+use crate::common::workspace::{JobReference, JobType};
+use crate::file_mgr::{FsService, JobRegistry, TrainingCfg, validate_training_cfg};
 use crate::training::{TrainingJob, TrainingRegistry};
 use axum::Router;
 use axum::extract::{Path, State};
@@ -104,11 +105,32 @@ async fn start_training(
         backbone_path,
     };
 
+    // Cross-cutting admission gate: `try_acquire(JobType::Train)`
+    // takes the global `max_train_jobs = 1` slot and stamps a
+    // workspace-scoped reference for `WorkspaceDelete`
+    // exclusion.  A second concurrent train returns
+    // `RegistryConflict::AnotherTrainRunning`, which the api
+    // layer renders as 409 with the dedicated
+    // `another_train_running` discriminator code (mirrors the
+    // converter's `try_acquire(JobType::Convert)` shape).  The
+    // [`JobHandle`] flows into `spawn` and is consumed at
+    // terminal -- on succeed/fail/cancel the slot is released.
+    let jobs: Arc<JobRegistry> = state.jobs.clone();
+    let job_handle = jobs
+        .try_acquire(
+            JobType::Train,
+            vec![JobReference::Workspace { workspace_id }],
+            None,
+        )
+        .map_err(|c| ApiError::File(crate::file_mgr::FileError::from(c)))?;
+    let job_id = job_handle.job_id();
+
     let training_for_spawn = training.clone();
     let files_for_spawn = files.clone();
-    let job_id =
-        tokio::task::spawn_blocking(move || training_for_spawn.spawn(files_for_spawn, job))
-            .await??;
+    tokio::task::spawn_blocking(move || {
+        training_for_spawn.spawn(files_for_spawn, job, Some(job_handle))
+    })
+    .await??;
     Ok(Json(TrainStartResp {
         head_id: head_id.to_string(),
         job_id: job_id.to_string(),
