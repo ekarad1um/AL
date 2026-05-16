@@ -13,6 +13,7 @@ import { ApiError, isApiError } from '$lib/api/http';
 // ARCHITECTURE.md's "constructive and conversational" error rule.
 const FIXED_COPY: Readonly<Record<string, string>> = {
   another_train_running: 'Another training job is already running on this daemon.',
+  another_convert_running: 'Another conversion job is already running on this daemon.',
   job_conflict: 'Another operation is already in progress on this resource.',
   event_gap: 'The event stream skipped ahead and needs to catch up from logs. Reconnecting…',
   too_early: 'The daemon is still applying your previous change. Retrying…',
@@ -30,7 +31,13 @@ const PASSTHROUGH_CODES: ReadonlySet<string> = new Set([
   'bad_request',
   'not_found',
   'conflict',
-  'method_not_allowed'
+  'method_not_allowed',
+  // `bad_dataset` is the daemon's typed rejection for dataset-shape
+  // problems (empty class folders, duplicate labels, ...).  Its
+  // `error` text is already operator-friendly (it names the
+  // offending path + the reason), so we pass it through with the
+  // capitalisation / trailing-period polish but no fixed copy.
+  'bad_dataset'
 ]);
 
 export function errorCopy(err: unknown): string {

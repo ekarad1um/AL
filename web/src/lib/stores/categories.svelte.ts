@@ -199,7 +199,12 @@ class CategoriesStore {
       // dataset tree is dirs all the way (no top-level files), but
       // filter defensively so a future stray file (e.g. an
       // operator-mode .DS_Store) doesn't render as a category.
-      const serverNames = serverListing.entries.filter((e) => e.kind === 'dir').map((e) => e.name);
+      // The wire token is `"directory"` per the daemon's
+      // `EntryKind` serde rename -- see [api/types.ts] for the
+      // history of the earlier `"dir"` mistake.
+      const serverNames = serverListing.entries
+        .filter((e) => e.kind === 'directory')
+        .map((e) => e.name);
 
       this.slices.set(workspaceId, {
         ...EMPTY_SLICE,

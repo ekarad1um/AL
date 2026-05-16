@@ -81,7 +81,7 @@
 
         <dt class="text-zinc-500">revision</dt>
         <dd class="truncate font-mono text-[10px] text-zinc-800">
-          {config.active.source_workspace_revision.id}
+          {config.active.workspace_revision.id}
         </dd>
       </dl>
     {/if}

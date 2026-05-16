@@ -7,6 +7,7 @@ import { deleteDraftsForWorkspace } from '$lib/idb/drafts';
 import { deleteSlicesForWorkspace } from '$lib/idb/slices';
 import { drafts as draftsStore } from '$lib/stores/drafts.svelte';
 import { slices as slicesStore } from '$lib/stores/slices.svelte';
+import { training as trainingStore } from '$lib/stores/training.svelte';
 import { capFirst, errorCopy } from '$lib/utils/error-copy';
 import type {
   WorkspaceCreateReq,
@@ -196,6 +197,14 @@ class WorkspacesStore {
         this.selected.delete(id);
         draftsStore.forget(id);
         slicesStore.forget(id);
+        // Training store: drop any tracked job for this workspace.
+        // `WorkspaceDelete` releases the daemon's workspace
+        // reference, which the training producer's spawned
+        // task observes at the next cancel-flag check + exits.
+        // The local poller has already been stopped by the
+        // `forget` call here; there's no daemon-side
+        // mutation to make.
+        trainingStore.forget(id);
         await Promise.all([
           deleteCategoriesForWorkspace(id).catch(() => 0),
           deleteDraftsForWorkspace(id).catch(() => 0),

@@ -1,3 +1,4 @@
+import { UploadPool } from '$lib/api/upload';
 import { fftRadix2, hannWindow } from './fft';
 import { buildPlasmaLut, magnitudeToPaletteIndex } from './palette';
 import { decodeCanonicalWavSync } from './wav-decode';
@@ -39,6 +40,29 @@ const FREQ_BINS = FFT_SIZE / 2 + 1; // 257 -- DC through Nyquist inclusive.
 // upscaling.  Matches the grid template in `SlicePane.svelte`.
 const CARD_WIDTH = 96;
 const CARD_HEIGHT = 64;
+
+// Bounded-concurrency cap on simultaneous spectrogram renders.
+// Each render runs three synchronous main-thread blocks --
+// WAV decode (44 100 sample Int16 → Float32 loop), 171-frame
+// radix-2 FFT, and a 6144-pixel palette walk -- adding up to
+// ~10-25 ms per slice on a modern laptop.  Without a cap, a
+// cold expand of an N-slice category fires N renders in
+// parallel; their synchronous blocks then run back-to-back in
+// the microtask queue and starve RAF for ~N × 15 ms, visibly
+// dropping frames on the dashboard's live waveform + Top-K
+// surfaces (which share the same main thread).  Capping at 3
+// keeps the worst-case main-thread block per macrotask to
+// ~3 × 15 ms ≈ 45 ms, which lets a 60 Hz RAF tick land
+// between batches.
+//
+// 3 matches `MAX_CONCURRENT_INDEX_FETCHES` in
+// [stores/slices.svelte.ts] and the upload pool's cap -- same
+// reasoning (one operator per device + we want the work spread
+// over time, not bunched).  The slice-bytes fetch pool runs at
+// 6 because its work is network-bound + browser-parallelised;
+// this CPU-bound pool stays tighter on purpose.
+const MAX_CONCURRENT_SPECTROGRAMS = 3;
+const generatePool = new UploadPool(MAX_CONCURRENT_SPECTROGRAMS);
 
 // Precomputed Hann window.  Lives at module scope so the cost is
 // paid exactly once per tab, not once per spectrogram.  dB range
@@ -93,7 +117,18 @@ export async function getSliceSpectrogramUrl(slice: SliceRecord): Promise<string
   const work = (async (): Promise<string> => {
     let url: string | null = null;
     try {
-      url = await generate(slice);
+      // Route the actual render through `generatePool` so a cold
+      // expand of an N-slice category fires at most
+      // `MAX_CONCURRENT_SPECTROGRAMS` synchronous WAV-decode +
+      // FFT + pixel-render bursts before yielding.  The pool's
+      // `submit` resolves with the task's value, so the
+      // cache-write + token-check semantics below stay
+      // unchanged.  Cache hits earlier in `getSliceSpectrogramUrl`
+      // (`urlCache.get(...)` / `inflight.get(...)`) still
+      // short-circuit before reaching the pool, so a cold
+      // expand of a previously-visited category re-resolves
+      // every URL instantly without burning pool slots.
+      url = await generatePool.submit(() => generate(slice));
       if (inflightTokens.get(slice.id) === token) {
         urlCache.set(slice.id, url);
       } else {

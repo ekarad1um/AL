@@ -1,5 +1,6 @@
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import {
+  bulkPutSlices,
   deleteSlice as idbDeleteSlice,
   deleteSlicesForCategory,
   listSlicesForCategory,
@@ -94,6 +95,53 @@ const UPLOAD_RETRY_ATTEMPTS = 4;
 const UPLOAD_RETRY_BASE_MS = 500;
 const UPLOAD_RETRY_MAX_MS = 8000;
 
+// Concurrency cap for the proactive per-category index reconcile
+// fired after the bulk IDB load and on poller-driven revision
+// advance.  Same value as `MAX_CONCURRENT_UPLOADS`: per-category
+// `listCategory` GETs are cheap (no fsync, no body) and the
+// daemon's directory-listing path is single-threaded, so going
+// past 3 doesn't meaningfully shorten wall-clock for typical
+// workspaces (≤ 10 categories) -- it just risks bunching SD-card
+// reads on the device's eMMC.  Worst-case wall-clock at 3 workers
+// over 10 categories is ~150 ms (50 ms / GET on localhost),
+// invisible to the operator's first-paint.
+const MAX_CONCURRENT_INDEX_FETCHES = 3;
+
+// Concurrency-limited fan-out.  Used by
+// `reconcileIndexesForWorkspace` to spread per-category daemon
+// listings across a few workers without serialising (slow when
+// per-call latency is in the 30-100 ms range and a workspace has
+// many categories) or blasting (rude to the daemon's single-
+// threaded listing path and a waste of origin connection
+// budget).  Best-effort: a per-task throw is caught here so
+// sibling tasks finish regardless; the underlying `refresh()`
+// already routes the failure onto the list's `error` field so
+// the UI can surface it.
+async function withConcurrency<T>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<void>
+): Promise<void> {
+  if (items.length === 0) return;
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const idx = cursor;
+      cursor += 1;
+      if (idx >= items.length) return;
+      try {
+        await fn(items[idx]);
+      } catch {
+        // Per-task failure already surfaces on the list's `error`
+        // via `refresh()`'s catch block.  Swallowed here so a
+        // single bad category doesn't strand the sibling workers
+        // mid-batch.
+      }
+    }
+  });
+  await Promise.all(workers);
+}
+
 class SlicesStore {
   private lists = new SvelteMap<string, SliceList>();
   // Workspaces for which `refreshForWorkspace` has already walked
@@ -145,6 +193,16 @@ class SlicesStore {
   // to re-fire on every `markUploading` patch the upload pipeline
   // makes against the same key.
   private staleKeys = new SvelteSet<string>();
+  // Workspaces with a `reconcileIndexesForWorkspace` task in
+  // flight.  In-flight guard: a second trigger (a poller-driven
+  // stale advance landing while the first reconcile is still
+  // draining) is a no-op.  Without this, two visible-tab edits
+  // to the same workspace would have the second tab's poller
+  // fire a new reconcile every 2 s even while the previous one
+  // was still in flight, amplifying GET traffic without benefit.
+  // Bare `Set` because no reactive consumer reads this state
+  // (it's purely an internal coordination flag).
+  private reconcilingWorkspaces = new Set<Uuid>();
 
   for(workspaceId: Uuid, categoryName: string): SliceList {
     return this.lists.get(key(workspaceId, categoryName)) ?? EMPTY_LIST;
@@ -242,16 +300,32 @@ class SlicesStore {
   }
 
   // Mark every currently-loaded category in `workspaceId` as
-  // stale.  Categories not yet in `lists` are skipped because
+  // stale AND kick off a proactive per-category reconcile against
+  // the daemon.  Categories not yet in `lists` are skipped because
   // their first `refresh` (on operator expand) always fetches
-  // fresh anyway -- there is no cache to invalidate.  Bulk badge
-  // counts on collapsed rows are intentionally NOT invalidated
-  // here: per the sync design, an unopened category is treated
-  // as "assumed synced" until the operator engages with it.
+  // fresh anyway -- there is no cache to invalidate.
+  //
+  // The proactive reconcile is what makes the collapsed-row badge
+  // counts converge after another tab / external CLI advances the
+  // workspace revision.  Without it, the SlicePane `$effect`'s
+  // tracked `isStale` read would only re-refresh the currently-
+  // expanded category, and every other category's badge would
+  // stay at the previous count until the operator manually
+  // expanded it.  The in-flight guard inside
+  // `reconcileIndexesForWorkspace` means a burst of poll ticks
+  // (e.g. a sibling tab streaming uploads) amplifies into at most
+  // one in-flight reconcile per workspace.
   markStaleForWorkspace(workspaceId: Uuid): void {
     const prefix = `${workspaceId} `;
+    const names: string[] = [];
     for (const k of this.lists.keys()) {
-      if (k.startsWith(prefix)) this.staleKeys.add(k);
+      if (k.startsWith(prefix)) {
+        this.staleKeys.add(k);
+        names.push(k.slice(prefix.length));
+      }
+    }
+    if (names.length > 0) {
+      void this.reconcileIndexesForWorkspace(workspaceId, names);
     }
   }
 
@@ -344,6 +418,62 @@ class SlicesStore {
       // independently).
       console.warn('[slices] bulk refresh failed', e);
     }
+    // Proactively reconcile every category's index against the
+    // daemon, capped at `MAX_CONCURRENT_INDEX_FETCHES` workers.
+    // The bulk IDB load above surfaces badge counts from local
+    // state (zero on cache-cleared / first-visit sessions);
+    // without this follow-up the operator would have to expand
+    // every category to see its actual slice count.  Fire-and-
+    // forget: callers are reactive `$effect`s that don't await,
+    // and the per-category lists transition to daemon-truth
+    // incrementally as each `refresh()` resolves.  Slice BLOBS
+    // remain lazy (operator-on-expand) -- only the per-category
+    // index reconciles here, so workspaces with thousands of
+    // slices don't pull megabytes of WAV bytes at first mount.
+    //
+    // Runs even if the bulk IDB load above threw: the per-
+    // category `refresh()` does its own IDB read + daemon GET
+    // and is resilient to a missing in-memory partition.
+    void this.reconcileIndexesForWorkspace(workspaceId, categoryNames);
+  }
+
+  // Concurrency-capped per-category index sync against the
+  // daemon listing.  Each per-category call routes through the
+  // same `refresh()` path that an operator-driven expand would
+  // hit, so the reconciliation rules (daemon-as-master for
+  // committed state, orphan GC, synthesised server-only rows)
+  // apply uniformly regardless of trigger.
+  //
+  // Triggered from two places:
+  //   1. After the bulk IDB load in `refreshForWorkspace` -- so
+  //      first-mount + cache-cleared sessions see daemon-truth
+  //      badge counts without operator-driven expansion.
+  //   2. From `markStaleForWorkspace` on poller-detected
+  //      revision advance -- so collapsed categories' badge
+  //      counts converge after another tab / external CLI
+  //      writes to the workspace.
+  //
+  // Re-entrant-safe: a second call while a previous reconcile
+  // is in flight is a no-op.  The poller fires `markStale*`
+  // every 2 s when visible, so without the in-flight gate a
+  // sparse-revision-advance burst (e.g. another tab streaming
+  // uploads) would pile up redundant reconciles.  The flag
+  // bounds amplification to "one reconcile in flight per
+  // workspace, period."
+  async reconcileIndexesForWorkspace(
+    workspaceId: Uuid,
+    categoryNames: readonly string[]
+  ): Promise<void> {
+    if (this.reconcilingWorkspaces.has(workspaceId)) return;
+    if (categoryNames.length === 0) return;
+    this.reconcilingWorkspaces.add(workspaceId);
+    try {
+      await withConcurrency(categoryNames, MAX_CONCURRENT_INDEX_FETCHES, (name) =>
+        this.refresh(workspaceId, name)
+      );
+    } finally {
+      this.reconcilingWorkspaces.delete(workspaceId);
+    }
   }
 
   // Per-category sync.  Reads local IDB + the daemon's category
@@ -398,6 +528,20 @@ class SlicesStore {
         })
       ]);
 
+      // Forget-race guard (early).  The Promise.all above is the
+      // longest await in this method (network listing + IDB
+      // round-trip) and therefore the widest window for a
+      // workspace-delete-driven `forget(workspaceId)` to land.
+      // Bailing here skips the synthesised-rows `bulkPutSlices`
+      // write below, which would otherwise commit IDB rows for a
+      // workspace whose IDB is concurrently being wiped by
+      // `deleteSlicesForWorkspace` -- leaving orphan rows that
+      // linger across the workspace's lifetime.  A second,
+      // matching guard lives just before the final `lists.set`
+      // below to catch a forget that lands during the IDB-write
+      // phase.
+      if (!this.lists.has(k)) return;
+
       // `SvelteSet` / `SvelteMap` even though these are purely
       // function-local: the file's `.svelte.ts` extension makes
       // the `svelte/prefer-svelte-reactivity` lint rule eager
@@ -429,7 +573,16 @@ class SlicesStore {
 
       // Synthesise rows for daemon-only files.  Deterministic id
       // (`srv:<ws>:<cat>:<filename>`) keeps the row stable across
-      // re-syncs so `putSlice` idempotently overwrites.
+      // re-syncs so the IDB write idempotently overwrites.
+      //
+      // Batch every synthesised record into ONE IDB transaction
+      // via `bulkPutSlices` instead of opening N independent
+      // transactions in sequence -- on a cache-cleared session
+      // with a 200-slice category that's a 200-tx-per-category
+      // hit (~600-1000 ms) collapsing to one 30-50 ms tx.  The
+      // batch is gathered synchronously here so the orphan-GC
+      // step below can still run in parallel with it.
+      const synthesised: SliceRecord[] = [];
       for (const entry of serverListing.entries) {
         if (entry.kind !== 'file' || !entry.name.endsWith('.wav')) continue;
         if (keptByFilename.has(entry.name)) continue;
@@ -442,8 +595,14 @@ class SlicesStore {
           state: 'committed',
           created_at: entry.mtime
         };
-        await putSlice(synthetic).catch(() => undefined);
+        synthesised.push(synthetic);
         kept.push(synthetic);
+      }
+      if (synthesised.length > 0) {
+        // Best-effort: a failed transaction (typically IDB quota)
+        // leaves the in-memory list authoritative until the next
+        // refresh.  Matches the old per-record `.catch` swallow.
+        await bulkPutSlices(synthesised).catch(() => undefined);
       }
 
       // GC orphans.  IDB deletes parallelise (disjoint keys);
@@ -458,6 +617,14 @@ class SlicesStore {
       }
 
       kept.sort(byCreatedAsc);
+      // Forget-race guard: `forget(workspaceId)` may have cleared
+      // this entry while we were awaiting the listing / IDB / orphan
+      // deletes above.  If so, leave the Map empty rather than
+      // recreating an entry for a workspace that no longer exists --
+      // a leaked entry outlives the workspace deletion and would
+      // shadow a same-id re-create (rare via local seed data, per
+      // the matching guard for `mutationsInFlight` in `forget`).
+      if (!this.lists.has(k)) return;
       this.lists.set(k, {
         entries: kept,
         loading: false,
@@ -472,6 +639,9 @@ class SlicesStore {
       // settles the dependency graph.
       this.staleKeys.delete(k);
     } catch (e) {
+      // Same guard as the success path -- a forget mid-await
+      // shouldn't be papered over with a stale error entry.
+      if (!this.lists.has(k)) return;
       this.lists.set(k, {
         entries: existing?.entries ?? [],
         loading: false,
@@ -895,6 +1065,14 @@ class SlicesStore {
     // but not impossible via local seed data) would inherit a
     // stale gate that pauses its poller indefinitely.
     this.mutationsInFlight.delete(workspaceId);
+    // Mirror cleanup for the reconcile in-flight flag.  A
+    // workspace-delete observed mid-reconcile would otherwise
+    // leave the flag set indefinitely (the reconcile's per-
+    // category `refresh()` short-circuits as soon as `forget`
+    // clears the lists, so the flag's `finally` does fire
+    // eventually -- but the explicit clear here removes any
+    // observability hazard for a same-id re-create).
+    this.reconcilingWorkspaces.delete(workspaceId);
   }
 }
 

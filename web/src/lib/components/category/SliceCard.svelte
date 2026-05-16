@@ -1,7 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import { getSliceSpectrogramUrl } from '$lib/audio/spectrogram';
-  import Spinner from '$lib/components/Spinner.svelte';
   import type { SliceRecord } from '$lib/idb/db';
 
   // One slice rendered as a rectangular card with its spectrogram
@@ -290,12 +289,30 @@
            want (the URL is in-tab data, not network). -->
       <img src={url} alt="" width="96" height="64" decoding="async" class="block h-full w-full" />
     {:else if pending}
-      <div class="flex h-full w-full items-center justify-center bg-zinc-100">
-        <Spinner class="h-3 w-3 text-zinc-400" />
-      </div>
+      <!-- STATIC placeholder during spectrogram generation -- no
+           animation.  An earlier draft rendered an `animate-spin`
+           Spinner here, but a cold expand of a 200-slice category
+           lit 200 spinning SVGs simultaneously: 200 transform
+           recalcs and 200 compositor layers per frame, on top of
+           the live dashboard's RAF loop, producing visible jank.
+           Same trade-off the author already made for the *delete*
+           state (see the block comment further down: "NO per-card
+           overlay or animation").  The card just renders an empty
+           zinc fill until the spectrogram URL resolves; the image
+           then pops into place via the `<img>` branch.  The
+           transition is short (cache hits resolve in a microtask;
+           fresh renders in ~10-50 ms) so the missing affordance
+           costs the operator nothing -- they don't have time to
+           ask "is this still loading?" before the image lands. -->
+      <div class="h-full w-full bg-zinc-100" aria-hidden="true"></div>
     {:else}
       <!-- Neutral fallback for failed spectrogram render.  Looks
-           visually muted but the card is still functional. -->
+           visually muted but the card is still functional.  The
+           bg-zinc-200 + wave icon distinguishes this from the
+           pending state's plain bg-zinc-100, so an operator who
+           glances at a grid of mixed pending / failed cards can
+           tell which ones gave up vs which ones are still in
+           flight. -->
       <div class="flex h-full w-full items-center justify-center bg-zinc-200">
         <svg
           viewBox="0 0 24 24"

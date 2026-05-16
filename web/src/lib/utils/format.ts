@@ -17,6 +17,22 @@ export function formatDuration(ms: number): string {
   return `${min}:${pad2(sec)}`;
 }
 
+// Unit-suffixed duration ("5s", "1m 23s", "2h 5m") for inline
+// metadata strips where a bare `mm:ss` clock reads ambiguous
+// next to non-duration tokens.  Sub-second runs round up to
+// "<1s" so they remain visibly nonzero in a stacked list.
+export function formatDurationHuman(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '<1s';
+  const totalSec = Math.round(ms / 1000);
+  if (totalSec === 0) return '<1s';
+  if (totalSec < 60) return `${totalSec}s`;
+  const hr = Math.floor(totalSec / 3600);
+  const min = Math.floor((totalSec % 3600) / 60);
+  const sec = totalSec % 60;
+  if (hr > 0) return min === 0 ? `${hr}h` : `${hr}h ${min}m`;
+  return sec === 0 ? `${min}m` : `${min}m ${sec}s`;
+}
+
 // Binary IEC units (KiB / MiB / GiB).  We use binary because IDB
 // storage is reported in binary by the browser and the operator
 // reasoning is "does this fit in my origin quota" -- decimal

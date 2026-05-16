@@ -20,6 +20,13 @@
   import CategoryList from '$lib/components/category/CategoryList.svelte';
   import { slices } from '$lib/stores/slices.svelte';
   import { WorkspacePoller } from '$lib/stores/workspace-poller';
+  // Training surface (Slice C): submit + live progress + heads
+  // management.  Lives below the dataset accordion so the
+  // operator's eye flows top-to-bottom through the typical
+  // workflow: record clips → trim + slice → train → activate.
+  import TrainPane from '$lib/components/training/TrainPane.svelte';
+  import HeadsList from '$lib/components/training/HeadsList.svelte';
+  import { training as trainingStore } from '$lib/stores/training.svelte';
 
   // Local state.  No dedicated store yet -- B.1 has a single
   // consumer for detail data, and the rename/delete mutations flow
@@ -56,6 +63,23 @@
     try {
       detail = await wsApi.get(id);
       lastId = id;
+      // Training store carries workspace-scoped terminal slots
+      // and may have stale state from a prior visit (e.g. the
+      // operator navigated away after a failed run, then
+      // returned).  Recovery picks up any actively-running job
+      // for this workspace; the terminal slot stays as-is so
+      // the operator sees their last verdict.  `recover` is
+      // a no-op if the active slot is already bound.
+      void trainingStore.recover(id);
+      // Persistent history hydration: list the workspace's
+      // `training_logs/` directory and replay the top
+      // `INITIAL_VISIBLE` (=2) JSONL files into history
+      // cards.  Idempotent across mount cycles; subsequent
+      // calls for the same workspace short-circuit without a
+      // network round-trip.  Fires concurrently with
+      // `recover()`; the store's active-slot guard prevents
+      // double-tracking a still-running job.
+      void trainingStore.hydrateHistory(id);
       // Begin polling for this workspace.  Detail re-binds on
       // every successful tick; `liveRevision` derives from it +
       // the slices store, so the chip updates automatically.
@@ -134,6 +158,49 @@
       sliceLatestRevision !== null &&
       sliceLatestRevision > detail.workspace_revision.id
   );
+
+  // Re-pull `detail` without restarting the poller.  Used by
+  // Heads list actions (activate / delete) and by the
+  // training store's terminal hook so the `heads[]` array
+  // picks up the freshly-published head (or the deleted one
+  // dropping off).  Errors are swallowed: a transient blip
+  // recovers on the next poller tick.
+  async function refreshDetail(): Promise<void> {
+    const id = lastId;
+    if (!id) return;
+    try {
+      const fresh = await wsApi.get(id);
+      if (lastId === id) detail = fresh;
+    } catch (e) {
+      console.warn('[workspace] post-mutation refresh failed', e);
+    }
+  }
+
+  // Training-terminal hook.  The store bumps `terminalSeq` on
+  // every terminal landing across all workspaces; we filter to
+  // this workspace's terminal slot (if any) and refresh only
+  // when the slot is a `completed` for this workspace -- a
+  // `failed` / `cancelled` doesn't change `heads[]` so a
+  // refresh is wasted work.  The poller's 2 s tick would catch
+  // up regardless; this is the faster path for the operator's
+  // attention.
+  //
+  // `lastTerminalSeqSeen` is intentionally a plain `let`, not
+  // `$state`: the effect both reads and writes it, and reactive
+  // self-dependency would schedule an extra fire (which would
+  // then return early via the equality guard) on every real
+  // change.  No consumer outside this effect needs to track
+  // its value, so non-reactive storage matches the actual
+  // semantics.
+  let lastTerminalSeqSeen = 0;
+  $effect(() => {
+    const seq = trainingStore.terminalSeq;
+    if (seq === lastTerminalSeqSeen) return;
+    lastTerminalSeqSeen = seq;
+    if (!detail) return;
+    const t = trainingStore.terminalFor(detail.id);
+    if (t?.view?.state === 'completed') void refreshDetail();
+  });
 
   let editingName = $state(false);
   let deleteOpen = $state(false);
@@ -323,49 +390,24 @@
       <CategoryList workspaceId={detail.id} workspaceName={detail.name} />
     </div>
 
-    <!-- Heads section.  B.1 ships the read-only listing; Slice C
-         layers Train / Activate / Delete affordances on top.  Empty
-         state intentionally telegraphs the upcoming work. -->
-    <section class="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm">
-      <header class="mb-3 flex items-baseline justify-between">
-        <h2 class="text-sm font-semibold text-zinc-900">Heads</h2>
-        <span class="text-[11px] text-zinc-500">
-          {detail.heads.length}
-          {detail.heads.length === 1 ? 'head' : 'heads'}
-        </span>
-      </header>
+    <!-- Training surface: submit + live progress + smart
+         suggestion when a current head exists.  Lives above
+         the heads list so the operator's typical action (start
+         a run) is closer to the dataset they just edited. -->
+    <div class="mb-6">
+      <TrainPane workspaceId={detail.id} workspaceRevision={liveRevision} heads={detail.heads} />
+    </div>
 
-      {#if detail.heads.length === 0}
-        <p class="text-xs text-zinc-500">
-          No heads trained yet. Recording + training will arrive with the next sub-slices.
-        </p>
-      {:else}
-        <ul class="divide-y divide-zinc-100">
-          {#each detail.heads as head (head.head_id)}
-            <li class="flex flex-wrap items-baseline justify-between gap-2 py-2.5">
-              <div class="min-w-0">
-                <p class="truncate font-mono text-[10px] text-zinc-700" title={head.head_id}>
-                  {head.head_id.slice(0, 8)}…
-                </p>
-                <p class="mt-0.5 text-[11px] text-zinc-500">
-                  {head.n_classes} classes ·
-                  {(head.size_bytes / 1024).toFixed(1)} KiB · rev {head.workspace_revision.id}
-                </p>
-              </div>
-              <span
-                class="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium capitalize transition-colors"
-                class:bg-emerald-100={head.status === 'current'}
-                class:text-emerald-800={head.status === 'current'}
-                class:bg-amber-100={head.status === 'stale'}
-                class:text-amber-800={head.status === 'stale'}
-              >
-                {head.status}
-              </span>
-            </li>
-          {/each}
-        </ul>
-      {/if}
-    </section>
+    <!-- Heads section: per-head card with Activate + Delete
+         actions.  `liveRevision` is the upload-receipt-promoted
+         revision so a head trained at the previous rev flips
+         to "stale" without waiting for the page poller. -->
+    <HeadsList
+      workspaceId={detail.id}
+      heads={detail.heads}
+      {liveRevision}
+      onchanged={refreshDetail}
+    />
   </div>
 
   <DeleteWorkspaceDialog

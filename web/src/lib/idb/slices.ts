@@ -41,6 +41,40 @@ export async function putSlice(record: SliceRecord): Promise<void> {
   await db.put(STORE_SLICES, record);
 }
 
+// Bulk-put N slice records in a single transaction.  Used by
+// `slices.refresh()` to persist the synthesised server-only rows
+// produced by daemon category sync.  On cache-cleared / first-
+// visit sessions a category with N committed slices on the
+// daemon produces N synthetic rows -- the prior sequential
+// `for ... await putSlice(synthetic)` loop opened N transactions
+// (each ~3-5 ms on a typical IDB backend), so a 200-slice
+// category cost ~600-1000 ms of IDB time during reconcile.  One
+// transaction over N puts collapses that to a single round-trip
+// + N writes inside the same tx, ~30-50 ms even at the worst-
+// case cap.  Failures (e.g. quota exhaustion) reject the whole
+// transaction -- the caller's catch swallows it, which is the
+// same observable behaviour as the old per-record `.catch(()
+// => undefined)` (a failed put left the in-memory list
+// authoritative until the next refresh).
+export async function bulkPutSlices(records: readonly SliceRecord[]): Promise<void> {
+  if (records.length === 0) return;
+  const db = await getDB();
+  const tx = db.transaction(STORE_SLICES, 'readwrite');
+  // `tx.store.put` returns a promise that resolves on the put's
+  // success event; awaiting each one in sequence is fine because
+  // IDB serialises writes inside a single tx anyway -- the
+  // benefit here is the shared transaction lifetime + commit,
+  // not per-put parallelism (which IDB doesn't offer).  An
+  // alternative `Promise.all(records.map(r => tx.store.put(r)))`
+  // would work but reads less obviously; the sequential `for`
+  // matches the original loop's shape and lets a transaction
+  // abort propagate cleanly via `tx.done`.
+  for (const record of records) {
+    void tx.store.put(record);
+  }
+  await tx.done;
+}
+
 export async function deleteSlice(id: string): Promise<void> {
   const db = await getDB();
   await db.delete(STORE_SLICES, id);
