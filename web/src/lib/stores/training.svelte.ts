@@ -740,10 +740,18 @@ class TrainingStore {
       // Newest-first by mtime; tie-break by jobId so the order
       // is stable across listings (filesystems can produce
       // sub-second-equal mtimes on fast back-to-back runs).
+      // Strict-weak tiebreak: return 0 on equal jobIds.  In
+      // practice `<workspace>/training_logs/<job_id>.jsonl` paths
+      // are unique per jobId so the equal case never fires, but
+      // a non-zero-on-equal comparator violates `Array.sort`'s
+      // contract and is fragile to future call sites that pass
+      // arrays with duplicates.
       discovered.sort((a, b) => {
         if (a.mtime > b.mtime) return -1;
         if (a.mtime < b.mtime) return 1;
-        return a.jobId < b.jobId ? -1 : 1;
+        if (a.jobId < b.jobId) return -1;
+        if (a.jobId > b.jobId) return 1;
+        return 0;
       });
       this.discoveredByWs.set(workspaceId, discovered);
       // Eager tier: load up to `INITIAL_VISIBLE` non-active,
@@ -1156,12 +1164,20 @@ class TrainingStore {
     const incomingIds = new Set(terminals.map((t) => t.jobId));
     const filtered = prev.filter((j) => !incomingIds.has(j.jobId));
     const merged = [...filtered, ...terminals];
+    // Strict-weak tiebreak: return 0 on equal jobIds.  `filtered`
+    // + dedup-by-jobId above ensures `merged` has no duplicates
+    // so the equal-jobId branch is unreachable today, but
+    // returning non-zero on equal violates `Array.sort`'s
+    // contract -- a fragile assumption for a comparator that a
+    // future call site might feed a duplicate-bearing array.
     merged.sort((a, b) => {
       const aT = a.view?.started_at ?? '';
       const bT = b.view?.started_at ?? '';
       if (aT > bT) return -1;
       if (aT < bT) return 1;
-      return a.jobId < b.jobId ? -1 : 1;
+      if (a.jobId < b.jobId) return -1;
+      if (a.jobId > b.jobId) return 1;
+      return 0;
     });
     this.historyByWs.set(workspaceId, merged.slice(0, MAX_HISTORY_PER_WS));
   }

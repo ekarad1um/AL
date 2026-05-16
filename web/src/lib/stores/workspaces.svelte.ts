@@ -5,6 +5,7 @@ import { enqueueDelete } from '$lib/api/delete-queue';
 import { deleteCategoriesForWorkspace } from '$lib/idb/categories';
 import { deleteDraftsForWorkspace } from '$lib/idb/drafts';
 import { deleteSlicesForWorkspace } from '$lib/idb/slices';
+import { categories as categoriesStore } from '$lib/stores/categories.svelte';
 import { drafts as draftsStore } from '$lib/stores/drafts.svelte';
 import { slices as slicesStore } from '$lib/stores/slices.svelte';
 import { training as trainingStore } from '$lib/stores/training.svelte';
@@ -195,6 +196,15 @@ class WorkspacesStore {
         // bearing one and a stale local row reaches no UI surface.
         this.all = this.all.filter((w) => w.id !== id);
         this.selected.delete(id);
+        // Drop in-memory state across every per-workspace store.
+        // Each `forget` is a synchronous Map/Set clear; the IDB
+        // wipe below runs in parallel.  Categories joins the
+        // family here because its prior absence leaked SvelteMap
+        // entries for every deleted workspace -- visible only as
+        // memory growth across a long session, but the asymmetry
+        // with the matching IDB helper (`deleteCategoriesForWorkspace`)
+        // was a real defect.
+        categoriesStore.forget(id);
         draftsStore.forget(id);
         slicesStore.forget(id);
         // Training store: drop any tracked job for this workspace.

@@ -92,27 +92,44 @@
   </div>
 
   <div class="flex shrink-0 items-center gap-2">
-    <Button
-      size="sm"
-      variant="secondary"
-      onclick={onActivateClick}
-      disabled={isActive || interactionDisabled}
-      loading={activating}
+    <!-- Tooltip hoisted onto a wrapper span so the explanation
+         surfaces in Firefox as well: a disabled <button> doesn't
+         fire pointer events in Firefox, so its native `title`
+         tooltip stays hidden -- visible only in Chrome / Safari.
+         The span receives the hover, shows its own title, and
+         the operator hovering an "Active" or "Can't delete" pill
+         sees the same hint cross-browser.  Single title source
+         per button keeps the markup honest about which copy is
+         authoritative. -->
+    <span
+      class="inline-flex shrink-0"
       title={isActive ? 'Already the active head' : 'Hot-swap this head into the inference engine'}
     >
-      {#if isActive}Active{:else}Activate{/if}
-    </Button>
-    <button
-      type="button"
-      onclick={() => ondelete(head)}
-      disabled={isActive || interactionDisabled}
+      <Button
+        size="sm"
+        variant="secondary"
+        onclick={onActivateClick}
+        disabled={isActive || interactionDisabled}
+        loading={activating}
+      >
+        {#if isActive}Active{:else}Activate{/if}
+      </Button>
+    </span>
+    <span
+      class="inline-flex shrink-0"
       title={isActive
         ? "Can't delete the active head. Activate another head or revert to default first."
         : 'Delete this head'}
-      aria-label="Delete head"
-      class="inline-flex shrink-0 items-center justify-center gap-1 rounded-md border border-zinc-200 bg-white p-1.5 text-zinc-500 transition disabled:cursor-not-allowed disabled:bg-zinc-50 disabled:text-zinc-300 enabled:hover:border-rose-200 enabled:hover:bg-rose-50 enabled:hover:text-rose-700"
     >
-      <TrashIcon />
-    </button>
+      <button
+        type="button"
+        onclick={() => ondelete(head)}
+        disabled={isActive || interactionDisabled}
+        aria-label="Delete head"
+        class="inline-flex shrink-0 items-center justify-center gap-1 rounded-md border border-zinc-200 bg-white p-1.5 text-zinc-500 transition disabled:cursor-not-allowed disabled:bg-zinc-50 disabled:text-zinc-300 enabled:hover:border-rose-200 enabled:hover:bg-rose-50 enabled:hover:text-rose-700"
+      >
+        <TrashIcon />
+      </button>
+    </span>
   </div>
 </li>

@@ -206,6 +206,12 @@ class CategoriesStore {
         .filter((e) => e.kind === 'directory')
         .map((e) => e.name);
 
+      // Forget-race guard: `forget(workspaceId)` may have cleared
+      // this entry during the Promise.all above (workspace-delete
+      // chain).  If so, leave the Map empty rather than recreating
+      // an entry for a workspace that no longer exists.  Mirrors
+      // the same pattern in `slices.svelte.ts::refresh`.
+      if (!this.slices.has(workspaceId)) return;
       this.slices.set(workspaceId, {
         ...EMPTY_SLICE,
         entries: mergeSources(idbNames, serverNames),
@@ -220,6 +226,8 @@ class CategoriesStore {
       // this clear short-circuits on the next refresh entry.
       this.staleWorkspaces.delete(workspaceId);
     } catch (e) {
+      // Same forget-race guard as the success path.
+      if (!this.slices.has(workspaceId)) return;
       this.slices.set(workspaceId, {
         ...EMPTY_SLICE,
         entries: existing?.entries ?? mergeSources([], []),
@@ -252,6 +260,14 @@ class CategoriesStore {
       name,
       created_at: new Date().toISOString()
     });
+    // Forget-race guard: `forget(workspaceId)` may have cleared
+    // this entry during the IDB write above (cross-tab workspace
+    // delete).  Bail rather than recreate an entry from the
+    // pre-await `existing` snapshot for a workspace that no
+    // longer exists in-memory.  The IDB row written above is
+    // wiped by `deleteCategoriesForWorkspace` later in the
+    // workspace-delete chain.
+    if (!this.slices.has(workspaceId)) return;
     const newCat: Category = { name, origin: 'idb' };
     const entries = sortCategories([...(existing?.entries ?? []), newCat]);
     this.slices.set(workspaceId, {
@@ -290,10 +306,19 @@ class CategoriesStore {
       // mandatory cleanup, not optional.
       await drafts.clear(workspaceId, name).catch(() => undefined);
       await slices.clearForCategory(workspaceId, name).catch(() => undefined);
+      // Forget-race guard: re-read the slice after the awaits
+      // above.  If `forget(workspaceId)` cleared this workspace
+      // (cross-tab workspace delete), `fresh` is undefined --
+      // bail rather than recreate the entry from the stale
+      // `slice` capture.  The server-side path below uses the
+      // same `fresh && set` pattern; this branch was the lone
+      // outlier.
+      const fresh = this.slices.get(workspaceId);
+      if (!fresh) return;
       this.slices.set(workspaceId, {
-        ...slice,
-        entries: slice.entries.filter((c) => c.name !== name),
-        expandedName: slice.expandedName === name ? null : slice.expandedName
+        ...fresh,
+        entries: fresh.entries.filter((c) => c.name !== name),
+        expandedName: fresh.expandedName === name ? null : fresh.expandedName
       });
       return;
     }
@@ -368,6 +393,19 @@ class CategoriesStore {
     if (slice.expandedName !== null) {
       this.slices.set(workspaceId, { ...slice, expandedName: null });
     }
+  }
+
+  // Drop all per-workspace state.  Called from the workspace-delete
+  // chain in [stores/workspaces.svelte.ts] alongside the matching
+  // `forget` calls on the drafts / slices / training stores so a
+  // long session doesn't accumulate orphan SvelteMap entries for
+  // deleted workspaces.  No IDB cleanup here -- that's the
+  // `deleteCategoriesForWorkspace` step the chain awaits next.
+  // The `refresh` forget-race guards above prevent a concurrent
+  // in-flight refresh from re-creating this entry post-clear.
+  forget(workspaceId: Uuid): void {
+    this.slices.delete(workspaceId);
+    this.staleWorkspaces.delete(workspaceId);
   }
 }
 

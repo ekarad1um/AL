@@ -84,10 +84,14 @@
     // morph when a head already matches this revision.
     // Activation lives in the Heads section below; no per-row
     // Activate affordance is exposed inside the train history.
-    workspaceRevision: number;
+    // Named `liveRevision` to match the sibling HeadsList /
+    // HeadCard prop -- both refer to the same upload-receipt-
+    // promoted number so a uniform name avoids re-aligning the
+    // mental model at each call site.
+    liveRevision: number;
     heads: readonly HeadRecord[];
   }
-  let { workspaceId, workspaceRevision, heads }: Props = $props();
+  let { workspaceId, liveRevision, heads }: Props = $props();
 
   // ── Training slot status ─────────────────────────────────────
 
@@ -106,7 +110,7 @@
 
   const currentHead = $derived.by(() => {
     if (heads.length === 0) return null;
-    const matches = heads.filter((h) => h.workspace_revision.id === workspaceRevision);
+    const matches = heads.filter((h) => h.workspace_revision.id === liveRevision);
     if (matches.length === 0) return null;
     // Strict-weak-order comparator: returns 0 on equal
     // `created_at` so `Array#sort`'s stability guarantees hold
@@ -191,6 +195,17 @@
     if (hasFieldErrors) settingsOpen = true;
   });
 
+  // Format `lr` for the at-a-glance chip.  We render with one
+  // mantissa digit so 1.5e-3 doesn't get rounded into 2e-3 (a
+  // 33 % misrepresentation that the prior `toExponential(0)`
+  // produced).  The ".0e" → "e" replace strips a no-op decimal
+  // for round powers of 10 so the default 1e-3 still reads as
+  // "1e-3" rather than "1.0e-3"; the "e+0" → "" strip collapses
+  // a literal-`1` lr to "1" rather than "1e+0".
+  function formatLR(lr: number): string {
+    return lr.toExponential(1).replace('.0e', 'e').replace('e+0', '');
+  }
+
   const summaryChips = $derived.by(() => {
     const c = cfg;
     const epochs = c?.epochs ?? DEFAULT_EPOCHS;
@@ -200,7 +215,7 @@
     return [
       `${epochs} epochs`,
       `batch ${batch}`,
-      `lr ${lr.toExponential(0).replace('e+0', '').replace('e-0', 'e-')}`,
+      `lr ${formatLR(lr)}`,
       vs === 0 ? 'no holdout' : `val ${Math.round(vs * 100)}%`
     ];
   });

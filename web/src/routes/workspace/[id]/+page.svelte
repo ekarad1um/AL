@@ -395,7 +395,7 @@
          the heads list so the operator's typical action (start
          a run) is closer to the dataset they just edited. -->
     <div class="mb-6">
-      <TrainPane workspaceId={detail.id} workspaceRevision={liveRevision} heads={detail.heads} />
+      <TrainPane workspaceId={detail.id} {liveRevision} heads={detail.heads} />
     </div>
 
     <!-- Heads section: per-head card with Activate + Delete
