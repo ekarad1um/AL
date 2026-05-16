@@ -42,10 +42,12 @@ body {
    same height regardless of inference content (Top-K rows, head fields).
    Without an explicit height, the grid row tracks whichever panel's
    max-content is larger -- a rogue Top-K count would inflate the
-   spectrogram pane.  Both sections anchor to Visualization's intrinsic:
-     p-5 top  20  + header     34  (text-sm + mb-3)
-   + h-32   128  + space-y-2    8
-   + h-56   224  + p-5 bottom  20  = 434 px = 27.125 rem
+   spectrogram pane.  Both sections anchor to this height:
+     p-5 top      20  + header        34  (text-sm + mb-3)
+   + waveform   176  + gap-2           8
+   + spectro    176  + p-5 bottom     20  = 434 px = 27.125 rem
+   Inside Visualization, waveform and spectrogram each take `flex-1
+   min-h-0` so the inner 360 px (= 176 + 8 + 176) splits 50/50.
    Inference fits this budget via `flex-1 min-h-0 overflow-y-auto` on
    its Top-K wrapper. */
 :root {

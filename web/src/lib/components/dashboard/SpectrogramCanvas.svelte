@@ -3,7 +3,7 @@
   import { streams } from '$lib/stores/streams.svelte';
   import { fftRadix2, hannWindow } from '$lib/audio/fft';
   import {
-    buildPlasmaLut,
+    buildSpectrogramLut,
     magnitudeToPaletteIndex,
     SPECTROGRAM_DB_CEILING,
     SPECTROGRAM_DB_FLOOR
@@ -18,11 +18,9 @@
     fftSize?: number;
     smoothing?: number;
   }
-  // Defaults pull from `palette.ts` so the per-slice spectrogram
-  // (`spectrogram.ts`) and this live renderer share one dB → colour
-  // mapping.  Overriding via Props is still allowed for ad-hoc
-  // surfaces but the matching default is what gives a 4 kHz band
-  // on a slice card the same colour on the dashboard.
+  // Defaults pull from `palette.ts` so this and `spectrogram.ts`
+  // share one dB → colour map.  Overrides allowed, but moving them
+  // off-default breaks the cross-surface colour invariant.
   let {
     seconds = 3,
     minDb = SPECTROGRAM_DB_FLOOR,
@@ -78,16 +76,11 @@
 
     let pixelW = 1;
     let pixelH = 1;
-    // 256-entry plasma RGB lookup, pre-computed once and shared
-    // with the per-slice spectrogram renderer
-    // ([spectrogram.ts](../../audio/spectrogram.ts)) -- both
-    // surfaces now read from the same LUT in
-    // [palette.ts](../../audio/palette.ts), so a 4 kHz band that
-    // reads as bright yellow on a slice card reads as bright
-    // yellow on the live dashboard too.  The clamped array also
-    // lets the inner loop drop per-channel Math.min/Math.max.
+    // 256-entry LUT shared with `spectrogram.ts` via `palette.ts`
+    // — the cross-surface colour invariant.  Clamped array lets
+    // the inner loop drop per-channel min/max guards.
     const PALETTE_N = 256;
-    const palette = buildPlasmaLut(PALETTE_N);
+    const palette = buildSpectrogramLut(PALETTE_N);
     const emptyColor = `rgb(${palette[0]}, ${palette[1]}, ${palette[2]})`;
 
     // Native raster stage: one spectrogram column is one source-canvas pixel.
@@ -274,4 +267,10 @@
   });
 </script>
 
-<canvas bind:this={canvas} class="block h-full w-full rounded-md bg-zinc-950"></canvas>
+<!-- Canvas bg matches the waveform's `#fafafa` background (Tailwind
+     `bg-zinc-50`) and the palette's pinned floor.  Silence dissolves
+     into the canvas AND visually continues out into the waveform
+     panel above, so the whole audio surface reads as one unified
+     light field with signal painted into it.  See [palette.ts](../../audio/palette.ts)
+     for the cross-surface floor-colour invariant. -->
+<canvas bind:this={canvas} class="block h-full w-full rounded-md bg-zinc-50"></canvas>

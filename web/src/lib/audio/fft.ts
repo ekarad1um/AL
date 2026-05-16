@@ -2,7 +2,7 @@
 //
 // AnalyserNode is faster (native + SIMD) but its AudioContext starts
 // suspended on cold load and only resumes after a user gesture; we'd
-// have a black spectrogram until the operator clicked.  A 512-point
+// have a blank spectrogram until the operator clicked.  A 512-point
 // radix-2 Cooley-Tukey runs in ~50 µs / frame on V8 -- well inside
 // one frame's budget -- with no autoplay dependency.  The forward FFT
 // operates in place on `(real, imag)`; callers pre-window the input

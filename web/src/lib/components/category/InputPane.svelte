@@ -1118,9 +1118,20 @@
      `contain: size` only zeros the *outward* intrinsic-size
      contribution; *inside* the pane, the flex column still
      needs that pair to let the waveform row absorb the
-     leftover height under fixed-height chrome. -->
+     leftover height under fixed-height chrome.
+     Outer padding `px-3 pt-1.5 pb-3` with uniform `gap-1.5`:
+     the 6 px above the header + 6 px gap below it sizes the
+     heading's neighbourhood to its 11 px text rather than to
+     the taller 19 px quota chip beside it.  `pb-3` matches
+     `px-3` so the action row (or whichever chip stacked
+     last) clears the rounded corner by the same distance it
+     clears the sides.  SlicePane mirrors `pt-1.5 pb-3` +
+     header `mb-1.5` so the two heading-bottom strips line
+     up side-by-side; horizontal `px-3` keeps the chevron-
+     to-edge geometry consistent with the CategoryRow body
+     and the train accordion family. -->
 <div
-  class="flex h-full min-h-0 flex-col gap-2 overflow-hidden rounded-md border bg-white px-4 py-3 transition-colors contain-size {dragging
+  class="flex h-full min-h-0 flex-col gap-1.5 overflow-hidden rounded-md border bg-white px-3 pt-1.5 pb-3 transition-colors contain-size {dragging
     ? 'border-blue-400 bg-blue-50/40'
     : 'border-zinc-200'}"
   ondrop={onDrop}
@@ -1128,40 +1139,15 @@
   ondragleave={onDragLeave}
   aria-label="Input module for category {displayName}"
 >
-  <header class="flex min-h-4.75 items-center justify-between gap-2">
-    <!-- "Input" alone -- the category name is already on the
-         accordion row header, so echoing it here is duplicate
-         signal that crowds the timing readout on the right.
-         Inner cluster uses `items-center` so the small ⓘ glyph
-         lands at the heading's vertical mid-line rather than the
-         baseline.  Why not `items-baseline`?  With a 10 px icon
-         on a 16.5 px line-box, baseline-alignment puts the
-         icon's bottom on the text baseline -- so its centre sits
-         ~5 px above baseline, while the caps' visual centre is
-         only ~3.85 px above baseline (cap-height / 2).  The
-         resulting 1.15 px "icon too high" tilt is exactly what
-         the eye reads as misalignment.  Centre-alignment lands
-         the icon centre at the line-box centre (8.25 px from
-         line top), which coincides with the caps' geometric
-         centre to ~0.1 px -- visually unified.
-         The OUTER header uses `items-center` with `min-h-4.75`
-         (19 px) so the heading cluster is vertically centred
-         inside a 19 px header that matches SlicePane's
-         pill-driven natural height (its `0/20` pill is 19 px
-         from `py-0.5` + text).  The same mechanism on both
-         panes -- centre-alignment in a 19 px box -- forces the
-         h4's top, bottom, and centre to land at the same y
-         cross-pane (within sub-pixel), eliminating the 0.25 px
-         residual the earlier `py-0.25` + `items-baseline` mix
-         left behind.  Mechanism parity > value-tuning: when
-         the cross-pane diff comes from the layout MODE the two
-         panes use, no amount of padding tweaking will close
-         the gap, only switching one pane to match.
-         The timing readout on the right is text-[11px] -- same
-         line-height as the heading, so centre-alignment lands
-         it at the same baseline as the heading, identical to
-         what `items-baseline` would have produced for two
-         single-line text siblings. -->
+  <header class="flex min-h-4.75 items-center justify-between gap-1.5">
+    <!-- "Input" alone (the category name lives on the accordion
+         header above).  Inner cluster uses `items-center` so the
+         10 px ⓘ glyph aligns with the caps' geometric centre;
+         baseline alignment would lift it ~1 px high against a
+         16.5 px line-box.  Outer header `items-center min-h-4.75`
+         (19 px) shares its mechanism with SlicePane's pill-driven
+         natural height — same layout MODE on both panes keeps the
+         two h4 baselines welded cross-pane. -->
     <div class="flex items-center gap-1.5">
       <h4 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">Input</h4>
       <Tips label="Input module tips">
@@ -1213,32 +1199,14 @@
     {/if}
   </header>
 
-  <!-- Waveform area + vertical loudness meter.  The waveform fills
-       remaining width; the meter only renders when there's signal
-       to read (recording OR playing) so an idle pane gets the
-       full waveform width and no orphaned empty track.
-       `flex-1 min-h-0` (NOT `min-h-32`): the slot absorbs *all*
-       leftover vertical space from the pane via `flex-1` and is
-       allowed to shrink to zero via `min-h-0`.  This is what
-       keeps the pane's outer height stable at the parent grid's
-       `min-h-80` (320 px) floor across every mode.  An earlier
-       draft used `min-h-32` (128 px) here as a readability floor,
-       but in modes where the action row stacks with optional
-       chrome (selection-status line, recorder/import error banner,
-       "Imported from" line, "Auto-stopped at the cap" message) the
-       *cumulative* intrinsic content height climbed past 320 px
-       and the grid row grew to accommodate it -- so the InputPane
-       got taller when an error fired, and SlicePane stretched
-       to match.  The result was a "pane jumps two notches up
-       when an error appears" feel that broke the visual rhythm
-       of the dataset accordion.
-       Dropping the floor here is the right trade-off: in
-       error-heavy / imported-from states the waveform compresses
-       gracefully (down to ~70-90 px in the worst case) but the
-       pane height stays welded to the grid's floor across every
-       mode transition.  The dashboard's 128 px waveform is a
-       separate surface (full-page width, no competing chrome),
-       so it doesn't need to match. -->
+  <!-- Waveform + vertical loudness meter.  Meter only mounts when
+       there's signal to read so an idle pane runs full waveform
+       width.  `flex-1 min-h-0` (no `min-h-32` floor) lets this slot
+       compress under variable chrome (error chips, "imported from",
+       cap notices) so the outer pane stays welded to the grid's
+       `min-h-80` floor instead of ratcheting taller when an error
+       fires.  Worst-case compression bottoms out at ~70-90 px,
+       still readable. -->
   <div class="flex min-h-0 flex-1 gap-2">
     <div class="relative flex-1 overflow-hidden rounded-md bg-zinc-50">
       {#if isRecording || (isFinalizing && !isStreaming)}
@@ -1274,7 +1242,7 @@
              pane's drop affordance during a drag-over via the
              parent's `dragging` flag. -->
         <label
-          class="flex h-full cursor-pointer flex-col items-center justify-center gap-2 rounded-md border-2 border-dashed border-zinc-300 px-4 text-center text-[11px] text-zinc-500 transition hover:border-zinc-400 hover:bg-zinc-100/40"
+          class="flex h-full cursor-pointer flex-col items-center justify-center gap-2 rounded-md border-2 border-dashed border-zinc-300 px-3 text-center text-[11px] text-zinc-500 transition hover:border-zinc-400 hover:bg-zinc-100/40"
           class:border-blue-400={dragging}
           class:bg-blue-50={dragging}
           title="Drop a WAV file here (up to {formatBytes(MAX_IMPORT_BYTES)}), or click to browse"
@@ -1295,7 +1263,7 @@
           </svg>
           <span>Drag &amp; drop a WAV here</span>
           <span
-            class="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-white px-2 py-0.5 text-[10px] font-medium text-zinc-700 transition group-hover:border-zinc-300"
+            class="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 transition group-hover:border-zinc-300"
           >
             Browse files
           </span>
@@ -1448,15 +1416,42 @@
         {/if}
       </Button>
 
-      <!-- Play / Stop toggles a single audio source bound to the
-           trimmed range.  Cursor + drag-to-seek live inside the
-           TrimWaveform above. -->
+      <!-- Text-only secondary, parked next to Slice.  Adjacency
+           mirrors the "thing + how to undo it" cluster the dataset
+           accordion uses elsewhere (CategoryRow / SliceCard hover
+           trashes).  The row reads heavy → light L→R: primary
+           Slice, text-only Discard, glyph-only Play/Stop, glyph-
+           only Export.  No leading icon — always-visible labelled
+           chrome doesn't need a glyph beside an explicit word, and
+           the row's icon vocabulary stays reserved for the symbol-
+           only utilities. -->
+      <Button
+        variant="secondary"
+        onclick={discardDraft}
+        ariaLabel="Discard clip"
+        title="Discard clip"
+      >
+        Discard
+      </Button>
+
+      <!-- Play/Stop on the trimmed range (cursor + drag-to-seek
+           live inside TrimWaveform).  Glyph-only with `min-h-8.5
+           px-2` for a square footprint paired with Export — the
+           play triangle / stop square are universal media glyphs,
+           and a shape-swap reads as state better than a label-swap.
+           `ariaLabel` + `title` keep the verbose phrasing for SR /
+           tooltip paths. -->
       {#if playing}
-        <Button variant="secondary" onclick={stopPlayback} ariaLabel="Stop playback">
-          <svg viewBox="0 0 24 24" fill="currentColor" class="h-3 w-3" aria-hidden="true">
+        <Button
+          variant="secondary"
+          onclick={stopPlayback}
+          ariaLabel="Stop playback"
+          title="Stop playback"
+          class="min-h-8.5 px-2"
+        >
+          <svg viewBox="0 0 24 24" fill="currentColor" class="h-4 w-4" aria-hidden="true">
             <rect x="6" y="6" width="12" height="12" rx="1.5" />
           </svg>
-          Stop
         </Button>
       {:else}
         <Button
@@ -1464,64 +1459,17 @@
           onclick={playSelection}
           disabled={!draftPcm || trimRangeSamples <= 0}
           ariaLabel="Play the trimmed selection"
+          title="Play the trimmed selection"
+          class="min-h-8.5 px-2"
         >
-          <svg viewBox="0 0 24 24" fill="currentColor" class="h-3 w-3" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor" class="h-4 w-4" aria-hidden="true">
             <path d="M8 5v14l11-7z" />
           </svg>
-          Play
         </Button>
       {/if}
 
-      <!-- Discard + Export collapse to icon-only buttons.  Rationale:
-           * Slice and Play/Stop carry primary-CTA + state-bearing
-             labels (Slice·N, the Play↔Stop flip) -- those stay
-             labeled because the text is doing real work.
-           * Discard and Export are utility actions used 0-1× per
-             draft; the trash + download glyphs are universally
-             recognised on their own.  Stripping their labels gives
-             the action row a clearer primary / secondary visual
-             hierarchy without losing functionality.
-           Footprint: `class="px-2"` (vs the SIZE_CLASSES default
-           `px-3.5`) tightens the horizontal padding to roughly
-           match the height -- the button reads as a square 34 × 34
-           tap target paired with its labeled siblings rather than
-           a wide rectangle that just happens to be empty of text.
-           Icon size bumps from `h-3` (12 px, labeled rhythm) to
-           `h-4` (16 px) so the icon doesn't look lost without a
-           label.
-           Discoverability: `title` carries a hover tooltip
-           (previously redundant with the printed label); the
-           existing `ariaLabel` still serves screen readers.
-           Icon choice for Discard: trash-can (matches SliceCard's
-           per-slice delete glyph at SliceCard.svelte:483).  The
-           prior X glyph reads as "Close/Cancel" -- fine when the
-           "Discard" word disambiguated, but ambiguous on its own.
-           Aligning with the same trash icon SliceCard uses for
-           "delete this slice" keeps the destructive-icon
-           vocabulary single-sourced across the dataset accordion. -->
-      <Button
-        variant="secondary"
-        onclick={discardDraft}
-        ariaLabel="Discard clip"
-        title="Discard clip"
-        class="min-h-8.5 px-2"
-      >
-        <svg
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          class="h-4 w-4"
-          aria-hidden="true"
-        >
-          <path d="M3 6h18" />
-          <path d="M8 6V4h8v2" />
-          <path d="M19 6l-1 14H6L5 6" />
-        </svg>
-      </Button>
-
+      <!-- Glyph-only at the tail; same `min-h-8.5 px-2` footprint
+           as Play/Stop so they read as a paired utility cluster. -->
       <Button
         variant="secondary"
         onclick={exportDraft}

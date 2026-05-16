@@ -25,15 +25,19 @@
     </span>
   </header>
 
-  <!-- h-32 + h-56 are the source of the `--vis-panel-h` budget in
-       app.css (434 px total).  Don't bump these without updating the
-       variable.  The split also keeps the spectrogram visually dominant
-       so p-5 reads balanced. -->
-  <div class="space-y-2">
-    <div class="h-32">
+  <!-- Waveform + spectrogram split the remaining height evenly via
+       `flex-1 min-h-0`.  The panel's outer height is pinned to
+       `--vis-panel-h` (see app.css), so the two children always sum to
+       the same budget -- only the internal distribution changed (from a
+       fixed 128/224 px split to 50/50).  `min-h-0` lets the canvases
+       shrink below their intrinsic size so flex actually distributes,
+       and `gap-2` replaces `space-y-2` to keep the gap outside the
+       flex sizing math. -->
+  <div class="flex min-h-0 flex-1 flex-col gap-2">
+    <div class="min-h-0 flex-1">
       <WaveformCanvas seconds={3} />
     </div>
-    <div class="h-56">
+    <div class="min-h-0 flex-1">
       <SpectrogramCanvas seconds={3} />
     </div>
   </div>

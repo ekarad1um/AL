@@ -15,8 +15,8 @@
   import type { SliceRecord } from '$lib/idb/db';
 
   // Slice Management pane.  Grid of `SliceCard`s backed by
-  // pre-rendered plasma spectrograms; sits in the right pane of the
-  // expanded category row alongside `InputPane`.
+  // pre-rendered spectrogram thumbnails; sits in the right pane of
+  // the expanded category row alongside `InputPane`.
   //
   // Playback: one shared `AudioContext`, lazily constructed.  A
   // card click decodes its WAV blob and plays via a fresh
@@ -767,69 +767,38 @@
   }
 </script>
 
-<!-- `contain-size` is what keeps the parent CategoryRow grid row
-     stable when this pane fills with slices.  Without it, CSS
-     Grid's `auto` row sizing reads each item's max-content height
-     (including the section's full slice grid, walked past the
-     overflow-y-auto), so a 30-slice batch would grow the row past
-     the InputPane's natural height and leave a visible empty band
-     in the Input pane.  Size containment tells the engine "ask me
-     for nothing -- I'll get my height from the row".  The slice
-     grid below still scrolls internally via `overflow-y-auto`. -->
+<!-- `contain: size` keeps the parent CategoryRow grid row welded
+     to its `min-h-80` floor — without it, the inner slice grid's
+     max-content height (walked past `overflow-y-auto`) would lift
+     the row above the InputPane's natural height and leave an
+     empty band on the Input side.  Outer padding `px-3 pt-1.5
+     pb-3` + header `mb-1.5` mirrors InputPane so the two heading
+     bottoms line up at the same y. -->
 <section
-  class="flex h-full min-h-0 flex-col rounded-md border border-zinc-200 bg-white px-4 py-3 contain-size"
+  class="flex h-full min-h-0 flex-col rounded-md border border-zinc-200 bg-white px-3 pt-1.5 pb-3 contain-size"
 >
-  <header class="mb-2 flex min-h-4.75 items-center justify-between gap-2">
-    <!-- `min-h-4.75` (19 px) is shared with InputPane's header so
-         both module headings sit in identical-height boxes and
-         the h4 + ⓘ cluster lands at the same y on both sides
-         of the grid.  Locally redundant when normal mode shows
-         the `0/20` pill (its `py-0.5` + text gives 19 px
-         naturally) but load-bearing in *selecting* mode where
-         the toolbar buttons (`py-0.5 text-[10px]`) are slightly
-         shorter than the pill -- without the floor the header
-         would shrink by ~1 px when the operator enters
-         selecting mode, jiggling the slice grid below.
-         Header swaps shape on the pane's mode FSM.
-         Normal mode: just the "Slices" title.  Operators in this
-         mode are auditing slices (clicking cards to play), so the
-         header carries no selection chrome -- the right-click
-         menu's "Select" / "Select all" entries and the Ctrl/Cmd-
-         click accelerator are the entry points into selecting.
-         "Select all" is hidden by default per the project spec
-         (the menu + Cmd/Ctrl+A cover the entry path).
-         Selecting mode: three left-aligned tight pill buttons --
-         Select all / Deselect all, Done, Delete N -- in the
-         workspaces toolbar's order.  All three share the same
-         pill shape (`inline-flex items-center rounded-md border
-         px-2 py-0.5 text-[10px] font-medium`) so the row reads
-         as one cohesive toolbar; the destructive accent rides on
-         the rose colour palette alone, not on a different
-         container shape.  An earlier draft kept Select all / Done
-         as bare text-link buttons (no border, underline-on-hover)
-         and only Delete as a pill, but the resulting "two links +
-         one button" row read as a mixed control group and let the
-         eye drift to the lone bordered pill -- the visual hierarchy
-         worked AGAINST "this is the selecting toolbar" and FOR
-         "Delete is doing its own thing over there".  Unifying the
-         shape recovers the toolbar reading, and dropping the
-         lowercase ("select all" / "done") in favour of Title Case
-         matches the workspaces toolbar's button labels so the two
-         modules' bulk-action surfaces feel like the same primitive.
-         No "N selected" counter on the left because (a) the
-         operator already sees the count baked into the Delete N
-         button label, and (b) dropping it lets the toolbar start
-         flush at the header's left edge -- visually anchoring
-         "I'm in selecting mode" without competing chrome.
-         The right-side quota chip stays put across both modes;
-         operators want "am I at quota?" visible regardless of
-         selection state. -->
+  <header class="mb-1.5 flex min-h-4.75 items-center justify-between gap-1.5">
+    <!-- `min-h-4.75` (19 px) matches InputPane's header so both
+         headings sit in identical-height boxes — load-bearing in
+         selecting mode where the toolbar pills are ~1 px shorter
+         than the quota pill and the header would otherwise jiggle
+         on mode switch.
+         Header swaps on the pane's mode FSM:
+           Normal: "Slices" + Tips.  Selection entry is via
+           Ctrl/Cmd-click or the right-click ContextMenu.
+           Selecting: Select all / Done / Delete N, all sharing
+           one pill shape (`px-1.5 py-0.5 text-[10px] font-medium`)
+           — destructive accent comes from rose colour, not from
+           a different container.  No "N selected" counter on the
+           left: count is baked into the Delete N label and the
+           toolbar flush-left anchors the mode.
+         The quota chip stays right-aligned across both modes. -->
     {#if mode === 'selecting'}
-      <div class="flex min-w-0 items-center gap-2">
+      <div class="flex min-w-0 items-center gap-1.5">
         <button
           type="button"
           onclick={toggleSelectAll}
-          class="inline-flex items-center rounded-md border border-zinc-200 bg-white px-2 py-0.5 text-[10px] font-medium text-zinc-700 transition duration-200 ease-out hover:border-zinc-300 hover:bg-zinc-50"
+          class="inline-flex items-center rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 transition duration-200 ease-out hover:border-zinc-300 hover:bg-zinc-50"
           title={allSelected
             ? 'Deselect all slices (Cmd/Ctrl+A)'
             : 'Select all slices (Cmd/Ctrl+A)'}
@@ -839,7 +808,7 @@
         <button
           type="button"
           onclick={exitSelecting}
-          class="inline-flex items-center rounded-md border border-zinc-200 bg-white px-2 py-0.5 text-[10px] font-medium text-zinc-700 transition duration-200 ease-out hover:border-zinc-300 hover:bg-zinc-50"
+          class="inline-flex items-center rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 transition duration-200 ease-out hover:border-zinc-300 hover:bg-zinc-50"
           title="Exit selection (Esc)"
         >
           Done
@@ -848,7 +817,7 @@
           type="button"
           onclick={bulkDelete}
           disabled={!hasSelection || isAnyDeleting}
-          class="inline-flex items-center gap-1 rounded-md border border-rose-200 bg-rose-50 px-2 py-0.5 text-[10px] font-medium text-rose-700 transition duration-200 ease-out hover:border-rose-300 hover:bg-rose-100 disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-zinc-50 disabled:text-zinc-400"
+          class="inline-flex items-center gap-1 rounded-md border border-rose-200 bg-rose-50 px-1.5 py-0.5 text-[10px] font-medium text-rose-700 transition duration-200 ease-out hover:border-rose-300 hover:bg-rose-100 disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-zinc-50 disabled:text-zinc-400"
           title={isAnyDeleting
             ? `Deleting ${inflightDeleteCount} ${inflightDeleteCount === 1 ? 'slice' : 'slices'}…`
             : hasSelection
@@ -861,14 +830,10 @@
               : 'Delete selected slices'}
           aria-live="polite"
         >
-          <!-- Icon slot: animated spinner while any `slices.delete()`
-               is in flight (covers the bulk path and any single-card
-               delete that landed in `deletingIds`); otherwise the
-               trash glyph.  Centralised spinner replaces N
-               per-card animations during a 30-slice batch -- one
-               running `animate-spin` rather than one per row.  See
-               the `SliceCard` deleting block for the matching
-               rationale on the card side. -->
+          <!-- Spinner while any delete is in flight; trash glyph
+               otherwise.  One animation per batch instead of N
+               per-card spinners (see SliceCard for the paint-cost
+               rationale). -->
           {#if isAnyDeleting}
             <Spinner class="h-2.5 w-2.5" />
           {:else}
@@ -895,18 +860,10 @@
         </button>
       </div>
     {:else}
-      <!-- Heading + Tips icon grouped on one row so the popover
-           trigger reads as part of the title cluster rather than
-           a floating chip.  The parent header's `justify-between`
-           keeps the cluster left + the quota chip right.  Tips
-           only appears in the non-selecting (normal/auditioning)
-           mode where the heading is visible -- in selecting mode
-           the toolbar replaces the heading and Tips would compete
-           with the Delete / Select buttons for attention.
-           `items-center` aligns the small ⓘ glyph's centre with
-           the heading's line-box centre; see the matching
-           commentary in [InputPane.svelte](InputPane.svelte) for
-           why centre beats baseline for sub-line-height icons. -->
+      <!-- Heading + Tips clustered so the popover trigger reads
+           as part of the title.  Tips is hidden in selecting mode
+           (where the toolbar replaces the heading) to avoid
+           competing with the Delete / Select buttons. -->
       <div class="flex items-center gap-1.5">
         <h4 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">Slices</h4>
         <Tips label="Slice module tips">
@@ -925,17 +882,15 @@
         </Tips>
       </div>
     {/if}
-    <!-- Quota chip: emerald at/above the per-category threshold,
-         amber when below.  Threshold from `labels.thresholdFor`
-         (20 for `_background_noise_`, 10 elsewhere).  No leading
-         icon -- the colour tone (emerald = satisfied, amber =
-         short) plus the tabular `count/threshold` numeral are the
-         signal; a leading check on the satisfied branch read as
-         visual chatter at this scale and competed with the
-         CategoryRow's own "Synced" badge for the operator's
-         attention. -->
+    <!-- Quota chip: emerald at/above threshold, amber below.
+         Tally `count/threshold` carried in `font-mono tabular-nums`
+         so the width is stable while count animates.  No leading
+         icon — colour tone alone signals the state, and a check
+         here would compete with the CategoryRow's "Synced" badge.
+         Chip footprint matches the CategoryRow badge + TrainPane
+         summary chips — one padding rhythm across the app. -->
     <span
-      class="inline-flex shrink-0 items-center rounded-full px-2 py-0.5 font-mono text-[10px] font-medium tabular-nums transition-colors"
+      class="inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 font-mono text-[10px] font-medium tabular-nums transition-colors"
       class:bg-emerald-100={satisfiesQuota}
       class:text-emerald-800={satisfiesQuota}
       class:bg-amber-100={!satisfiesQuota}
@@ -970,115 +925,53 @@
       </p>
     </div>
   {:else}
-    <!-- Grid: `auto-fit` columns of a *fixed* 96 px (the card's
-         own width), packed from the LEFT with a constant 12 px
-         (`gap-3`) inter-card distance.  `justify-start` is the
-         load-bearing piece: every gap (between cards, after the
-         last card) stays at exactly 12 px regardless of how wide
-         the pane is or how many cards live in the grid.
-         Why `justify-start` over the earlier `justify-evenly`:
-           The previous `justify-evenly` divided whatever leftover
-           horizontal space couldn't fit another column into N + 1
-           equal slots (left edge, every inter-card gap, right
-           edge).  For a full row that distribution was elegant
-           (symmetric edges, identical inter-card spacing); for a
-           PARTIAL row -- a one- or two-card last row, or a
-           freshly-sliced 4-clip batch in a 6-column-wide pane --
-           the leftover ballooned the inter-card gap to 60-100 px
-           and the partial row read as visually unrelated to the
-           full rows above it.  The "rhythm" of the grid changed
-           with card count, which is exactly the inconsistency
-           that makes a content grid feel fidgety.
-           Switching to `justify-start` trades the symmetric edge
-           padding for a fixed gap.  Cards anchor at the grid's
-           left edge, every inter-card distance is 12 px, and
-           whatever leftover space exists piles up on the right
-           as predictable whitespace.  Same pattern as macOS
-           Finder column view, GitHub repo grid, and most asset
-           browsers; aligns with left-to-right reading order so
-           the eye picks up the first card immediately.
-         Why `gap-3` (12 px) over the earlier `gap-2` (8 px):
-           At 96 px card width, an 8 px gap is a 12:1 card-to-gap
-           ratio -- cards visually almost touch, which read as
-           "compact data view" rather than "audition gallery".
-           Comparable asset libraries (Linear issue grid, Notion
-           gallery, Spotify tile rows) sit at 6:1 to 8:1.  12 px
-           lands at 8:1 -- a clean breathing room without wasting
-           horizontal screen real estate.  Column-count math at
-           the typical md breakpoint (pane content ~330 px wide)
-           still resolves to 3 columns (3 × 96 + 2 × 12 = 312 ≤
-           330), so the bump is purely visual; no rows lose
-           cards on resize.  The same 12 px also applies to the
-           row gap, giving vertical breathing room between rows
-           that matches the horizontal cadence.
-         The earlier `repeat(auto-fill, minmax(96px, 1fr))` template
-         was the *opposite* fix attempt: it stretched each cell
-         horizontally to absorb leftover.  But the SliceCard inside
-         is a fixed-width 96 px button (`w-24`) and left-aligned,
-         so the stretched cell ended up with a right-leaning
-         "padding hole" *inside* each cell -- left edge ≠ inter-
-         card gap ≠ right edge, all visible.  The current
-         fixed-width track keeps the SliceCard flush with the
-         cell, and `justify-start` keeps every inter-cell gap
-         identical, so the visible cadence finally matches the
-         underlying grid math.
-         Wrap math (unchanged from the earlier template): a new
-         column appears exactly when the container can fit
-         `(N+1)*96 + N*12` px -- i.e. the cards plus the minimum
-         gap between every adjacent pair.  Below that, leftover
-         absorbs as right-edge whitespace.
-         Partial last row: `auto-fit` only collapses tracks that
-         are empty in *every* row, so a partial last row still
-         aligns to the track positions established by the full
-         rows above -- last-row items appear flush-left into
-         tracks 1..M, not re-centered against a smaller
-         distribution.  Combined with `justify-start`, a
-         freshly-sliced batch lands directly under the existing
-         cards rather than spreading across the row.
-         `content-start` (= `align-content: start`) is the y-axis
-         counterpart -- pins row tracks to the top -- and is
-         load-bearing.
-         The grid has `flex-1`, so it claims all the vertical room
-         the parent flex column gives it; the implicit row tracks
-         generated by item wrapping default to `grid-auto-rows:
-         auto` (= the items' 64 px content height).  Without an
-         explicit `align-content`, the spec's `normal` value
-         behaves as `stretch` for `auto`-sized tracks, which
-         absorbs the *vertical* leftover into the tracks themselves
-         -- a 2-row layout in a 500 px container would balloon each
-         track to ~244 px while keeping `gap` at 12 px, so the
-         *visible* distance between two card rows would be ~188 px,
-         not 12 px.  3 rows compressed that to ~103 px, 4 rows to
-         ~61 px, and a full overflowing grid settled at exactly 12.
-         `align-content: start` pins every row track at its 64 px
-         content size, places the stack from the top, and dumps
-         any vertical leftover *below* the last row (where the
-         `overflow-y-auto` scroll region absorbs it) -- so the
-         between-row distance is the literal `gap-3` and stays
-         constant whether there are 2, 3, or 20 rows.  Keep the
-         tracks implicit (rather than pinning them via
-         `grid-auto-rows: 16`) so the card height stays sourced
-         from `SliceCard`'s `h-16` alone -- no two-place constant
-         to drift.
-         `flex-1 min-h-0` lets the grid fill all leftover height in
-         the section without growing past it, so SlicePane stays
-         the same height as the InputPane regardless of slice count
-         and an incoming batch only scrolls within the grid.
-         `scrollbar-gutter: stable` reserves the scrollbar's native
-         width up front so flipping into overflow (the moment a
-         fresh batch pushes the grid past its visible height)
-         doesn't yank horizontal real estate out from under the
-         existing cards and trigger a reflow of the column count.
-         `tabindex=0` makes the grid keyboard-focusable so the
-         Del / Backspace shortcut for batch delete has a focus
-         scope -- otherwise the listener would fire on any window
-         keystroke, including in unrelated panes. -->
+    <!-- Grid contract: `auto-fill` columns at `minmax(96px, 1fr)`,
+         `gap-3`.  Cells are ≥ 96 px and stretch via 1fr so a full
+         row's widths sum exactly to the pane width — no right-edge
+         dead band.  The SliceCard inside is `w-full aspect-3/2`
+         so its height tracks cell width on the canonical 3:2
+         spectrogram ratio.
+         Column-count math: with gap G = 12, N = floor((W+G)/(96+G))
+         columns of width w = (W − (N−1)·G) / N.  Realistic widths:
+           W=330 → 3 × 102 px;  W=440 → 4 × 101 px;
+           W=600 → 5 × 110 px;  W=800 → 7 × 104 px;
+           W=1200 → 11 × 98 px.
+         All upscales sit at 2-15 %, well inside the band where
+         the browser's bilinear/bicubic path is perceptually clean
+         on the 96 × 64 PNG.
+         `auto-fill` (not `auto-fit`): empty tracks must reserve
+         space instead of collapsing — otherwise `minmax(96px,
+         1fr)` would balloon a lone slice to fill the pane.  Card
+         width stays predictable whether there's 1 slice or 100.
+         `minmax(96px, 1fr)` (not the prior fixed `96px`): absorbs
+         the right-edge band that previously jittered on resize.
+         The dead band now only appears on partial last rows.
+         `aspect-3/2` (not `w-full h-16`): horizontal-only stretch
+         would squash the spectrogram's time axis, so a "1 s clip"
+         would read different durations at different pane widths.
+         The aspect-locked card preserves the time-per-pixel scale
+         across pane widths.
+         `content-start` is load-bearing — implicit row tracks
+         are `grid-auto-rows: auto` and the spec's `normal`
+         align-content stretches them, which would balloon the
+         vertical gap between rows from `gap-3` to whatever
+         absorbs the leftover height (e.g. ~188 px for a 2-row
+         layout in a 500 px container).  `align-content: start`
+         pins tracks at the aspect-derived height and dumps the
+         leftover below the last row, where `overflow-y-auto`
+         absorbs it.
+         `scrollbar-gutter: stable` reserves the scrollbar width
+         up front; without it, a fresh batch pushing the grid into
+         overflow would yank horizontal space from under the
+         existing cards and reflow the column count.
+         `tabindex=0` scopes the Del/Backspace bulk-delete shortcut
+         to focus inside this grid. -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <div
       bind:this={gridEl}
       tabindex="0"
-      class="grid min-h-0 flex-1 grid-cols-[repeat(auto-fit,96px)] content-start justify-start gap-3 overflow-y-auto rounded-sm scrollbar-gutter-stable focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-200"
+      class="grid min-h-0 flex-1 grid-cols-[repeat(auto-fill,minmax(96px,1fr))] content-start gap-3 overflow-y-auto rounded-sm scrollbar-gutter-stable focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-200"
       oncontextmenu={onGridContextMenu}
       onkeydown={onGridKey}
     >

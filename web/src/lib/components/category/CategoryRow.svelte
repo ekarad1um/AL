@@ -55,35 +55,22 @@
   const threshold = $derived(thresholdFor(category.name));
   const syncStatus = $derived(slices.syncStatusFor(workspaceId, category.name));
 
-  // Unified row badge.  A single pill conveys quota + sync state.
-  // The numeric count lives inside the expanded SlicePane; the
-  // badge only labels the situation, not the exact tally -- the
-  // operator can drill in for the count if they need it.  Tone +
-  // text by combined state:
-  //   - Enough samples AND synced      → emerald "✓ Synced"
-  //   - Enough samples AND uploading   → blue    "Uploading"
-  //   - Enough samples AND pending     → amber   "Pending"
-  //   - Not enough samples + empty     → amber   "Not enough samples"
-  //   - Not enough samples + state     → amber   "Not enough samples · State"
-  //   - Any failed                     → rose    "Failed" or
-  //                                              "Not enough samples · Failed"
-  // Badge width is fully driven by its content (no `min-width`
-  // floor) so every state has the same `px-2` visible padding
-  // on the left and right of the pill's contents -- matching
-  // the rest of the project's small status pills (sync chip,
-  // deleting badge, socket pill).  Earlier we held a 80 px
-  // floor to keep the row header from jiggling during a batch
-  // upload, but the measurement-driven width transition (see
-  // `textWidth` below) now interpolates between labels
-  // smoothly, so the jiggle concern is handled at the
-  // animation layer; a floor only bloated the visible padding
-  // for short labels ("Failed" / "Synced") and made them look
-  // inconsistent with the longer "Not enough samples" states.
+  // Unified row badge.  Tone + text by combined (quota, sync) state:
+  //   satisfied + synced     → emerald "✓ Synced"
+  //   satisfied + uploading  → amber   "Uploading"
+  //   satisfied + pending    → amber   "Pending"
+  //   short + empty          → amber   "Not enough samples"
+  //   short + non-empty      → amber   "Not enough samples · <state>"
+  //   any failed             → rose    "Failed" (or "… · Failed")
+  // Width is content-driven; the measurement transition on
+  // `textWidth` smooths the cross-label glide so a min-width floor
+  // is not needed.  Chip footprint `px-1.5 py-0.5 text-[10px]`
+  // matches the TrainPane summary chips so every small pill in the
+  // app shares one padding rhythm; colour + weight diverge because
+  // this badge carries status, not data.
   type BadgeTone = 'emerald' | 'amber' | 'rose';
-  // The only visible icon is the "Synced" arrow/check.  All other
-  // states are text-only -- a stationary "+" or "↑" on a moving
-  // status pill amounted to visual chrome the operator didn't need,
-  // and removing them lets the colour + text alone do the talking.
+  // Only "Synced" carries an icon (check).  Other states are
+  // text-only — a stationary glyph on a status pill is chrome.
   type BadgeIcon = 'check' | null;
   interface Badge {
     tone: BadgeTone;
@@ -202,6 +189,15 @@
     : 'border-zinc-200 hover:border-zinc-300'}"
   class:opacity-60={isDeleting}
 >
+  <!-- Header and expanded body share `px-3` so the chevron's
+       x-offset matches the pane border below it (a mismatched
+       `px-4` body would leave a 4 px kink at the boundary).  The
+       same `px-3` is used by the train module's accordion family
+       (TrainHistoryItem, TrainPane "Hyperparameters", TrainLogs)
+       so disclosure rows across both modules share one
+       chevron-to-edge geometry.  `py-1.5` runs tighter than the
+       train accordions' `py-2` because the dataset surface has
+       more rows per pane; TrainLogs matches at `py-1.5`. -->
   <div
     role="button"
     tabindex={isDeleting ? -1 : 0}
@@ -210,17 +206,28 @@
     aria-disabled={isDeleting}
     onclick={onHeaderClick}
     onkeydown={onHeaderKey}
-    class="flex cursor-pointer items-center gap-3 px-4 py-3 transition select-none"
+    class="flex cursor-pointer items-center gap-2 px-3 py-1.5 transition select-none"
     class:cursor-not-allowed={isDeleting}
     class:pointer-events-none={isDeleting}
   >
     <!-- Disclosure chevron.  Rotation animates with the row's
-         expansion so the affordance reads as one motion. -->
+         expansion so the affordance reads as one motion.
+         Optical micro-alignment: the path's filled mass occupies
+         y=5.23..12.71 in a 0..20 viewBox -- ~1 px above box centre.
+         At `items-center` the collapsed chevron therefore sits ~1
+         px above the text mid-line; rotate-90 swings the bias into
+         the horizontal axis, so the expanded chevron lands near
+         text centre on its own.  `translate-y-px` only when
+         collapsed nudges the resting state down to match.  Same
+         trick the TrainHistoryItem / TrainPane chevrons use, so
+         the dataset and train accordions stay mechanically
+         identical. -->
     <svg
       viewBox="0 0 20 20"
       fill="currentColor"
       aria-hidden="true"
       class="h-3.5 w-3.5 shrink-0 text-zinc-500 transition-transform duration-200"
+      class:translate-y-px={!expanded}
       class:rotate-90={expanded}
     >
       <path
@@ -229,43 +236,31 @@
         clip-rule="evenodd"
       />
     </svg>
-    <!-- Name + delete-affordance cluster.  Grouping them in one
-         flex container keeps the destructive action immediately
-         adjacent to the name it targets (rather than across the
-         row past the status badge), so the operator's eye reads
-         "this is the thing, this is how to remove it" as one
-         unit.  `flex-1 min-w-0` lets the h3 truncate while the
-         button stays a fixed-size sibling on the right of the
-         cluster; the badge then sits at the row's right edge as
-         the only thing on that side. -->
+    <!-- Name + delete cluster.  Grouping the destructive action
+         next to its target reads as "thing + how to remove it";
+         the badge sits alone at the row's right edge.  `flex-1
+         min-w-0` lets the h3 truncate while the button stays
+         fixed-size. -->
     <div class="flex min-w-0 flex-1 items-center gap-2">
       <h3 class="min-w-0 truncate text-sm font-medium text-zinc-900" title={category.name}>
         {display}
       </h3>
-      <!-- Inline delete affordance, hover-revealed.  Sits to the
-           right of the name (rather than past the status badge)
-           so name + mutation control read as a single cluster
-           on the left of the row.  `opacity-0` at rest with a
-           200 ms ease-out fade-in on `group-hover/row` keeps
-           the resting row chrome-free; `pointer-events-none`
-           mirrors the opacity gate so the invisible target
-           can't be clicked through before hover.
-           `focus-visible:` reveals the button for keyboard
-           users without depending on mouse hover, and the
-           right-click context menu in CategoryList wires into
-           the same DeleteCategoryDialog so the touch /
-           keyboard / non-hover path is still served.
-           Mandatory categories ( `_background_noise_` ) still
-           render a `disabled` stub with a diagonal slash so
-           the operator gets the same visual rhythm across rows
-           on hover and learns the why (tooltip + slash). -->
+      <!-- Hover-revealed delete.  `opacity-0 + pointer-events-none`
+           at rest with a 200 ms fade-in on `group-hover/row` /
+           `focus-visible` keeps the resting row chrome-free without
+           losing the keyboard path; the right-click ContextMenu in
+           CategoryList wires the same DeleteCategoryDialog for the
+           touch/non-hover entry.  Mandatory categories
+           (`_background_noise_`) render a disabled stub with a
+           diagonal slash so the rhythm survives and the tooltip
+           explains why. -->
       {#if !isDeleting}
         <button
           type="button"
           onclick={onDeleteClick}
           disabled={isMandatory}
           aria-disabled={isMandatory}
-          class="pointer-events-none shrink-0 rounded-md p-1.5 opacity-0 transition duration-200 ease-out group-hover/row:pointer-events-auto group-hover/row:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-rose-200 focus-visible:outline-none"
+          class="pointer-events-none inline-flex shrink-0 items-center justify-center rounded-md p-1 opacity-0 transition duration-200 ease-out group-hover/row:pointer-events-auto group-hover/row:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-rose-200 focus-visible:outline-none"
           class:cursor-not-allowed={isMandatory}
           class:text-zinc-200={isMandatory}
           class:text-zinc-300={!isMandatory}
@@ -292,76 +287,34 @@
             <path d="M8 6V4h8v2" />
             <path d="M19 6l-1 14H6L5 6" />
             {#if isMandatory}
-              <!-- Diagonal slash from top-left to bottom-right of
-                   the icon's viewBox.  Drawn with a slight
-                   `stroke-width` lift so the line reads as an
-                   explicit prohibition mark rather than another
-                   trash-can stroke.  No special start / end offset
-                   -- the eye reads the through-line and the trash
-                   silhouette together as "no delete". -->
+              <!-- Prohibition slash over the trash glyph; the
+                   thicker stroke distinguishes it from the can's
+                   own strokes. -->
               <line x1="3" y1="3" x2="21" y2="21" stroke-width="2.5" />
             {/if}
           </svg>
         </button>
       {/if}
     </div>
-    <!-- Unified sync badge.  Single pill that conveys both quota
-         (enough samples / not) and daemon-side sync state.  Only
-         the "Synced" success state earns a leading icon -- a
-         check -- so the eye can pick out done categories at a
-         glance; every other state stays text-only to avoid
-         signalling competing affordances on a small chip.
-         Animation discipline:
-           - The icon slot collapses to `w-0` (and drops its
-             right margin) when the badge is in an iconless
-             state, so the text is geometrically centered in the
-             pill.  An always-reserved 10 px slot pushed every
-             iconless label ~7 px right of the badge centre,
-             which read as asymmetric horizontal padding -- the
-             collapse fixes that.  Both `width` and `margin-
-             right` transition at 200 ms ease-out so the badge
-             widens / narrows smoothly when the check arrives
-             or leaves; the snap that motivated the original
-             always-on slot is now absorbed by this transition
-             plus the text-wrapper's measurement-driven width
-             transition, which compose into one shape change.
-             Slot uses `overflow-hidden` so the icon is clipped
-             as the slot expands / collapses, visibly emerging
-             from (or retreating into) the slot's bounds rather
-             than hovering over neighbouring chrome.  The slot's
-             right gap rides as `mr-1` instead of the parent's
-             `gap-1` so it collapses together with the slot
-             width -- a parent gap would otherwise leave a 4 px
-             stub between a zero-width slot and the text.
-           - The text grid sits inside an explicit-width wrapper
-             whose `width` is driven by an off-screen mirror
-             (`measureEl`) of the current label.  CSS interpolates
-             that width between labels so the pill glides between
-             "Synced" (narrow) and "Not enough samples · Pending"
-             (wide).  Without it the wrapper would snap to the
-             wider label the moment the new span mounts (grow
-             case) or stay at the wider label until the old
-             span's out-fade completes and then snap inward
-             (shrink case) -- both read as a jolt mid-transition.
-             `justify-center` + `overflow-hidden` keep the
-             clipping symmetric while old and new briefly co-
-             occupy the cell.
-           - In + out fade durations match (180 ms) and run in
-             parallel so the swap reads as one crossfade -- not a
-             sequenced out-then-in pair.
-           - The icon keeps a scale-in (0.6 → 1, 240 ms) for the
-             "completion arriving" feel; `transform: scale` is a
-             paint-time transform so it doesn't perturb the
-             badge's layout width while it animates.
-           - Background + foreground colour cross-fade in 200 ms,
-             a touch longer than the content swap so the tone
-             change leads in slightly and the eye doesn't feel
-             the colour land before the label.  Width transition
-             matches at 200 ms so colour and shape settle
-             together a hair after the text crossfade. -->
+    <!-- Sync badge.  Animation discipline:
+           * Icon slot collapses width + right-margin to zero in the
+             iconless states, transitioning at 200 ms so the badge
+             widens/narrows in one motion; `overflow-hidden` clips
+             the check during the collapse so it emerges from the
+             slot, not the neighbouring chrome.  `mr-1` (instead of
+             the parent `gap-1`) so the gap collapses with the slot.
+           * Text wrapper carries an explicit width measured off-
+             screen from `measureEl`; the CSS width transition glides
+             between labels so the pill never snaps to the longest
+             label mid-swap.  `justify-center` + `overflow-hidden`
+             keep clipping symmetric while old/new spans co-occupy.
+           * Fade in/out match at 180 ms (single crossfade), check
+             scales 0.6→1 over 240 ms (paint-time transform, doesn't
+             perturb layout), colour cross-fades over 200 ms (leads
+             the content swap so tone settles with shape). -->
     {#if !isDeleting}
       <span
-        class="hidden shrink-0 items-center justify-center overflow-hidden rounded-full px-2 py-0.5 text-[10px] font-medium transition-[background-color,color] duration-200 ease-out sm:inline-flex"
+        class="hidden shrink-0 items-center justify-center overflow-hidden rounded-full px-1.5 py-0.5 text-[10px] font-medium transition-[background-color,color] duration-200 ease-out sm:inline-flex"
         class:bg-emerald-100={badge.tone === 'emerald'}
         class:text-emerald-800={badge.tone === 'emerald'}
         class:bg-amber-100={badge.tone === 'amber'}
@@ -370,16 +323,6 @@
         class:text-rose-800={badge.tone === 'rose'}
         title={badge.title}
       >
-        <!-- Icon slot.  Width + right-margin collapse to zero
-             when no icon is shown so the text wrapper can sit
-             flush at the centre of the badge; both properties
-             transition at the same 200 ms ease-out as the text
-             wrapper so the slot's collapse / expand composes
-             with the wrapper's resize into one motion.
-             `overflow-hidden` clips the icon while the slot is
-             narrower than 10 px so the check visibly emerges
-             from the slot's left edge rather than hovering
-             outside of it. -->
         <span
           class="inline-flex h-2.5 shrink-0 items-center justify-center overflow-hidden transition-[width,margin] duration-200 ease-out"
           class:w-2.5={badge.icon === 'check'}
@@ -407,13 +350,6 @@
             </span>
           {/if}
         </span>
-        <!-- Animated-width text wrapper.  `style:width` carries
-             the current label's measured width; the CSS
-             `transition: width` interpolates between labels so
-             the pill glides instead of snapping at the fade
-             boundaries.  The inner grid still stacks outgoing
-             and incoming spans in the same cell so they cross-
-             fade in place. -->
         <span
           class="inline-flex items-center justify-center overflow-hidden transition-[width] duration-200 ease-out"
           style:width={textWidth !== null ? `${textWidth}px` : 'auto'}
@@ -431,12 +367,9 @@
           </span>
         </span>
       </span>
-      <!-- Off-screen mirror used to measure the next label's
-           width for the wrapper's `transition: width`.  Fixed-
-           position + `invisible` takes it out of layout flow;
-           same `text-[10px] font-medium` as the visible label
-           so its measured width matches what the visible
-           wrapper would have at intrinsic size. -->
+      <!-- Off-screen mirror feeding `textWidth`.  Fixed + invisible
+           takes it out of flow; the typography MUST match the
+           visible label so the measured width is correct. -->
       <span
         bind:this={measureEl}
         aria-hidden="true"
@@ -447,7 +380,7 @@
     {/if}
     {#if isDeleting}
       <span
-        class="inline-flex shrink-0 items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-medium text-rose-700 capitalize"
+        class="inline-flex shrink-0 items-center gap-1 rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] font-medium text-rose-700 capitalize"
       >
         <Spinner class="h-2.5 w-2.5 text-rose-700" />
         deleting
@@ -465,50 +398,20 @@
     <div
       id="category-body-{category.name}"
       transition:slide={{ duration: 200, easing: cubicOut }}
-      class="border-t border-zinc-100 bg-zinc-50 px-4 py-4"
+      class="border-t border-zinc-100 bg-zinc-50 px-3 py-3"
     >
-      <!-- Two-pane layout: Input (B.3 + B.4) on the left, Slices
-           (B.4 list, B.5 spectrogram cards) on the right.  At md+
-           they sit side-by-side; below md they stack with the
-           Input pane on top so a touch operator records / imports
-           / slices first, then scrolls to see the slice list.
-           Default `items-stretch` (grid's default cross-axis
-           alignment) coupled with a stable `min-h-80` on the
-           grid is what keeps the dataset accordion still when a
-           freshly-sliced batch lands in the SlicePane: the
-           InputPane no longer "ratchets up" to match a growing
-           SlicePane because both panes already share the same
-           baseline height.  SlicePane's grid scrolls internally
-           past that baseline, so a 60-slice batch doesn't change
-           the row height at all.
-           Both panes carry their own `flex-1 min-h-0` discipline
-           internally (the InputPane on its waveform row, the
-           SlicePane on its `overflow-y-auto` slice grid) AND
-           both carry `contain: size` on their outer container.
-           The flex-1 pair lets internal chrome compress; the
-           size containment is what stops their content from
-           dragging the *grid track* taller than the floor in
-           the first place.  In particular the InputPane's
-           waveform `<canvas>` (DPR-sized via width/height attrs
-           for a crisp render) would otherwise contribute a 2:1
-           intrinsic aspect ratio to the track and lift the row
-           by ~80 px the instant a recording / draft mounted.
-           So the only thing that determines row height is this
-           floor: every other piece of vertical chrome (status
-           lines, error banners, the action button row, even an
-           action row wrapped to 2-3 lines on a narrow pane) is
-           absorbed by the flex-1 region's compression rather
-           than pushing the row taller.  Sized at 320 px (20 rem)
-           -- a 32 px trim from the prior 352 px floor.  In the
-           InputPane this leaves the waveform with ~180 px in
-           empty mode and ~90-110 px in error-heavy / imported-
-           from modes (the flex-1 absorbs whatever fixed chrome
-           is present).  The SlicePane gets ~250 px of grid
-           scroll space, which still holds 3 full rows of 64 px
-           cards plus gaps before the operator has to scroll.
-           Cutting deeper would start compressing the waveform
-           below visual readability or the slice grid to ≤ 2
-           visible rows -- both noticeable. -->
+      <!-- Two-pane layout (Input left, Slices right at md+; stacked
+           below md).  Fixed grid floor (`min-h-80` = 320 px) +
+           default `items-stretch` welds both panes to the same
+           baseline so a freshly-sliced batch never ratchets the row
+           taller -- the SlicePane scrolls internally instead.  The
+           panes' own `contain: size` is what enforces that:
+           without it, the waveform `<canvas>`'s 2:1 intrinsic
+           aspect ratio would lift the track ~80 px on every record
+           / draft state change.  320 px gives ~180 px of waveform
+           in empty mode and ~250 px of slice grid (3 rows of 64 px
+           cards + gaps); deeper cuts compress either past
+           readability. -->
       <div class="grid min-h-80 grid-cols-1 gap-3 md:grid-cols-2">
         <InputPane {workspaceId} {workspaceName} categoryName={category.name} />
         <SlicePane {workspaceId} categoryName={category.name} />

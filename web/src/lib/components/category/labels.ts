@@ -39,7 +39,7 @@ export const THRESHOLD_STANDARD = 10;
 //     operator who's working toward "training-ready" never hits
 //     the cap;
 //   - bound origin-quota growth.  Each slice carries an ~88 KB
-//     WAV blob in IDB plus a 96x64 plasma spectrogram blob URL;
+//     WAV blob in IDB plus a 96x64 spectrogram blob URL;
 //     at 200 slices a class is ~18 MB which is meaningful but not
 //     pathological;
 //   - signal "this is past diminishing returns".  More data is

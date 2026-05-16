@@ -1,6 +1,6 @@
 import { UploadPool } from '$lib/api/upload';
 import { fftRadix2, hannWindow } from './fft';
-import { buildPlasmaLut, magnitudeToPaletteIndex } from './palette';
+import { buildSpectrogramLut, magnitudeToPaletteIndex } from './palette';
 import { decodeCanonicalWavSync } from './wav-decode';
 import { getSliceBlob } from './slice-fetch';
 import type { SliceRecord } from '$lib/idb/db';
@@ -9,7 +9,7 @@ import type { SliceRecord } from '$lib/idb/db';
 //
 // Each canonical slice is 44 100 samples (1 s @ 44.1 kHz).  We
 // compute a Hann-windowed STFT (FFT 512, hop 256) → log-magnitude
-// → plasma-colormapped image and stash the PNG bytes as a blob URL
+// → colormapped image and stash the PNG bytes as a blob URL
 // keyed by slice id.  The blob URL is what `SliceCard.svelte`
 // drops into its `<img>` src.
 //
@@ -35,9 +35,13 @@ const FFT_SIZE = 512;
 const HOP_SIZE = 256;
 const FREQ_BINS = FFT_SIZE / 2 + 1; // 257 -- DC through Nyquist inclusive.
 
-// Card visible size at desktop (px); spectrogram renders into this
-// exact pixel grid so the `<img>` tag doesn't pay for in-browser
-// upscaling.  Matches the grid template in `SlicePane.svelte`.
+// Canonical asset size (px) for the spectrogram PNG.  3:2 ratio
+// matches the SliceCard's `aspect-3/2`; the rendered card width is
+// now fluid (SlicePane's grid is `repeat(auto-fill, minmax(96px,
+// 1fr))`), so at typical pane widths the cell is 100-125 px and
+// the `<img>` rides the browser's default bilinear upscale (2-15 %,
+// well below the band where blur is perceptible).  96 is the cell
+// minimum, not a 1:1 display size.
 const CARD_WIDTH = 96;
 const CARD_HEIGHT = 64;
 
@@ -72,16 +76,11 @@ const generatePool = new UploadPool(MAX_CONCURRENT_SPECTROGRAMS);
 // `SpectrogramCanvas`.
 const HANN_512 = hannWindow(FFT_SIZE);
 
-// 256-entry plasma LUT shared with the dashboard's live
-// `SpectrogramCanvas`.  Both surfaces sample the same colour ramp,
-// so a 4 kHz energy peak that reads as a bright-yellow band on a
-// slice card reads as a bright-yellow band on the dashboard's
-// live spectrogram too -- the operator's eye picks up the
-// correspondence without having to re-calibrate between surfaces.
-// 256 entries is enough resolution at 96×64 (the eye can't tell
-// a 256-step LUT from a continuous gradient at thumbnail scale).
+// 256-entry LUT shared with `SpectrogramCanvas` — the cross-surface
+// colour invariant.  256 steps are indistinguishable from a
+// continuous gradient at thumbnail scale.
 const PALETTE_N = 256;
-const PALETTE = buildPlasmaLut(PALETTE_N);
+const PALETTE = buildSpectrogramLut(PALETTE_N);
 
 // Cache of blob: URLs keyed by slice id.  We dedup concurrent
 // generation via the `inflight` map so two simultaneous renders
@@ -265,9 +264,7 @@ async function generate(slice: SliceRecord): Promise<string> {
     );
     for (let x = 0; x < CARD_WIDTH; x++) {
       const frameIdx = Math.min(frames - 1, Math.floor((x / CARD_WIDTH) * frames));
-      // Shared helper -- identical mapping is what guarantees a
-      // 4 kHz energy peak that reads as bright yellow on a slice
-      // card reads as bright yellow on the live dashboard too.
+      // Shared helper — same dB → index map as the live dashboard.
       const pi = magnitudeToPaletteIndex(magnitudes[frameIdx * FREQ_BINS + freqIdx], PALETTE_N);
       const src = pi * 3;
       const p = (y * CARD_WIDTH + x) * 4;
@@ -279,9 +276,8 @@ async function generate(slice: SliceRecord): Promise<string> {
   }
 
   ctx.putImageData(imageData, 0, 0);
-  // PNG keeps the colormap discrete; JPEG would soft-blur the
-  // narrow plasma bands.  PNG @ 96×64 is ~3-4 KB; 100 slices = ~400 KB
-  // of cached image bytes per workspace.  Tolerable.
+  // PNG keeps narrow palette bands crisp; JPEG would soft-blur them.
+  // ~3-4 KB per slice, ~400 KB per 100-slice workspace — tolerable.
   const blob = await canvas.convertToBlob({ type: 'image/png' });
   return URL.createObjectURL(blob);
 }
