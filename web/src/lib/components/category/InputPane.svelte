@@ -1598,6 +1598,17 @@
     <span class="text-[11px] text-amber-700"> Auto-stopped at the duration cap. </span>
   {/if}
 
+  <!-- Recorder / generic error chips.  Both share the same
+       alert chrome (`px-3 py-2`, rose-50 on rose-200) and the
+       same dismiss button with `-mt-1 -mr-2`: the asymmetric
+       negative margins compensate for the alert's asymmetric
+       padding so the visible gap from the X to BOTH the top
+       and right edges is the same 4 px (px-3 − mr-2 = 4 and
+       py-2 − mt-1 = 4).  Same geometry rule as the
+       training-area dismisses in TrainPane / HeadsList; a
+       symmetric `-m-1` would leave the right gap at 8 px
+       while the top sat at 4 px, which reads as the button
+       hugging the top more than the side. -->
   {#if recorderError}
     <div
       class="flex items-start justify-between gap-2 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-900"
@@ -1606,7 +1617,7 @@
       <span class="min-w-0 flex-1">{recorderError}</span>
       <button
         type="button"
-        class="shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
+        class="-mt-1 -mr-2 shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
         onclick={dismissError}
         aria-label="Dismiss"
       >
@@ -1632,7 +1643,7 @@
       <span class="min-w-0 flex-1">{error}</span>
       <button
         type="button"
-        class="shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
+        class="-mt-1 -mr-2 shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
         onclick={() => (error = null)}
         aria-label="Dismiss"
       >

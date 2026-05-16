@@ -181,11 +181,17 @@
         </p>
         <p class="mt-0.5 wrap-break-word text-rose-800">{activateError.message}</p>
       </div>
+      <!-- Dismiss button.  `-mt-1 -mr-2` compensates for the
+           alert's asymmetric `px-3 py-2` padding so the visible
+           gap from the button to both the top and right edges
+           is the same 4 px.  Matches the sibling start-error
+           dismiss in TrainPane so the two training-area
+           error chips read as one family. -->
       <button
         type="button"
         onclick={dismissActivateError}
         aria-label="Dismiss"
-        class="-mt-1 -mr-1 shrink-0 rounded-md p-1 text-rose-500 transition hover:bg-white/60 hover:text-rose-900"
+        class="-mt-1 -mr-2 shrink-0 rounded-md p-1 text-rose-500 transition hover:bg-white/60 hover:text-rose-900"
       >
         <svg viewBox="0 0 16 16" fill="currentColor" class="h-3.5 w-3.5" aria-hidden="true">
           <path

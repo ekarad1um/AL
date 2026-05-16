@@ -11,7 +11,6 @@
     MANDATORY_BACKGROUND_NOISE,
     thresholdFor
   } from '$lib/components/category/labels';
-  import { formatRelative } from '$lib/utils/time';
   import TrainForm from './TrainForm.svelte';
   import TrainHistory from './TrainHistory.svelte';
   import {
@@ -79,15 +78,17 @@
   interface Props {
     workspaceId: Uuid;
     // Live workspace revision (max of detail.workspace_revision.id
-    // and any upload receipt the slices store has seen).  Used
-    // for the smart subtitle and the "Re-train" button-label
-    // morph when a head already matches this revision.
-    // Activation lives in the Heads section below; no per-row
-    // Activate affordance is exposed inside the train history.
-    // Named `liveRevision` to match the sibling HeadsList /
-    // HeadCard prop -- both refer to the same upload-receipt-
-    // promoted number so a uniform name avoids re-aligning the
-    // mental model at each call site.
+    // and any upload receipt the slices store has seen).  Drives
+    // the "Re-train" button-label morph: when a head already
+    // matches this revision, `currentHead` is non-null, the
+    // button state becomes `idle_trained`, and the label flips
+    // from "Train head" to "Re-train".  Activation lives in the
+    // Heads section below; no per-row Activate affordance is
+    // exposed inside the train history.  Named `liveRevision`
+    // to match the sibling HeadsList / HeadCard prop -- both
+    // refer to the same upload-receipt-promoted number so a
+    // uniform name avoids re-aligning the mental model at each
+    // call site.
     liveRevision: number;
     heads: readonly HeadRecord[];
   }
@@ -101,12 +102,13 @@
     trainingStore.active !== null && trainingStore.active.workspaceId !== workspaceId
   );
 
-  // ── Smart-suggestion derivation (subtitle hint only) ─────────
+  // ── Current-head derivation (Re-train button morph) ─────────
   //
-  // Earlier this drove an inline banner; now we use it only to
-  // morph the primary button label from "Train head" to "Re-train"
-  // when a current head already exists.  Activation itself is
-  // owned by the Heads section below the pane.
+  // Earlier this drove an inline suggestion banner; now we use
+  // it only to morph the primary button label from "Train head"
+  // to "Re-train" when a head already matches the live revision.
+  // Activation itself is owned by the Heads section below the
+  // pane.
 
   const currentHead = $derived.by(() => {
     if (heads.length === 0) return null;
@@ -329,27 +331,27 @@
 
   // ── Subtitle ─────────────────────────────────────────────────
   //
-  // Single line under the title.  Morphs by precedence to
-  // describe the pane's current invariant.  Same precedence as
-  // the button state so the subtitle and the action are
-  // describing the same situation.  Width is intentionally
-  // capped at the title's column so a long readiness reason
-  // wraps onto a second line WITHIN the title's slot rather
-  // than running under the right-side action button.
+  // Single line under the title, stable across the run
+  // lifecycle.  The training-active state intentionally does
+  // NOT change this text -- a per-tick "started 3s ago" morph
+  // would tick up every poll (visual noise) and duplicate the
+  // live history row's own "started X" timestamp; the header
+  // button + history-row chrome already represent the running
+  // state (button morphs to Cancel, row gets a blue left-border
+  // and a pulsing state word).  The only branches here are the
+  // dataset-readiness gate (amber reason when the dataset can't
+  // support training) and the cross-workspace busy interlock
+  // (amber notice when another workspace owns the global train
+  // slot).  Width is capped at the title's column so a long
+  // readiness reason wraps onto a second line WITHIN the
+  // title's slot rather than running under the right-side
+  // action button.
 
   const subtitle = $derived.by(() => {
-    if (active?.view?.state === 'running') {
-      const startedAt = active.view.started_at;
-      return `Training in progress · started ${formatRelative(startedAt)}`;
-    }
-    if (active) return 'Submitting training request…';
     if (otherWorkspaceRunning) {
       return 'Another workspace is training; only one job runs at a time.';
     }
-    if (readiness.kind === 'loading') {
-      return "Tune a head on this workspace's dataset, then activate it for live inference.";
-    }
-    if (readiness.kind !== 'ready') {
+    if (readiness.kind !== 'loading' && readiness.kind !== 'ready') {
       return readinessReason(readiness);
     }
     return "Tune a head on this workspace's dataset, then activate it for live inference.";
@@ -358,9 +360,11 @@
   // Tone for the subtitle.  Amber when surfacing a readiness /
   // busy obstacle; default zinc otherwise.  The colour echoes
   // the disabled state of the primary button without an extra
-  // affordance.
-  const subtitleTone = $derived.by<'zinc' | 'amber' | 'blue'>(() => {
-    if (active) return 'blue';
+  // affordance.  No 'blue' variant: the active-training state
+  // is signalled by the header button (morphs to Cancel /
+  // destructive variant) and the live history row's blue
+  // left-border, not by the subtitle.
+  const subtitleTone = $derived.by<'zinc' | 'amber'>(() => {
     if (otherWorkspaceRunning) return 'amber';
     if (readiness.kind === 'loading' || readiness.kind === 'ready') return 'zinc';
     return 'amber';
@@ -406,13 +410,15 @@
 
 <section class="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm">
   <!-- Header.  Title block on the left (with subtitle that
-       morphs to carry readiness / busy / running state),
-       primary action on the right.  The header's geometry is
-       independent of the body below: the body's height changes
-       drive no layout in this row.  `items-center` anchors the
-       button to the title block's vertical centroid so it
-       remains visually balanced with both the title and the
-       subtitle when the subtitle wraps to two or more lines. -->
+       carries the dataset-readiness / cross-workspace busy
+       state -- but stays stable across this workspace's own
+       training lifecycle), primary action on the right.  The
+       header's geometry is independent of the body below:
+       the body's height changes drive no layout in this row.
+       `items-center` anchors the button to the title block's
+       vertical centroid so it remains visually balanced with
+       both the title and the subtitle when the subtitle wraps
+       to two or more lines. -->
   <header class="mb-4 flex items-center justify-between gap-3">
     <div class="min-w-0">
       <h2 class="text-sm font-semibold text-zinc-900">Train</h2>
@@ -420,7 +426,6 @@
         class="mt-0.5 text-xs"
         class:text-zinc-500={subtitleTone === 'zinc'}
         class:text-amber-700={subtitleTone === 'amber'}
-        class:text-blue-700={subtitleTone === 'blue'}
       >
         {subtitle}
       </p>
@@ -464,11 +469,19 @@
         <p class="font-medium text-rose-900">Could not start training</p>
         <p class="mt-0.5 wrap-break-word text-rose-800">{trainingStore.startError}</p>
       </div>
+      <!-- Dismiss button.  `-mt-1 -mr-2` is sized to compensate
+           for the alert's asymmetric `px-3 py-2` padding so the
+           visible gap from the button to BOTH the alert's top
+           and right edges is the same 4 px (px-3 − mr-2 = 4 and
+           py-2 − mt-1 = 4).  A symmetric pair like `-m-1` would
+           leave the right gap at 8 px while the top sat at 4 px,
+           which read as the button hugging the top more tightly
+           than the side -- visible asymmetry on a small chip. -->
       <button
         type="button"
         onclick={dismissStartError}
         aria-label="Dismiss"
-        class="-mr-1 -mt-1 shrink-0 rounded-md p-1 text-rose-500 transition hover:bg-white/60 hover:text-rose-900"
+        class="-mt-1 -mr-2 shrink-0 rounded-md p-1 text-rose-500 transition hover:bg-white/60 hover:text-rose-900"
       >
         <svg viewBox="0 0 16 16" fill="currentColor" class="h-3.5 w-3.5" aria-hidden="true">
           <path

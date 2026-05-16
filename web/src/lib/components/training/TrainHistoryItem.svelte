@@ -1,7 +1,6 @@
 <script lang="ts">
   import { slide } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
-  import Button from '$lib/components/ui/Button.svelte';
   import JobProgress from './JobProgress.svelte';
   import { formatRelative } from '$lib/utils/time';
   import { STAGE_LABEL, TRAINING_STATE_LABEL } from './labels';
@@ -21,23 +20,35 @@
   // border accent, 4 px), one inline state word (coloured to
   // match), one timestamp, and a small trailing detail strip
   // (running progress hint OR final metric).  No per-row
-  // Activate / dismiss affordances -- the heads list below
-  // owns activation, and `Clear finished` at the section
-  // header owns bulk delete.  Removing those two trailing
-  // buttons reclaims the right gutter so the header reads as
-  // pure run metadata rather than action+metadata cohabiting
-  // one row.
+  // affordances of any kind -- the TrainPane header's primary
+  // button owns the full Train / Cancel / Re-train state
+  // machine, the heads list below owns activation, and the
+  // daemon's storage reaper owns retention.  Rows are purely
+  // observational, which keeps the live-vs-terminal visual
+  // rhythm identical: blue left-border + pulsing state word
+  // for the live entry, otherwise the row's chrome is the
+  // same.  Earlier revisions stacked a small destructive
+  // Cancel button on the right of the live row, which clashed
+  // with the header's destructive Cancel (two red buttons in
+  // close proximity, both bound to the same `store.cancel()`)
+  // and contradicted the module's "training-history rows are
+  // purely observational" rule -- per TrainPane's docblock,
+  // the same rule is why Activate isn't surfaced per-row
+  // either (the heads list below owns head actions).
   //
   // ## Header invariant
   //
-  // The header is a single fixed-height row (with allowed wrap
-  // on narrow viewports).  No element show/hide causes a
-  // height jump bigger than one wrap line: state word,
-  // timestamp, and trailing detail are present in every
-  // state.  The chevron rotates rather than swapping glyphs.
-  // The only right-side affordance is the live-only Cancel
-  // button, which slot-collapses away on terminal transitions
-  // without shifting the row's vertical rhythm.
+  // The header is a single row (with allowed flex-wrap on
+  // narrow viewports).  Chevron, state word, and time label
+  // render in every state; trailing-detail tokens mount and
+  // unmount with the lifecycle (none during pre-ack
+  // `submitting`, one for `running` / `failed` / `cancelled`,
+  // zero-to-two for `completed`) but `flex-wrap` absorbs the
+  // count delta within the same baseline -- no row-height
+  // jump bigger than one wrap line.  The chevron rotates
+  // rather than swapping glyphs, so the dominant lifecycle
+  // transitions (submitting → running → terminal) read as a
+  // colour + text morph on stable node identities.
   //
   // ## Body
   //
@@ -59,25 +70,17 @@
     // transition even when the item's source moves from
     // `store.active` to `store.history`.
     expanded: boolean;
-    // Cancel handler for the live entry.  Omitted for
-    // terminal entries.  Rendered as a small destructive
-    // button on the right of the header.  Receiving this prop
-    // means the parent already gates on "this is the live
-    // entry" so we don't need to re-check `isLive` before
-    // wiring the click.
-    oncancel?: () => Promise<void>;
     // Notify the parent that the chevron / header was clicked
     // so it can toggle `expanded`.  We don't own that state
     // here; see the props doc above.
     ontoggle: () => void;
     // True when this entry is the currently-active run (the
     // top of the list).  Drives the pulsing affordance on the
-    // state word and the Cancel button visibility.  The
-    // active job's view may be null (pre-ack) or `view.state
-    // === 'running'` (post-ack, pre-terminal).
+    // state word.  The active job's view may be null (pre-ack)
+    // or `view.state === 'running'` (post-ack, pre-terminal).
     isLive: boolean;
   }
-  let { job, expanded, oncancel, ontoggle, isLive }: Props = $props();
+  let { job, expanded, ontoggle, isLive }: Props = $props();
 
   // Display state.  `view === null` is the just-submitted, pre-
   // first-poll window -- treat it as 'submitting' rather than
@@ -194,18 +197,6 @@
     // left-border accent, so the header copy is identical.
     return [`stopped at ${STAGE_LABEL[v.progress.phase].toLowerCase()}`];
   });
-
-  let cancelling = $state(false);
-  async function onCancelClick(e: MouseEvent): Promise<void> {
-    e.stopPropagation();
-    if (!oncancel || cancelling || job.cancelling) return;
-    cancelling = true;
-    try {
-      await oncancel();
-    } finally {
-      cancelling = false;
-    }
-  }
 </script>
 
 <!-- One row.  A 4 px coloured left border is the only edge
@@ -223,18 +214,22 @@
   class:border-l-rose-500={displayState === 'failed'}
   class:border-l-zinc-400={displayState === 'cancelled'}
 >
-  <!-- Header.  Clicking anywhere on the header (excluding the
-       live-only Cancel button) toggles `expanded` via the
-       parent.  The chevron is a child of the toggle button so
-       the entire header is one keyboard focus target. -->
-  <div class="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2.5">
-    <button
-      type="button"
-      onclick={ontoggle}
-      aria-expanded={expanded}
-      class="flex min-w-0 flex-1 items-center gap-2.5 text-left"
-    >
-      <!-- Optical micro-alignment.  Two facts compound:
+  <!-- Header.  A single full-width toggle button: the row's
+       entire footprint is the disclosure target, the chevron
+       sits inside it so chevron + label share one keyboard
+       focus stop.  No right-side affordances render here in
+       any state -- the TrainPane header owns Cancel for the
+       live entry, so no flex wrapper is needed to host a
+       trailing sibling.  Padding lives on the button rather
+       than on a parent wrapper so the click target hits the
+       full padded box, not just the inner ink. -->
+  <button
+    type="button"
+    onclick={ontoggle}
+    aria-expanded={expanded}
+    class="flex w-full items-center gap-2.5 px-3 py-2.5 text-left"
+  >
+    <!-- Optical micro-alignment.  Two facts compound:
              1. The chevron path occupies y=5.23..12.71 of
                 its 0-20 viewBox, putting its visual centre
                 ~0.72 px ABOVE the SVG box centre.
@@ -261,22 +256,22 @@
            don't fight; the conditional translate simply
            appears/disappears as the disclosure toggles, and
            the rotate animates independently. -->
-      <svg
-        viewBox="0 0 20 20"
-        fill="currentColor"
-        aria-hidden="true"
-        class="h-3.5 w-3.5 shrink-0 text-zinc-400 transition-transform duration-200"
-        class:translate-y-px={!expanded}
-        class:rotate-90={expanded}
-      >
-        <path
-          fill-rule="evenodd"
-          d="M7.21 5.23a.75.75 0 011.06.02L12 9l-3.73 3.71a.75.75 0 11-1.06-1.06L9.94 9 7.19 6.29a.75.75 0 01.02-1.06z"
-          clip-rule="evenodd"
-        />
-      </svg>
+    <svg
+      viewBox="0 0 20 20"
+      fill="currentColor"
+      aria-hidden="true"
+      class="h-3.5 w-3.5 shrink-0 text-zinc-400 transition-transform duration-200"
+      class:translate-y-px={!expanded}
+      class:rotate-90={expanded}
+    >
+      <path
+        fill-rule="evenodd"
+        d="M7.21 5.23a.75.75 0 011.06.02L12 9l-3.73 3.71a.75.75 0 11-1.06-1.06L9.94 9 7.19 6.29a.75.75 0 01.02-1.06z"
+        clip-rule="evenodd"
+      />
+    </svg>
 
-      <!-- Inline header line.  Three slots:
+    <!-- Inline header line.  Three slots:
              {state}  {time} · {trailing detail tokens}
            A faint zinc-300 middot separates the trailing detail
            cluster from the {state, time} pair so the eye reads
@@ -287,52 +282,30 @@
            detail stay neutral so a row never reads as a colour
            stripe.  `animate-pulse` rides on the state word for
            live entries (no separate dot element). -->
-      <span class="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs">
-        <span
-          class="shrink-0 font-medium capitalize"
-          class:text-blue-700={displayState === 'running' || displayState === 'submitting'}
-          class:animate-pulse={isLive}
-          class:text-emerald-700={displayState === 'completed'}
-          class:text-rose-700={displayState === 'failed'}
-          class:text-zinc-600={displayState === 'cancelled'}
-        >
-          {stateLabel}
-        </span>
-        <span class="shrink-0 text-zinc-500" title={timeTitle}>
-          {timeLabel}
-        </span>
-        {#if trailingDetail.length > 0}
-          <span aria-hidden="true" class="shrink-0 text-zinc-300">·</span>
-        {/if}
-        {#each trailingDetail as token (token)}
-          <span class="shrink-0 font-mono text-[11px] tabular-nums text-zinc-500">
-            {token}
-          </span>
-        {/each}
+    <span class="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs">
+      <span
+        class="shrink-0 font-medium capitalize"
+        class:text-blue-700={displayState === 'running' || displayState === 'submitting'}
+        class:animate-pulse={isLive}
+        class:text-emerald-700={displayState === 'completed'}
+        class:text-rose-700={displayState === 'failed'}
+        class:text-zinc-600={displayState === 'cancelled'}
+      >
+        {stateLabel}
       </span>
-    </button>
-
-    <!-- Live-only Cancel button.  Stops propagation so the
-         click doesn't toggle the disclosure underneath.  This
-         is the only right-side affordance any state of the
-         row exposes — Activate moved to the Heads section
-         below and per-row delete folded into the "Clear
-         finished" section header action. -->
-    {#if isLive && oncancel}
-      <div class="flex shrink-0 items-center">
-        <Button
-          size="sm"
-          variant="destructive"
-          onclick={onCancelClick}
-          loading={cancelling || job.cancelling}
-          disabled={job.view === null}
-          title="Cancel this training job at the next checkpoint."
-        >
-          {cancelling || job.cancelling ? 'Cancelling…' : 'Cancel'}
-        </Button>
-      </div>
-    {/if}
-  </div>
+      <span class="shrink-0 text-zinc-500" title={timeTitle}>
+        {timeLabel}
+      </span>
+      {#if trailingDetail.length > 0}
+        <span aria-hidden="true" class="shrink-0 text-zinc-300">·</span>
+      {/if}
+      {#each trailingDetail as token (token)}
+        <span class="shrink-0 font-mono text-[11px] tabular-nums text-zinc-500">
+          {token}
+        </span>
+      {/each}
+    </span>
+  </button>
 
   <!-- Expanded body: the existing JobProgress component (phase
        strip, progress bar, metrics chart, readout, log

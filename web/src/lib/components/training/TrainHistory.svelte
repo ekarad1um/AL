@@ -186,14 +186,17 @@
   }
 
   // ── Action handlers ─────────────────────────────────────────
-
-  async function onCancelActive(): Promise<void> {
-    try {
-      await trainingStore.cancel();
-    } catch {
-      // Store logs the failure; the item re-enables itself.
-    }
-  }
+  //
+  // Cancel is intentionally NOT routed through here.  The
+  // TrainPane header's primary button morphs to Cancel on the
+  // running state (variant=destructive, single canonical
+  // action surface for the run lifecycle), so duplicating the
+  // affordance per-row would render two red Cancel buttons on
+  // screen at the same time -- competing for attention and
+  // splitting the operator's mental model of "where do I stop
+  // this run."  The header is also the slot the operator
+  // already used to start the job, so the eye doesn't need to
+  // re-anchor when the action flips polarity.
 
   function onToggleOlder(): void {
     trainingStore.setOlderExpanded(workspaceId, !olderExpanded);
@@ -285,7 +288,6 @@
           isLive={active?.jobId === job.jobId}
           expanded={expanded.has(job.jobId)}
           ontoggle={() => toggle(job.jobId)}
-          oncancel={active?.jobId === job.jobId ? onCancelActive : undefined}
         />
       {/each}
       {#if showEagerSkeletons}
