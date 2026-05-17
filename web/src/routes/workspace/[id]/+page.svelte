@@ -7,7 +7,7 @@
   import { workspaces as wsStore } from '$lib/stores/workspaces.svelte';
   import { errorCopy, isNotFound } from '$lib/utils/error-copy';
   import type { WorkspaceDetail } from '$lib/api/types';
-  import Spinner from '$lib/components/Spinner.svelte';
+  import LoadingRow from '$lib/components/LoadingRow.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import EmptyState from '$lib/components/ui/EmptyState.svelte';
   import InlineName from '$lib/components/ui/InlineName.svelte';
@@ -266,10 +266,7 @@
 </nav>
 
 {#if loading && !detail}
-  <div class="flex items-center gap-2 px-1 py-12 text-xs text-zinc-500">
-    <Spinner />
-    <span>loading workspace…</span>
-  </div>
+  <LoadingRow label="loading workspace…" />
 {:else if notFound}
   <EmptyState
     title="Workspace not found"

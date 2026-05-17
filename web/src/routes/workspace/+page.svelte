@@ -4,7 +4,7 @@
   import { workspaces, MAX_WORKSPACES } from '$lib/stores/workspaces.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import EmptyState from '$lib/components/ui/EmptyState.svelte';
-  import Spinner from '$lib/components/Spinner.svelte';
+  import LoadingRow from '$lib/components/LoadingRow.svelte';
   import PlusIcon from '$lib/components/ui/PlusIcon.svelte';
   import TrashIcon from '$lib/components/ui/TrashIcon.svelte';
   import ContextMenu, { type MenuSection } from '$lib/components/ui/ContextMenu.svelte';
@@ -238,10 +238,7 @@
 </header>
 
 {#if !workspaces.loaded}
-  <div class="flex items-center gap-2 px-1 py-12 text-xs text-zinc-500">
-    <Spinner />
-    <span>loading…</span>
-  </div>
+  <LoadingRow label="loading workspaces…" />
 {:else if workspaces.error && workspaces.entries.length === 0}
   <div
     class="flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs"

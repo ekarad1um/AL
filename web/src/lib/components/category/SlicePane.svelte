@@ -6,6 +6,7 @@
   import { thresholdFor } from './labels';
   import SliceCard from './SliceCard.svelte';
   import Spinner from '$lib/components/Spinner.svelte';
+  import LoadingRow from '$lib/components/LoadingRow.svelte';
   import Tips from '$lib/components/ui/Tips.svelte';
   import ContextMenu, {
     type MenuItem,
@@ -1005,10 +1006,7 @@
   </header>
 
   {#if !list.loaded}
-    <div class="flex flex-1 items-center gap-2 text-xs text-zinc-500">
-      <Spinner />
-      <span>loading slices…</span>
-    </div>
+    <LoadingRow size="fill" label="loading slices…" />
   {:else if list.error && list.entries.length === 0}
     <div
       class="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900"

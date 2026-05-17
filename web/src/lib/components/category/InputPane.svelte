@@ -169,19 +169,57 @@
   // `getUserMedia` from the recorder so a mic unplugged between
   // sessions degrades silently to the system default instead of
   // throwing.
+  //
+  // Stored shape:
+  //   - ''                                  → system default mic
+  //   - ':stream'                           → daemon opus stream
+  //   - '<deviceId>' (bare, legacy)         → that mic by raw id
+  //   - '{"id":...,"label":...,"groupId":...}'
+  //                                         → that mic + metadata
+  //                                           for cross-session
+  //                                           re-match
+  //
+  // Why the JSON form: browser `deviceId` is stable per-origin
+  // only AFTER mic permission persists, and Firefox / Safari
+  // rotate it between sessions when the permission isn't kept.
+  // Capturing `groupId` (stable per physical device) and `label`
+  // (human-readable) lets us re-attach the operator's chosen mic
+  // when the opaque id has rotated, instead of silently degrading
+  // to system default each session.
 
   type InputSource = { kind: 'mic'; deviceId: string } | { kind: 'stream' };
+  interface SavedSource {
+    id: string;
+    label?: string;
+    groupId?: string;
+  }
 
   const SOURCE_STORAGE_KEY = 'acoustics-lab:input-device-id';
   const STREAM_KEY = ':stream';
 
-  function readSavedKey(): string {
-    if (typeof window === 'undefined') return '';
+  function readSaved(): SavedSource {
+    if (typeof window === 'undefined') return { id: '' };
+    let raw: string | null = null;
     try {
-      return localStorage.getItem(SOURCE_STORAGE_KEY) ?? '';
+      raw = localStorage.getItem(SOURCE_STORAGE_KEY);
     } catch {
       // Private-mode / quota exceptions -- treat as no preference.
-      return '';
+      return { id: '' };
+    }
+    if (!raw) return { id: '' };
+    // Backward-compat: any value that isn't a JSON object is read
+    // as a bare deviceId / sentinel.  `:stream` and a bare opaque
+    // id both flow through this branch.
+    if (!raw.startsWith('{')) return { id: raw };
+    try {
+      const p = JSON.parse(raw) as Partial<SavedSource>;
+      return {
+        id: typeof p.id === 'string' ? p.id : '',
+        ...(typeof p.label === 'string' && p.label ? { label: p.label } : {}),
+        ...(typeof p.groupId === 'string' && p.groupId ? { groupId: p.groupId } : {})
+      };
+    } catch {
+      return { id: '' };
     }
   }
 
@@ -189,22 +227,84 @@
     return key === STREAM_KEY ? { kind: 'stream' } : { kind: 'mic', deviceId: key };
   }
 
+  // `initialSaved` carries the recovery target loaded from storage
+  // at mount: the deviceId we'd like to re-attach to, plus the
+  // groupId / label fallback metadata for cross-session id
+  // rotation (Firefox / Safari) and mid-session unplug→replug.
+  //
+  // It's kept alive across successful matches *and* failed matches
+  // -- a match might be lost by an unplug later in the session,
+  // and a replug then needs the same metadata to re-attach.  It's
+  // nulled in exactly two places:
+  //   - `onPickInputSource` (operator explicitly picked something
+  //     else, so the stored target no longer represents intent);
+  //   - the no-recovery-target branch of `refreshDevices` (saved
+  //     id was empty or the stream sentinel -- nothing to recover).
+  //
+  // Reactive so the "(remembered) …" phantom option in the dropdown
+  // re-renders when the resolve nulls it.
+  let initialSaved = $state<SavedSource | null>(readSaved());
+
   let audioInputs = $state<MediaDeviceInfo[]>([]);
-  let selectedKey = $state<string>(readSavedKey());
+  // `untrack` because we read the saved value once at construction
+  // and don't want `selectedKey` to silently re-derive when
+  // `initialSaved` later nulls itself after a successful resolve.
+  let selectedKey = $state<string>(untrack(() => initialSaved?.id ?? ''));
   const selectedSource = $derived<InputSource>(asSource(selectedKey));
 
-  // Persist the selection.  An empty `selectedKey` (system-default
-  // mic) clears the entry so the storage doesn't fossilise an
-  // empty string forever; any other key (specific mic id or the
-  // stream sentinel) is written through verbatim.
+  // Persist the current selection, capturing the active device's
+  // label + groupId when the enumeration is labeled.  Re-fires on
+  // `selectedKey`, `audioInputs`, and `initialSaved` (the last
+  // dep is conditional -- only read inside the `!k` branch via
+  // Svelte 5's dynamic dep tracking, so non-empty-key transitions
+  // don't churn the effect on `initialSaved` changes).
+  //
+  // The post-permission refresh promotes a bare-id entry to the
+  // metadata-rich JSON form.  Three guards keep state intact:
+  //   - skip the storage write when the resolved next form
+  //     already matches byte-for-byte (no-op);
+  //   - never overwrite an existing JSON entry with a bare id
+  //     for the same id, so a re-mount that hasn't yet been
+  //     granted permission can't strip the cross-session
+  //     metadata;
+  //   - never `removeItem` while a recovery target is still
+  //     in flight (`initialSaved` non-null) -- an unplug
+  //     mid-session sets selectedKey='' but the storage entry
+  //     must survive so the next `devicechange` (replug) can
+  //     re-attach via groupId/label, and the next session can
+  //     resume on a machine where the device is present.
   $effect(() => {
     const k = selectedKey;
     if (typeof window === 'undefined') return;
     try {
-      if (k) localStorage.setItem(SOURCE_STORAGE_KEY, k);
-      else localStorage.removeItem(SOURCE_STORAGE_KEY);
+      if (!k) {
+        if (!initialSaved) {
+          localStorage.removeItem(SOURCE_STORAGE_KEY);
+        }
+        return;
+      }
+      if (k === STREAM_KEY) {
+        localStorage.setItem(SOURCE_STORAGE_KEY, STREAM_KEY);
+        return;
+      }
+      const d = audioInputs.find((x) => x.deviceId === k);
+      const next =
+        d && (d.label || d.groupId)
+          ? JSON.stringify({
+              id: k,
+              ...(d.label ? { label: d.label } : {}),
+              ...(d.groupId ? { groupId: d.groupId } : {})
+            })
+          : k;
+      const current = localStorage.getItem(SOURCE_STORAGE_KEY);
+      if (current === next) return;
+      if (current?.startsWith('{') && !next.startsWith('{')) {
+        const parsed = JSON.parse(current) as Partial<SavedSource>;
+        if (parsed.id === k) return; // would strip metadata for the same id
+      }
+      localStorage.setItem(SOURCE_STORAGE_KEY, next);
     } catch {
-      /* Best-effort -- ignore quota / private-mode failures. */
+      /* Best-effort -- ignore quota / private-mode / parse failures. */
     }
   });
 
@@ -213,6 +313,17 @@
   // can still surface a missing `mediaDevices` (e.g. insecure
   // context); we guard for that one specifically and bail without
   // a console error if so.
+  //
+  // Reconciliation is gated on a *labeled* enumeration -- pre-
+  // permission browsers return one anonymous placeholder entry,
+  // and the old "clear if id not in list" logic would treat that
+  // as proof the saved mic was gone and wipe the persisted
+  // preference on every cold visit.  Once labels populate (after
+  // the first `getUserMedia` grant, or because permission already
+  // persisted on this origin), we try id → groupId → label in
+  // turn so a Firefox / Safari per-session deviceId rotation
+  // re-attaches by physical identity instead of degrading to the
+  // system default.
   async function refreshDevices(): Promise<void> {
     const md = navigator.mediaDevices as MediaDevices | undefined;
     if (!md) {
@@ -222,22 +333,64 @@
     try {
       const all = await md.enumerateDevices();
       audioInputs = all.filter((d) => d.kind === 'audioinput');
-      // Drop a stale persisted mic id silently.  Stream selections
-      // survive a disconnected daemon -- `audioStatus` reactivity
-      // disables the Record button until the socket reopens, then
-      // the same selection works again -- but a vanished mic has
-      // no equivalent return path, and the recorder's `ideal`
-      // constraint would silently fall back to system default on
-      // the next `start()` anyway.  Clearing the persisted id
-      // here keeps the visible dropdown selection consistent with
-      // the recorder's runtime behaviour.
-      if (selectedKey && selectedKey !== STREAM_KEY) {
-        if (!audioInputs.some((d) => d.deviceId === selectedKey)) {
-          selectedKey = '';
-        }
-      }
     } catch {
       audioInputs = [];
+      return;
+    }
+    // Pre-permission enumerations cannot validate the saved id
+    // (the id from a labeled session is not in the placeholder
+    // list).  Bail and let the post-`recorder.start()` refresh
+    // run the reconcile when labels are available.
+    if (!audioInputs.some((d) => d.label)) return;
+    const saved = initialSaved;
+    // No recovery target: either no saved preference at all, or
+    // a stream sentinel that isn't addressed by deviceId.  Drop
+    // the in-memory tombstone so the persistence effect's
+    // `removeItem` path is unblocked when the operator picks
+    // "System default" while in this state.
+    if (!saved?.id || saved.id === STREAM_KEY) {
+      if (saved) initialSaved = null;
+      return;
+    }
+    // Saved is a specific mic id.  Try to find it in the current
+    // enumeration in stability order:
+    //   1. `deviceId` -- stable per-origin on Chrome after
+    //      permission persists; the cheap path.
+    //   2. `groupId`  -- stable per physical device on every
+    //      browser that exposes it after permission.
+    //   3. `label`    -- case-insensitive match; survives a
+    //      per-session id rotation (Firefox / Safari) but can
+    //      collide if two devices share a name (rare; the OS
+    //      usually suffixes a disambiguator).
+    // `MediaDeviceInfo.label` / `.groupId` are non-nullable strings
+    // but are empty pre-permission; comparing to the non-empty
+    // saved values auto-skips those entries, so neither find
+    // needs an extra labeled-guard.
+    let match: MediaDeviceInfo | undefined = audioInputs.find((d) => d.deviceId === saved.id);
+    if (!match && saved.groupId) {
+      const want = saved.groupId;
+      match = audioInputs.find((d) => d.groupId === want);
+    }
+    if (!match && saved.label) {
+      const want = saved.label.toLowerCase();
+      match = audioInputs.find((d) => d.label.toLowerCase() === want);
+    }
+    if (match) {
+      // Re-attach.  `initialSaved` is deliberately kept alive --
+      // an unplug→replug cycle later in this session re-enters
+      // this function and needs the same metadata to recover
+      // (groupId / label) again.  It's nulled only on an
+      // explicit user pick (`onPickInputSource`).
+      if (selectedKey !== match.deviceId) selectedKey = match.deviceId;
+    } else {
+      // Saved device not currently connected.  Surface system
+      // default so the dropdown is honest about which mic the
+      // next Record will open; the persistence effect's
+      // `initialSaved` guard preserves the storage entry so a
+      // future `devicechange` (plug-in mid-session, or next
+      // session on a machine where the device is present) can
+      // still re-attach.
+      if (selectedKey !== '') selectedKey = '';
     }
   }
 
@@ -1219,6 +1372,38 @@
     if (d.label) return d.label;
     return `Microphone ${idx + 1} (${d.deviceId.slice(0, 6) || 'default'})`;
   }
+
+  // True when `selectedKey` references a mic that isn't in the
+  // current enumeration -- either pre-permission (no labels yet)
+  // or the saved device is genuinely disconnected.  Drives the
+  // "(remembered) …" phantom <option> below so the dropdown
+  // visually agrees with the bound state and the operator can
+  // see that their preference is still in effect.
+  const rememberedMissing = $derived(
+    selectedKey !== '' &&
+      selectedKey !== STREAM_KEY &&
+      !audioInputs.some((d) => d.deviceId === selectedKey)
+  );
+  // Label to show in the phantom option.  Prefer the saved
+  // friendly label captured the last time labels were available.
+  // The short-id fallback covers two corner cases:
+  //   - legacy bare-id storage entries (pre-JSON refactor) carry
+  //     no label;
+  //   - `initialSaved` has been nulled (operator picked a new mic
+  //     that then disconnected before we could capture its
+  //     metadata) -- the phantom still needs *some* glyph.
+  const rememberedLabel = $derived(
+    initialSaved?.label ?? `Microphone (${selectedKey.slice(0, 6) || 'default'})`
+  );
+
+  // User-initiated pick wins over the recovery path: null
+  // `initialSaved` so a subsequent `refreshDevices` reconcile
+  // doesn't try to re-attach to the previously-saved device.
+  // `<select>` doesn't emit `change` for programmatic value
+  // mutations, so this only runs on operator interaction.
+  function onPickInputSource(): void {
+    initialSaved = null;
+  }
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1687,12 +1872,24 @@
       <select
         id="input-source-{workspaceId}-{categoryName}"
         bind:value={selectedKey}
+        onchange={onPickInputSource}
         class="select-chevron min-w-0 max-w-56 flex-1 truncate rounded-md border border-zinc-200 bg-white py-1.5 pl-3 text-sm font-medium text-zinc-900 transition hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:bg-zinc-50 disabled:text-zinc-400"
         aria-label="Input source"
         disabled={isBusy}
       >
         <optgroup label="Microphone">
           <option value="">System default microphone</option>
+          {#if rememberedMissing}
+            <!-- Phantom for the remembered-but-not-enumerated case:
+                 pre-permission (no labels yet) or a saved device
+                 that's currently disconnected.  Without it the
+                 <select> would silently render the first option
+                 ("System default") even though the bound state
+                 still holds the saved id -- a state / display
+                 divergence that misleads the operator about which
+                 mic the next Record will open. -->
+            <option value={selectedKey}>{rememberedLabel} (remembered)</option>
+          {/if}
           {#each audioInputs as device, idx (device.deviceId || idx)}
             <option value={device.deviceId}>{describeDevice(device, idx)}</option>
           {/each}
