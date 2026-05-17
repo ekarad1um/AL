@@ -1,45 +1,39 @@
 //! Runtime storage hygiene: periodic sweep of orphan `.tmp/`
-//! entries (crashed uploads / staged-but-unfinished deletes) and
-//! aged-out per-workspace job logs.
+//! entries (crashed uploads / staged-but-unfinished deletes).
 //!
 //! # Scope
 //!
-//! Two distinct kinds of clutter accumulate under the workspace
-//! tree over a daemon's lifetime:
+//! Three places stage temporaries under the daemon tree:
 //!
-//! 1. **`.tmp/` orphans.** Three places stage temporaries:
-//!    * `<root>/.tmp/` -- workspace-delete staging
-//!      (`delete-workspace-<job>/` + tombstone JSON)
-//!    * `<root>/active/.tmp/<activation_id>/` -- pre-publish
-//!      active-head staging (atomic-renamed into
-//!      `active/generations/<id>/` on success)
-//!    * `<workspace>/.tmp/` -- per-workspace asset upload
-//!      tempfiles, asset / converter / log delete tombstones +
-//!      payloads
+//! * `<root>/.tmp/` -- workspace-delete staging
+//!   (`delete-workspace-<job>/` + tombstone JSON)
+//! * `<root>/active/.tmp/<activation_id>/` -- pre-publish
+//!   active-head staging (atomic-renamed into
+//!   `active/generations/<id>/` on success)
+//! * `<workspace>/.tmp/` -- per-workspace asset upload
+//!   tempfiles, asset / converter / log delete tombstones +
+//!   payloads
 //!
-//!    The boot-time recovery sweep ([`super::recovery::recover_all`])
-//!    drains tombstones and unlinks stage orphans at every
-//!    restart, but on a daemon that crashes hard and never
-//!    restarts (or crashes between two restarts in a way that
-//!    bypasses recovery -- e.g. `kill -9` during a window where
-//!    the writer had already created the staging file but not yet
-//!    completed the operation) the entries sit indefinitely.
-//!    Power-loss orphans from `tempfile::NamedTempFile` (mkstemp)
-//!    are the most common case: the file's `Drop` impl unlinks on
-//!    clean shutdown but cannot run on hard crash.
+//! The boot-time recovery sweep ([`super::recovery::recover_all`])
+//! drains tombstones and unlinks stage orphans at every
+//! restart, but on a daemon that crashes hard and never
+//! restarts (or crashes between two restarts in a way that
+//! bypasses recovery -- e.g. `kill -9` during a window where
+//! the writer had already created the staging file but not yet
+//! completed the operation) the entries sit indefinitely.
+//! Power-loss orphans from `tempfile::NamedTempFile` (mkstemp)
+//! are the most common case: the file's `Drop` impl unlinks on
+//! clean shutdown but cannot run on hard crash.
 //!
-//! 2. **Per-workspace job logs.** `<workspace>/training_logs/`
-//!    and `<workspace>/converter_logs/` accumulate one `*.jsonl`
-//!    per job run.  There is no built-in retention -- they grow
-//!    until the operator explicitly issues `DELETE
-//!    /workspace/{id}/assets/{tree}` or until the workspace is
-//!    removed.  On a busy operator a year of daily training jobs
-//!    leaves 365 entries per workspace, each containing the
-//!    full epoch / batch trace -- non-trivial storage on a
-//!    bounded SBC.
+//! Per-workspace JSONL job logs
+//! (`<workspace>/{training,converter}_logs/<job>.jsonl`) are
+//! NOT pruned here: retention lives in
+//! [`super::log_retention`], which is invoked by the producers
+//! (`TrainJobLog::open`, `ConvertJobLog::open`) at the only
+//! moment the cap can be exceeded (a new run arrives).
 //!
-//! The daemon-root `<root>/logs/acousticsd.log.*` does **not**
-//! flow through here: `tracing_appender::rolling::Rotation::DAILY`
+//! The daemon-root `<root>/logs/acousticsd.log.*` is also
+//! untouched: `tracing_appender::rolling::Rotation::DAILY`
 //! plus `max_log_files(7)` already prunes it, and the rotation
 //! lives inside the appender's own writer thread.
 //!
@@ -60,10 +54,6 @@
 //!   inside a single critical section; full-tree drains complete
 //!   in seconds.  A 24 h-old payload means the daemon crashed
 //!   mid-drain; the reaper finishes the operator's intent.
-//! * Per-workspace log files: each `*.jsonl` is written by a
-//!   producer whose mtime advances on every event.  An idle log
-//!   older than the 30 d default is a stale job; pruning frees
-//!   the inode.
 //!
 //! No coordination lock with `WorkspaceMgr` is required because
 //! the threshold is far above any legitimate operation duration.
@@ -85,7 +75,6 @@
 //! 1k-entry orphan it's milliseconds.  Either way well under the
 //! 1 h period.
 
-use crate::file_mgr::dataset::{CONVERTER_LOGS_DIR_NAME, TRAINING_LOGS_DIR_NAME};
 use crate::file_mgr::error::{FileError, io_err};
 use crate::file_mgr::schema::{
     ROOT_TMP_DIR_NAME, active_staging_dir, root_tmp_dir, workspaces_dir,
@@ -93,23 +82,19 @@ use crate::file_mgr::schema::{
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-/// Age thresholds and dispatch knobs for a single sweep pass.
+/// Age threshold + dispatch knobs for a single sweep pass.
 ///
-/// Both `tmp_age` and `log_age` are operator-tunable in spirit;
-/// today they are constants in the daemon binary's reaper wiring
-/// (`modules/daemon/main_body.rs`).  Promotion to the launch TOML
-/// is a follow-up if operators ask for tighter / looser windows.
+/// `tmp_age` is operator-tunable in spirit; today it is a
+/// constant in the daemon binary's reaper wiring
+/// (`modules/daemon/main_body.rs`).  Promotion to the launch
+/// TOML is a follow-up if operators ask for a tighter / looser
+/// window.
 #[derive(Clone, Copy, Debug)]
 pub struct SweepConfig {
     /// Reap `.tmp/` entries whose mtime is older than this.
     /// `Duration::from_secs(24 * 3600)` is the daemon default --
     /// orders of magnitude above any in-flight operation.
     pub tmp_age: Duration,
-    /// Prune per-workspace `*_logs/*.jsonl` files older than
-    /// this.  `Duration::from_secs(30 * 24 * 3600)` is the
-    /// daemon default; keeps a month of job history per
-    /// workspace.
-    pub log_age: Duration,
 }
 
 /// Outcome of one [`sweep_once`] pass.  Numbers feed the
@@ -120,9 +105,6 @@ pub struct SweepConfig {
 pub struct SweepReport {
     /// `.tmp/` entries reaped (root + active + every workspace).
     pub tmp_orphans_reaped: u64,
-    /// Stale `*.jsonl` files removed from `training_logs/` +
-    /// `converter_logs/`.
-    pub log_files_pruned: u64,
     /// Per-workspace directories scanned (count of distinct
     /// `<root>/workspaces/<id>/` walked).  Zero when the
     /// workspaces parent itself is absent (fresh daemon).
@@ -139,15 +121,14 @@ impl SweepReport {
     /// the daemon's periodic task to decide whether to log at
     /// `info` (work happened) or stay silent (cheap no-op).
     pub fn did_work(&self) -> bool {
-        self.tmp_orphans_reaped > 0 || self.log_files_pruned > 0
+        self.tmp_orphans_reaped > 0
     }
 }
 
 /// Run a single sweep pass over `<root>/.tmp/`,
-/// `<root>/active/.tmp/`, and every `<workspace>/.tmp/` +
-/// `*_logs/` underneath `<root>/workspaces/`.  Returns the
-/// counts collected -- the caller wires them into
-/// `WorkspaceMetrics`.
+/// `<root>/active/.tmp/`, and every `<workspace>/.tmp/`
+/// underneath `<root>/workspaces/`.  Returns the counts
+/// collected -- the caller wires them into `WorkspaceMetrics`.
 ///
 /// Per-workspace failures are isolated: a sweep failure on
 /// workspace A does not skip workspace B.  The function only
@@ -169,7 +150,7 @@ pub fn sweep_once(root: &Path, cfg: &SweepConfig) -> Result<SweepReport, FileErr
     //    of the active-tree layout flows through one place.
     sweep_dir_entries(&active_staging_dir(root), now, cfg.tmp_age, &mut report);
 
-    // 3. Per-workspace `.tmp/` + log dirs.
+    // 3. Per-workspace `.tmp/`.
     let workspaces = workspaces_dir(root);
     let entries = match std::fs::read_dir(&workspaces) {
         Ok(e) => e,
@@ -213,26 +194,12 @@ pub fn sweep_once(root: &Path, cfg: &SweepConfig) -> Result<SweepReport, FileErr
     Ok(report)
 }
 
-/// Sweep one workspace's `.tmp/` + the two log dirs.
-/// Internal helper kept lazy on the dir presence (any of the
-/// three may legitimately be absent under the lazy-mkdir
-/// contract introduced alongside this reaper).
+/// Sweep one workspace's `.tmp/`.  A missing dir is treated
+/// as a no-op by `sweep_dir_entries` -- workspaces that never
+/// had an upload / delete attempt do not materialize `.tmp/`
+/// (the lazy-mkdir contract).
 fn sweep_workspace(ws: &Path, now: SystemTime, cfg: &SweepConfig, report: &mut SweepReport) {
     sweep_dir_entries(&ws.join(ROOT_TMP_DIR_NAME), now, cfg.tmp_age, report);
-    prune_old_files(
-        &ws.join(TRAINING_LOGS_DIR_NAME),
-        now,
-        cfg.log_age,
-        &mut report.log_files_pruned,
-        &mut report.failures,
-    );
-    prune_old_files(
-        &ws.join(CONVERTER_LOGS_DIR_NAME),
-        now,
-        cfg.log_age,
-        &mut report.log_files_pruned,
-        &mut report.failures,
-    );
 }
 
 /// Remove every direct entry in `dir` whose mtime is older than
@@ -333,103 +300,6 @@ fn sweep_dir_entries(dir: &Path, now: SystemTime, age: Duration, report: &mut Sw
     }
 }
 
-/// Remove regular files in `dir` older than `age`.  Skips
-/// subdirectories (defensive: production log dirs hold only flat
-/// `*.jsonl` files, but an operator-pasted subdir should not
-/// disappear silently).
-fn prune_old_files(
-    dir: &Path,
-    now: SystemTime,
-    age: Duration,
-    pruned: &mut u64,
-    failures: &mut u64,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::warn!(
-                target: "file_mgr",
-                err = %e,
-                path = %dir.display(),
-                "storage reaper: log read_dir failed",
-            );
-            *failures += 1;
-            return;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(
-                    target: "file_mgr",
-                    err = %e,
-                    parent = %dir.display(),
-                    "storage reaper: log dir-iter entry failed",
-                );
-                *failures += 1;
-                continue;
-            }
-        };
-        let path = entry.path();
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                tracing::warn!(
-                    target: "file_mgr",
-                    err = %e,
-                    path = %path.display(),
-                    "storage reaper: log metadata probe failed",
-                );
-                *failures += 1;
-                continue;
-            }
-        };
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        let mtime = match metadata.modified() {
-            Ok(m) => m,
-            Err(e) => {
-                // Mirror `sweep_dir_entries`'s shape: log +
-                // count rather than silently skipping.  A
-                // platform that cannot expose mtime is a
-                // configuration/build oddity an operator
-                // should see in the logs, not a quiet drop.
-                tracing::warn!(
-                    target: "file_mgr",
-                    err = %e,
-                    path = %path.display(),
-                    "storage reaper: log mtime probe failed",
-                );
-                *failures += 1;
-                continue;
-            }
-        };
-        let aged_out = matches!(now.duration_since(mtime), Ok(d) if d > age);
-        if !aged_out {
-            continue;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                *pruned += 1;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "file_mgr",
-                    err = %e,
-                    path = %path.display(),
-                    "storage reaper: log remove failed",
-                );
-                *failures += 1;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // Tests stage fixtures with `std::fs::*` + `filetime::set_file_mtime`;
@@ -472,26 +342,24 @@ mod tests {
     }
 
     /// Helper: build an empty workspace tree skeleton with a
-    /// per-workspace `.tmp/` and the two log dirs already
-    /// materialized.  Mirrors the post-first-producer shape.
+    /// per-workspace `.tmp/` already materialized.  Mirrors the
+    /// post-first-asset-upload shape (workspaces never used for
+    /// uploads / deletes do not materialize `.tmp/`).
     fn build_workspace_skeleton(root: &Path, id: &str) -> std::path::PathBuf {
         let ws = root.join("workspaces").join(id);
         fs::create_dir_all(ws.join(".tmp")).unwrap();
-        fs::create_dir_all(ws.join("training_logs")).unwrap();
-        fs::create_dir_all(ws.join("converter_logs")).unwrap();
         ws
     }
 
-    /// Daemon production-default thresholds: 24 h on `.tmp/`,
-    /// 30 d on per-workspace log files.  Matches the constants
-    /// wired in `daemon::main_body` so the tests exercise the
-    /// same window operators see in deployment.  Tests that need
-    /// a different threshold use struct-update syntax, e.g.
-    /// `SweepConfig { tmp_age: Duration::from_nanos(1), ..default_cfg() }`.
+    /// Daemon production-default threshold: 24 h on `.tmp/`.
+    /// Matches the constant wired in `daemon::main_body` so the
+    /// tests exercise the same window operators see in
+    /// deployment.  Tests that need a different threshold
+    /// construct a fresh `SweepConfig` with the value they need
+    /// (the struct holds a single field).
     fn default_cfg() -> SweepConfig {
         SweepConfig {
             tmp_age: Duration::from_secs(24 * 3600),
-            log_age: Duration::from_secs(30 * 24 * 3600),
         }
     }
 
@@ -509,7 +377,6 @@ mod tests {
 
         let report = sweep_once(tmp.path(), &default_cfg()).expect("sweep");
         assert_eq!(report.tmp_orphans_reaped, 1);
-        assert_eq!(report.log_files_pruned, 0);
         assert_eq!(report.failures, 0);
         assert!(!stale.exists());
         assert!(root_tmp.is_dir(), "parent .tmp/ itself stays in place");
@@ -541,7 +408,6 @@ mod tests {
         // future-mtime skip keeps `future` alive.
         let cfg = SweepConfig {
             tmp_age: Duration::from_nanos(1),
-            ..default_cfg()
         };
         let report = sweep_once(tmp.path(), &cfg).expect("sweep");
         assert_eq!(
@@ -610,42 +476,6 @@ mod tests {
         assert!(!stale.exists());
     }
 
-    /// Log pruning removes a `.jsonl` older than `log_age`
-    /// and keeps a fresh sibling.  Pins the per-workspace
-    /// retention contract.
-    #[test]
-    fn sweep_prunes_aged_log_keeps_fresh() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = build_workspace_skeleton(tmp.path(), "ws-logs");
-        let stale = ws.join("training_logs").join("stale.jsonl");
-        let fresh = ws.join("training_logs").join("fresh.jsonl");
-        fs::write(&stale, b"{}").unwrap();
-        fs::write(&fresh, b"{}").unwrap();
-        backdate(&stale, Duration::from_secs(60 * 24 * 3600));
-
-        let report = sweep_once(tmp.path(), &default_cfg()).expect("sweep");
-        assert_eq!(report.log_files_pruned, 1);
-        assert!(!stale.exists());
-        assert!(fresh.exists());
-    }
-
-    /// Log pruning skips subdirectories.  Production log dirs
-    /// hold only `*.jsonl`, but an operator-pasted subdir
-    /// should survive a sweep so the reaper does not silently
-    /// nuke operator artifacts.
-    #[test]
-    fn sweep_skips_subdirs_inside_log_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = build_workspace_skeleton(tmp.path(), "ws-subdir");
-        let sub = ws.join("training_logs").join("operator-stash");
-        fs::create_dir_all(&sub).unwrap();
-        backdate(&sub, Duration::from_secs(60 * 24 * 3600));
-
-        let report = sweep_once(tmp.path(), &default_cfg()).expect("sweep");
-        assert_eq!(report.log_files_pruned, 0);
-        assert!(sub.is_dir());
-    }
-
     /// Sweep tolerates a completely absent layout: a fresh
     /// daemon with no workspaces, no `.tmp/`, no `active/`
     /// returns an all-zero report rather than failing on
@@ -680,8 +510,9 @@ mod tests {
     }
 
     /// `SweepReport::did_work` returns true iff at least one
-    /// entry was removed.  Used by the daemon's periodic task
-    /// to decide whether to log at `info!` or stay silent.
+    /// `.tmp/` entry was reaped.  Used by the daemon's
+    /// periodic task to decide whether to log at `info!` or
+    /// stay silent.
     #[test]
     fn did_work_predicate_matches_counters() {
         let mut r = SweepReport::default();
@@ -689,11 +520,6 @@ mod tests {
         r.failures = 5;
         assert!(!r.did_work(), "failures alone are not 'work'");
         r.tmp_orphans_reaped = 1;
-        assert!(r.did_work());
-        let r = SweepReport {
-            log_files_pruned: 1,
-            ..Default::default()
-        };
         assert!(r.did_work());
     }
 }

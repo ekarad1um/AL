@@ -135,16 +135,26 @@ pub struct WorkspaceMetricsSnapshot {
     /// gap the boot sweep cannot.  See
     /// [`crate::file_mgr::storage_reaper`].
     pub tmp_orphans_reaped_total: u64,
-    /// Cumulative per-workspace `*.jsonl` files pruned by the
-    /// runtime `storage_reaper`.  Bounds the long-tail growth
-    /// of `<workspace>/training_logs/` +
-    /// `<workspace>/converter_logs/` on operators who never
-    /// issue `DELETE /workspace/{id}/assets/{tree}` manually.
+    /// Cumulative per-workspace `<job_id>.jsonl` files pruned
+    /// by the producer-side keep-last-N retention pass
+    /// (`crate::file_mgr::log_retention::enforce_keep_last_n`).
+    /// `TrainJobLog::open` and `ConvertJobLog::open` invoke
+    /// retention immediately after creating the new log file,
+    /// so this counter bumps roughly once per train / convert
+    /// job once a workspace's log tree exceeds the keep cap.
     pub log_files_pruned_total: u64,
     /// Cumulative per-workspace failures observed by the
-    /// runtime `storage_reaper`.  Mirrors the boot-time
-    /// recovery counter shape; lets operators correlate
-    /// "reaper logging warnings" without grep.
+    /// producer-side log retention pass (failed metadata
+    /// probes, non-`NotFound` unlink errors).  Distinct from
+    /// `storage_reaper_failures_total` so an operator can tell
+    /// "is my log retention healthy?" apart from "is the
+    /// `.tmp/` orphan sweep healthy?".
+    pub log_retention_failures_total: u64,
+    /// Cumulative per-workspace failures observed by the
+    /// runtime `storage_reaper` (`.tmp/` orphan sweep).
+    /// Mirrors the boot-time recovery counter shape; lets
+    /// operators correlate "reaper logging warnings" without
+    /// grep.
     pub storage_reaper_failures_total: u64,
 }
 
@@ -169,6 +179,7 @@ pub struct WorkspaceMetrics {
     boot_workspace_recovery_failures_total: AtomicU64,
     tmp_orphans_reaped_total: AtomicU64,
     log_files_pruned_total: AtomicU64,
+    log_retention_failures_total: AtomicU64,
     storage_reaper_failures_total: AtomicU64,
     /// Bounded ring of recent `workspace.json` write
     /// durations (microseconds).  Capacity:
@@ -213,6 +224,9 @@ impl WorkspaceMetrics {
                 .load(Ordering::Relaxed),
             tmp_orphans_reaped_total: self.tmp_orphans_reaped_total.load(Ordering::Relaxed),
             log_files_pruned_total: self.log_files_pruned_total.load(Ordering::Relaxed),
+            log_retention_failures_total: self
+                .log_retention_failures_total
+                .load(Ordering::Relaxed),
             storage_reaper_failures_total: self
                 .storage_reaper_failures_total
                 .load(Ordering::Relaxed),
@@ -318,22 +332,30 @@ impl WorkspaceMetrics {
     }
 
     /// Record one runtime sweep pass from the
-    /// `file_mgr::storage_reaper` background task.  Accepts bare
-    /// counters (not the report struct) so the layer-graph edge
-    /// `status -> file_mgr` stays out of the dependency tree;
-    /// the daemon's wiring site unpacks the fields and forwards
-    /// them through here.
-    pub fn record_storage_sweep(
-        &self,
-        tmp_orphans_reaped: u64,
-        log_files_pruned: u64,
-        failures: u64,
-    ) {
+    /// `file_mgr::storage_reaper` background task (`.tmp/`
+    /// orphan cleanup).  Accepts bare counters (not the report
+    /// struct) so the layer-graph edge `status -> file_mgr`
+    /// stays out of the dependency tree; the daemon's wiring
+    /// site unpacks the fields and forwards them through here.
+    /// Per-workspace log retention is recorded by a separate
+    /// path -- see [`Self::record_logs_pruned`].
+    pub fn record_storage_sweep(&self, tmp_orphans_reaped: u64, failures: u64) {
         self.tmp_orphans_reaped_total
             .fetch_add(tmp_orphans_reaped, Ordering::Relaxed);
-        self.log_files_pruned_total
-            .fetch_add(log_files_pruned, Ordering::Relaxed);
         self.storage_reaper_failures_total
+            .fetch_add(failures, Ordering::Relaxed);
+    }
+
+    /// Record one producer-side log retention pass
+    /// (`crate::file_mgr::log_retention::enforce_keep_last_n`).
+    /// The helper emits at sweep completion via the daemon's
+    /// installed metrics hook; the hook short-circuits
+    /// zero-on-zero, so a no-op sweep (under-cap or
+    /// missing-dir) does NOT reach this method.
+    pub fn record_logs_pruned(&self, pruned: u64, failures: u64) {
+        self.log_files_pruned_total
+            .fetch_add(pruned, Ordering::Relaxed);
+        self.log_retention_failures_total
             .fetch_add(failures, Ordering::Relaxed);
     }
 }
@@ -600,23 +622,46 @@ mod tests {
         assert_eq!(m.snapshot().boot_workspace_recovery_failures_total, 5);
     }
 
-    /// `record_storage_sweep` accumulates each of the three
-    /// counters independently across multiple sweep passes.
-    /// Pins the positional arg order (`tmp_orphans_reaped`,
-    /// `log_files_pruned`, `failures`) so a future
-    /// swap of two same-typed arguments surfaces as a counter
-    /// mismatch in CI rather than as silently miscounted metrics
-    /// in production.
+    /// `record_storage_sweep` accumulates each counter
+    /// independently across multiple sweep passes.  Pins the
+    /// positional arg order (`tmp_orphans_reaped`, `failures`)
+    /// so a future swap of two same-typed arguments surfaces
+    /// as a counter mismatch in CI rather than as silently
+    /// miscounted metrics in production.  Log retention has
+    /// its own counter family ([`record_logs_pruned`]) so the
+    /// two surfaces stay independent.
     #[test]
     fn record_storage_sweep_accumulates() {
         let m = WorkspaceMetrics::new();
-        m.record_storage_sweep(3, 5, 1);
-        m.record_storage_sweep(2, 0, 0);
-        m.record_storage_sweep(0, 0, 4);
+        m.record_storage_sweep(3, 1);
+        m.record_storage_sweep(2, 0);
+        m.record_storage_sweep(0, 4);
         let s = m.snapshot();
         assert_eq!(s.tmp_orphans_reaped_total, 5);
-        assert_eq!(s.log_files_pruned_total, 5);
         assert_eq!(s.storage_reaper_failures_total, 5);
+        // Log counters MUST stay zero -- the storage sweep
+        // surface no longer touches them.
+        assert_eq!(s.log_files_pruned_total, 0);
+        assert_eq!(s.log_retention_failures_total, 0);
+    }
+
+    /// `record_logs_pruned` accumulates `pruned` and
+    /// `failures` into the producer-side retention counters
+    /// independently of the storage-sweep surface.  Pins the
+    /// arg order so a future swap surfaces as a CI counter
+    /// mismatch.
+    #[test]
+    fn record_logs_pruned_accumulates() {
+        let m = WorkspaceMetrics::new();
+        m.record_logs_pruned(3, 0);
+        m.record_logs_pruned(2, 1);
+        m.record_logs_pruned(0, 4);
+        let s = m.snapshot();
+        assert_eq!(s.log_files_pruned_total, 5);
+        assert_eq!(s.log_retention_failures_total, 5);
+        // Storage-sweep counters MUST stay zero.
+        assert_eq!(s.tmp_orphans_reaped_total, 0);
+        assert_eq!(s.storage_reaper_failures_total, 0);
     }
 
     #[test]

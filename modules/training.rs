@@ -1449,6 +1449,17 @@ impl TrainJobLog {
     /// append; creates the dir if missing.  Surfaces failures as
     /// [`TrainingError::Io`] so an unwritable training_logs dir
     /// fails the run loudly instead of silently losing the trace.
+    ///
+    /// After the new file is created, enforces
+    /// [`crate::file_mgr::LOG_RETENTION_KEEP_COUNT`] over the
+    /// dir's `.jsonl` files: the just-opened file is the freshest
+    /// by mtime and survives (as long as no forward-stamped
+    /// sibling outranks it); older runs over the cap are
+    /// unlinked oldest-first.  The helper publishes per-sweep
+    /// counters through its installed metrics hook itself, so
+    /// retention failures surface as a `tracing::warn!` plus a
+    /// `log_retention_failures_total` bump and do NOT fail the
+    /// open.
     fn open(workspace_dir: &std::path::Path, job_id: JobId) -> Result<Self, TrainingError> {
         let dir = workspace_dir.join("training_logs");
         std::fs::create_dir_all(&dir).map_err(|e| TrainingError::Io {
@@ -1464,6 +1475,7 @@ impl TrainJobLog {
                 path: path.display().to_string(),
                 source: e,
             })?;
+        crate::file_mgr::enforce_keep_last_n(&dir, crate::file_mgr::LOG_RETENTION_KEEP_COUNT);
         Ok(Self { file, seq: 0 })
     }
 
@@ -1913,6 +1925,71 @@ mod tests {
         assert_eq!(third["kind"], "job_cancelled");
         assert_eq!(third["stage"], "train");
         assert_eq!(third["reason"], "operator");
+    }
+
+    /// `TrainJobLog::open` enforces
+    /// `LOG_RETENTION_KEEP_COUNT` on
+    /// `<workspace>/training_logs/` after creating the new
+    /// `<job_id>.jsonl`: the just-opened file is the freshest
+    /// by mtime and survives; older `.jsonl` siblings outside
+    /// the cap are unlinked oldest-first.  Pins the
+    /// producer-side retention contract -- a writer-side
+    /// regression here would re-introduce the long-tail
+    /// growth the 30-day reaper used to bound.
+    #[test]
+    fn train_job_log_open_enforces_keep_last_n() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path();
+        let dir = workspace_dir.join("training_logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Stage one more pre-existing log than the keep cap.
+        let cap = crate::file_mgr::LOG_RETENTION_KEEP_COUNT;
+        let mut stale_paths = Vec::with_capacity(cap + 1);
+        for i in 0..=cap {
+            let p = dir.join(format!("00000000-0000-4000-8000-{i:012x}.jsonl"));
+            std::fs::write(&p, b"{}\n").unwrap();
+            let backdate = std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(
+                    (1000 - i as u64) * 60,
+                ))
+                .expect("backdate");
+            let secs = backdate
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("post-epoch")
+                .as_secs();
+            let ft = filetime::FileTime::from_unix_time(secs as i64, 0);
+            filetime::set_file_mtime(&p, ft).expect("set mtime");
+            stale_paths.push(p);
+        }
+        // Open a new log -- triggers retention.  The new file
+        // is fresher than every stale fixture (no backdate),
+        // so it survives; the TWO oldest stale paths
+        // (`stale_paths[0]` and `[1]`) are unlinked.
+        let job_id = JobId::new();
+        let _log = TrainJobLog::open(workspace_dir, job_id).expect("open log");
+
+        let new_path = dir.join(format!("{job_id}.jsonl"));
+        assert!(new_path.is_file(), "new log survived");
+        // Math: (cap+1) stale + 1 new = cap+2 total; cap+2 -
+        // cap = 2 oldest unlinked.  Pin both removed paths
+        // and the remaining-count assertion so a future
+        // off-by-one in the helper surfaces at this site.
+        assert!(!stale_paths[0].exists(), "oldest stale log unlinked");
+        assert!(!stale_paths[1].exists(), "second-oldest stale log unlinked");
+        assert!(
+            stale_paths[2].exists(),
+            "third-oldest stale log must survive (inside top-cap)",
+        );
+        let remaining: usize = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .ok()
+                    .and_then(|e| e.file_name().into_string().ok())
+                    .is_some_and(|n| n.ends_with(".jsonl"))
+            })
+            .count();
+        assert_eq!(remaining, cap, "after open, dir holds exactly cap .jsonl");
     }
 
     /// `val_split == 0.0` runs land NaN into the `JobView`'s

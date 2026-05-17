@@ -106,11 +106,12 @@ prost-build = "=0.14.3"
 [dev-dependencies]
 criterion = { workspace = true }
 tokio-tungstenite = "=0.29.0"
-# Test-only dev-dep for the storage-reaper unit tests that
-# backdate fixture mtime past the sweep threshold.  Production
-# code uses `SystemTime::now()` against on-disk mtime; it never
-# *sets* mtime, so `filetime` does not need to reach the release
-# binary.
+# Test-only dev-dep for storage-reaper, log-retention, and
+# producer-side keep-last-N retention unit tests that backdate
+# fixture mtime so the age-based / mtime-ordering assertions
+# become deterministic.  Production code uses `SystemTime::now()`
+# against on-disk mtime; it never *sets* mtime, so `filetime`
+# does not need to reach the release binary.
 filetime = "=0.2.28"
 # `process` is a test-only feature (daemon-lifecycle tests spawn the
 # binary as a subprocess via `tokio::process::Command`); not needed

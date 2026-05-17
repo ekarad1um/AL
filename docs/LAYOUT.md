@@ -155,8 +155,8 @@ once needed.
         heads/                                    -- lazy: created on first head publish (max 2)
             <head_id>.mpk                         -- raw weights (Burn .mpk)
             <head_id>.json                        -- per-head manifest (HeadManifest)
-        training_logs/<job_id>.jsonl              -- lazy: created on first train job
-        converter_logs/<job_id>.jsonl             -- lazy: created on first convert job
+        training_logs/<job_id>.jsonl              -- lazy: created on first train job; keep last N=10 per workspace
+        converter_logs/<job_id>.jsonl             -- lazy: created on first convert job; keep last N=10 per workspace
         .tmp/                                     -- lazy: created on first upload / delete staging
     .tmp/                                         -- lazy: created on first workspace delete
     active/                                       -- lazy: created on first head activation
@@ -175,25 +175,34 @@ once needed.
 
 ### Background storage hygiene
 
-A `storage_reaper` background task (every 1 h; see
-[`modules/file_mgr/storage_reaper.rs`](../modules/file_mgr/storage_reaper.rs))
-keeps the lazy tree bounded:
+Storage hygiene is split into two surfaces so each runs at the
+right cadence:
 
-- Reaps `.tmp/` entries (files or dir subtrees) whose mtime is
+- A `storage_reaper` background task (every 1 h; see
+  [`modules/file_mgr/storage_reaper.rs`](../modules/file_mgr/storage_reaper.rs))
+  reaps `.tmp/` entries (files or dir subtrees) whose mtime is
   older than 24 h across `<root>/.tmp/`, `<root>/active/.tmp/`,
   and every `<workspace>/.tmp/`.  Covers the "daemon kept
   running after a hard crash" gap that boot recovery cannot
   reach.
-- Prunes per-workspace `training_logs/*.jsonl` and
-  `converter_logs/*.jsonl` older than 30 d so a long-lived
-  workspace does not grow unbounded.
-- Leaves `<root>/logs/acousticsd.log.*` untouched -- the
-  `tracing-appender::rolling::Rotation::DAILY` policy with
-  `max_log_files(7)` already prunes it.
+- Producer-side log retention (see
+  [`modules/file_mgr/log_retention.rs`](../modules/file_mgr/log_retention.rs))
+  keeps the last `N = 10` `<job_id>.jsonl` files per workspace
+  per tree.  `TrainJobLog::open` and `ConvertJobLog::open`
+  invoke `enforce_keep_last_n` immediately after creating the
+  new log file: the new file is the freshest by mtime and
+  always survives; older `.jsonl` siblings beyond the cap are
+  unlinked oldest-first.  Subdirectories and
+  non-`.jsonl` artifacts (operator-pasted notes, archives) are
+  preserved.
+- `<root>/logs/acousticsd.log.*` is untouched by both surfaces
+  -- the `tracing-appender::rolling::Rotation::DAILY` policy
+  with `max_log_files(7)` already prunes it.
 
 Counters surface via `GET /api/v1/status` under
 `workspace_metrics.tmp_orphans_reaped_total`,
-`log_files_pruned_total`, `storage_reaper_failures_total`.
+`log_files_pruned_total`, `log_retention_failures_total`,
+`storage_reaper_failures_total`.
 
 `config.toml` is the hot-reloadable user-preference TOML
 (mic policy + inference cadence -- the only fields actually
@@ -243,8 +252,8 @@ managed independently.
 | `workspaces/<id>/converters/<path>/<file>` | Daemon-owned converter input tree | raw bytes | Same revision-before-bytes invariant as the dataset tree |
 | `workspaces/<id>/heads/<head_id>.mpk` | Raw trained-head weights | Burn `.mpk` | Index-atomic publish: staged in `.tmp/`, fsynced, renamed BEFORE `heads.json` references it |
 | `workspaces/<id>/heads/<head_id>.json` | Per-head manifest with inline labels | [`HeadManifest`](#headmanifest) | Same publish ordering as the matching `.mpk` |
-| `workspaces/<id>/training_logs/<job_id>.jsonl` | Append-only train job events | one [`JobEvent`](#jobevent) per line | Writers flush at least once per second and on terminal state; no per-line fsync |
-| `workspaces/<id>/converter_logs/<job_id>.jsonl` | Append-only convert job events | one `JobEvent` per line | Same as `training_logs/` |
+| `workspaces/<id>/training_logs/<job_id>.jsonl` | Append-only train job events | one [`JobEvent`](#jobevent) per line | Writers flush at least once per second and on terminal state; no per-line fsync; `TrainJobLog::open` enforces keep-last-N=10 per workspace |
+| `workspaces/<id>/converter_logs/<job_id>.jsonl` | Append-only convert job events | one `JobEvent` per line | Same as `training_logs/`; `ConvertJobLog::open` enforces keep-last-N=10 per workspace |
 | `workspaces/<id>/.tmp/` | Per-workspace staging for atomic rename | (opaque) | Every mutating writer fsyncs the tempfile before rename |
 | `.tmp/delete-workspace-<job_id>/payload/...` | Staged payload of an in-flight async workspace delete | (opaque) | Boot recovery resumes the drain |
 | `active/current.json` | Atomic active-generation pointer | [`ActiveCurrentPointer`](#activecurrentpointer) | Atomic rewrite via `put_atomic`; only published AFTER the pointed generation is fsynced |

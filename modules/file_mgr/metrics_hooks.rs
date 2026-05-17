@@ -40,12 +40,22 @@ pub type IncrementHook = dyn Fn() + Send + Sync + 'static;
 /// failed to deliver because every receiver had lagged out.
 pub type EventsDroppedHook = dyn Fn(u64) + Send + Sync + 'static;
 
+/// Callback signature for `record_logs_pruned`.  Arguments
+/// are `(pruned, failures)` from a single
+/// [`crate::file_mgr::log_retention::enforce_keep_last_n`]
+/// invocation.  The helper itself emits at the completion
+/// point (mirrors the other `file_mgr` write helpers); the
+/// daemon's installed closure forwards both counts into
+/// `WorkspaceMetrics`.
+pub type LogsPrunedHook = dyn Fn(u64, u64) + Send + Sync + 'static;
+
 static WORKSPACE_CORE_WRITE: OnceLock<Box<WriteDurationHook>> = OnceLock::new();
 static HEAD_INDEX_WRITE: OnceLock<Box<WriteDurationHook>> = OnceLock::new();
 static UPLOAD: OnceLock<Box<UploadHook>> = OnceLock::new();
 static DATASET_MUTATION_REJECTED: OnceLock<Box<IncrementHook>> = OnceLock::new();
 static CONVERTER_MUTATION_REJECTED: OnceLock<Box<IncrementHook>> = OnceLock::new();
 static JOB_EVENTS_DROPPED: OnceLock<Box<EventsDroppedHook>> = OnceLock::new();
+static LOGS_PRUNED: OnceLock<Box<LogsPrunedHook>> = OnceLock::new();
 
 /// Install the `workspace.json` write-duration hook.  Daemon
 /// boot calls this once with a closure that forwards into
@@ -102,6 +112,17 @@ where
     let _ = JOB_EVENTS_DROPPED.set(Box::new(f));
 }
 
+/// Install the `record_logs_pruned(pruned, failures)` hook.
+/// Daemon boot calls this once with a closure that forwards
+/// both counts into
+/// `crate::status::WorkspaceMetrics::record_logs_pruned`.
+pub fn install_logs_pruned_hook<F>(f: F)
+where
+    F: Fn(u64, u64) + Send + Sync + 'static,
+{
+    let _ = LOGS_PRUNED.set(Box::new(f));
+}
+
 /// Invoke the workspace-core write hook, if installed.
 /// `pub(crate)` because external callers go through the
 /// `record_*_write` shape on
@@ -147,5 +168,21 @@ pub(crate) fn emit_converter_mutation_rejected() {
 pub(crate) fn emit_job_events_dropped(n: u64) {
     if let Some(h) = JOB_EVENTS_DROPPED.get() {
         h(n);
+    }
+}
+
+/// Invoke the logs-pruned hook, if installed.
+/// [`crate::file_mgr::log_retention::enforce_keep_last_n`]
+/// calls this at the end of every sweep so the metrics
+/// surface reflects the producer-side retention path.
+/// Skipped silently when `pruned == 0 && failures == 0` so an
+/// idle workspace's empty sweep does not churn the metrics
+/// surface.
+pub(crate) fn emit_logs_pruned(pruned: u64, failures: u64) {
+    if pruned == 0 && failures == 0 {
+        return;
+    }
+    if let Some(h) = LOGS_PRUNED.get() {
+        h(pruned, failures);
     }
 }

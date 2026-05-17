@@ -751,6 +751,19 @@ async fn async_main(args: Cli) -> Result<()> {
             m.record_job_events_dropped(n);
         });
     }
+    {
+        // Producer-side log retention: `TrainJobLog::open` and
+        // `ConvertJobLog::open` invoke `enforce_keep_last_n`
+        // after creating their new `<job_id>.jsonl`.  The hook
+        // forwards both counts into `WorkspaceMetrics` so
+        // operators see "log files reaped" via
+        // `log_files_pruned_total` and any per-tree failures
+        // via `log_retention_failures_total`.
+        let m = std::sync::Arc::clone(&workspace_metrics);
+        crate::file_mgr::metrics_hooks::install_logs_pruned_hook(move |pruned, failures| {
+            m.record_logs_pruned(pruned, failures);
+        });
+    }
     let shutdown = CancellationToken::new();
 
     // Drain registry holds task handles + cancel tokens + pre-
@@ -1341,40 +1354,36 @@ async fn async_main(args: Cli) -> Result<()> {
 
     // Storage reaper: hourly sweep of `.tmp/` orphans across
     // `<root>/.tmp/`, `<root>/active/.tmp/`, and every
-    // `<workspace>/.tmp/`, plus age-based pruning of per-workspace
-    // `training_logs/` + `converter_logs/`.  Closes two gaps the
-    // boot-time `recover_all` cannot cover:
+    // `<workspace>/.tmp/`.  Closes the gap boot-time
+    // `recover_all` cannot cover: a daemon that crashed hard
+    // (kill -9, OOM, power loss) leaves orphan tempfiles /
+    // staging dirs that boot recovery sweeps on the *next*
+    // start, but the storage reaper covers the case where the
+    // daemon kept running and a subsystem leaked (today only
+    // theoretical -- every production write path uses RAII --
+    // but the reaper is the safety net for any future
+    // regression).
     //
-    // 1. A daemon that crashed hard (kill -9, OOM, power loss)
-    //    leaves orphan tempfiles / staging dirs.  Boot recovery
-    //    sweeps them on the *next* start; the storage reaper
-    //    covers the case where the daemon kept running but a
-    //    subsystem leaked (today only theoretical -- every
-    //    production write path uses RAII -- but the reaper is
-    //    the safety net for any future regression).
-    // 2. Per-workspace job logs (`<job>.jsonl` under
-    //    `training_logs/` / `converter_logs/`) have no built-in
-    //    retention.  A busy operator's workspace would accumulate
-    //    one entry per job indefinitely.  30 d is generous enough
-    //    that operators reviewing a recent job still see it; a
-    //    follow-up can promote both thresholds to the launch TOML
-    //    if operators ask.
+    // 24 h on `.tmp/` is orders of magnitude above any
+    // legitimate in-flight operation (uploads finish in
+    // seconds), so the sweep can never race a producer.
     //
-    // The thresholds are conservative on purpose: 24 h on
-    // `.tmp/` is orders of magnitude above any legitimate
-    // in-flight operation (uploads finish in seconds), so the
-    // sweep can never race a producer.  30 d on logs keeps a
-    // month of training-job history per workspace.
+    // Per-workspace JSONL job logs are NOT swept here:
+    // retention lives in
+    // `crate::file_mgr::log_retention::enforce_keep_last_n`,
+    // which the producers (`TrainJobLog::open`,
+    // `ConvertJobLog::open`) invoke at the only moment the
+    // per-tree cap can be exceeded (a new run arrives).
+    // Routing logs through both surfaces would double the
+    // pruning logic without changing the steady-state
+    // behaviour.
     //
-    // `<root>/logs/acousticsd.log.*` is NOT swept here -- the
+    // `<root>/logs/acousticsd.log.*` is also untouched -- the
     // `tracing_appender::rolling` daily rotation with
-    // `max_log_files(7)` already prunes it; routing it through
-    // this reaper would double the pruning logic without
-    // changing the steady-state behaviour.
+    // `max_log_files(7)` already prunes it.
     {
         const STORAGE_REAP_INTERVAL: Duration = Duration::from_secs(3600);
         const TMP_AGE_THRESHOLD: Duration = Duration::from_secs(24 * 3600);
-        const LOG_AGE_THRESHOLD: Duration = Duration::from_secs(30 * 24 * 3600);
         let workspace_root_for_reap = workspace_root.clone();
         let shutdown_for_storage = shutdown.clone();
         let metrics_for_storage = workspace_metrics.clone();
@@ -1395,7 +1404,6 @@ async fn async_main(args: Cli) -> Result<()> {
                     }
                     let cfg = crate::file_mgr::SweepConfig {
                         tmp_age: TMP_AGE_THRESHOLD,
-                        log_age: LOG_AGE_THRESHOLD,
                     };
                     let root = workspace_root_for_reap.clone();
                     let metrics = metrics_for_storage.clone();
@@ -1415,14 +1423,12 @@ async fn async_main(args: Cli) -> Result<()> {
                         Ok(Ok(report)) => {
                             metrics.record_storage_sweep(
                                 report.tmp_orphans_reaped,
-                                report.log_files_pruned,
                                 report.failures,
                             );
                             if report.did_work() || report.failures > 0 {
                                 tracing::info!(
                                     target: "acoustics",
                                     tmp_orphans_reaped = report.tmp_orphans_reaped,
-                                    log_files_pruned = report.log_files_pruned,
                                     workspaces_scanned = report.workspaces_scanned,
                                     failures = report.failures,
                                     "storage reaper sweep completed",

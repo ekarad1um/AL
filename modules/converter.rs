@@ -1512,6 +1512,17 @@ struct ConvertJobLog {
 }
 
 impl ConvertJobLog {
+    /// Open `<workspace_dir>/converter_logs/<job_id>.jsonl` for
+    /// append; creates the dir if missing.  Mirror of
+    /// [`crate::training::TrainJobLog::open`] for the converter
+    /// producer: after the new file is created, enforces
+    /// [`crate::file_mgr::LOG_RETENTION_KEEP_COUNT`] over the
+    /// dir's `.jsonl` files (the just-opened file is the freshest
+    /// by mtime and survives, modulo forward-stamped siblings).
+    /// The helper publishes per-sweep counters through its
+    /// installed metrics hook itself; retention failures surface
+    /// as a `tracing::warn!` plus a `log_retention_failures_total`
+    /// bump and do NOT fail the open.
     fn open(workspace_dir: &Path, job_id: crate::common::ids::JobId) -> Result<Self, ConvertError> {
         let dir = workspace_dir.join("converter_logs");
         std::fs::create_dir_all(&dir).map_err(|e| convert_write_err(dir.display(), e))?;
@@ -1521,6 +1532,7 @@ impl ConvertJobLog {
             .append(true)
             .open(&path)
             .map_err(|e| convert_write_err(path.display(), e))?;
+        crate::file_mgr::enforce_keep_last_n(&dir, crate::file_mgr::LOG_RETENTION_KEEP_COUNT);
         Ok(Self { file, seq: 0 })
     }
 
@@ -2584,6 +2596,68 @@ mod tests {
             }),
             "log must contain a `failed` event line; got:\n{log}",
         );
+    }
+
+    /// `ConvertJobLog::open` enforces
+    /// `LOG_RETENTION_KEEP_COUNT` on
+    /// `<workspace>/converter_logs/` after creating the new
+    /// `<job_id>.jsonl`: the just-opened file is the freshest
+    /// by mtime and survives; older `.jsonl` siblings outside
+    /// the cap are unlinked oldest-first.  Mirror of the
+    /// training-side pin; pins the producer-side retention
+    /// contract for the converter path.
+    #[test]
+    fn convert_job_log_open_enforces_keep_last_n() {
+        // No `serialize_convert_test` gate: this test does not
+        // call `run_convert_job` and so does not touch the
+        // global `CONVERT_SEMAPHORE`.
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path();
+        let dir = workspace_dir.join("converter_logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cap = crate::file_mgr::LOG_RETENTION_KEEP_COUNT;
+        let mut stale_paths = Vec::with_capacity(cap + 1);
+        for i in 0..=cap {
+            let p = dir.join(format!("00000000-0000-4000-8000-{i:012x}.jsonl"));
+            std::fs::write(&p, b"{}\n").unwrap();
+            let backdate = std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(
+                    (1000 - i as u64) * 60,
+                ))
+                .expect("backdate");
+            let secs = backdate
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("post-epoch")
+                .as_secs();
+            let ft = filetime::FileTime::from_unix_time(secs as i64, 0);
+            filetime::set_file_mtime(&p, ft).expect("set mtime");
+            stale_paths.push(p);
+        }
+        let job_id = crate::common::ids::JobId::new();
+        let _log = ConvertJobLog::open(workspace_dir, job_id).expect("open log");
+
+        let new_path = dir.join(format!("{job_id}.jsonl"));
+        assert!(new_path.is_file(), "new log survived");
+        // Math: (cap+1) stale + 1 new = cap+2 total; cap+2 -
+        // cap = 2 oldest unlinked.  Pin both removed paths
+        // and the remaining-count assertion so a future
+        // off-by-one in the helper surfaces at this site.
+        assert!(!stale_paths[0].exists(), "oldest stale log unlinked");
+        assert!(!stale_paths[1].exists(), "second-oldest stale log unlinked");
+        assert!(
+            stale_paths[2].exists(),
+            "third-oldest stale log must survive (inside top-cap)",
+        );
+        let remaining: usize = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .ok()
+                    .and_then(|e| e.file_name().into_string().ok())
+                    .is_some_and(|n| n.ends_with(".jsonl"))
+            })
+            .count();
+        assert_eq!(remaining, cap, "after open, dir holds exactly cap .jsonl");
     }
 
     /// Each line in `<workspace>/converter_logs/<job_id>.jsonl`

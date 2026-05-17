@@ -114,10 +114,15 @@ pub mod active_head_writer;
 // daemon-owned orphans, repair `head_count`, verify the active
 // generation.  Runs once before the api goes live.
 pub mod recovery;
-// Runtime storage hygiene: periodic `.tmp/` orphan sweep +
-// per-workspace log retention.  Wired into the daemon's
-// background-task registry alongside the training reaper.
+// Runtime storage hygiene: periodic `.tmp/` orphan sweep.
+// Wired into the daemon's background-task registry alongside
+// the training reaper.
 pub mod storage_reaper;
+// Producer-side keep-last-N retention for per-workspace JSONL
+// job logs.  Invoked synchronously from `TrainJobLog::open` /
+// `ConvertJobLog::open` so the cap is enforced at the only
+// moment it can be exceeded.
+pub mod log_retention;
 mod uploader;
 
 // Process-wide hook registry letting the daemon publish into
@@ -152,6 +157,7 @@ pub use job_registry::{
     JobState as RegistryJobState, LeaseGuard as JobRegistryLeaseGuard, RegistryConflict,
     RegistryEvent,
 };
+pub use log_retention::{LOG_RETENTION_KEEP_COUNT, RetentionReport, enforce_keep_last_n};
 pub use metadata::{AssetKind, AssetRecord, WorkspaceMetadata};
 pub use mime::content_type_from_path;
 pub use recovery::{
