@@ -5,7 +5,7 @@
   import { encodeWavPcm16, SLICE_SAMPLES, WAV_SAMPLE_RATE } from '$lib/audio/wav';
   import { decodeAudioFile, encodeWavFromChunks, encodeWavFromFloat32 } from '$lib/audio/resample';
   import { readWavMagic, decodeCanonicalWav } from '$lib/audio/wav-decode';
-  import { chunkPcmToSlices, sliceCountFor } from '$lib/audio/slicer';
+  import { chunkPcmToValidSlices, sliceCountFor } from '$lib/audio/slicer';
   import { sha256Hex } from '$lib/audio/sha256';
   import { slices } from '$lib/stores/slices.svelte';
   import { SvelteSet } from 'svelte/reactivity';
@@ -330,6 +330,16 @@
   $effect(() => {
     const current = draft;
     const pcm = draftPcm;
+    // Any draft / draftPcm transition invalidates a prior slice
+    // note: discard, re-record, re-import, decode-in-flight,
+    // decode-done.  Clear unconditionally (before the early
+    // return) so the note doesn't survive across drafts -- the
+    // selection-status hint is hidden when there's no draft, so
+    // a stale value would otherwise pop back into view the
+    // moment a new draft loads.  Sibling reads of `draft` /
+    // `draftPcm` above pull them into the dep set; `sliceNote`
+    // is write-only here, no re-fire loop.
+    sliceNote = null;
     if (!current || !pcm) return;
     let ns = current.trim_start_samples ?? 0;
     let ne = current.trim_end_samples ?? pcm.length;
@@ -348,6 +358,9 @@
   function onTrimChange(start: number, end: number): void {
     trimStart = start;
     trimEnd = end;
+    // Operator started re-trimming; the previous slice's note
+    // is no longer relevant.  Idempotent if already null.
+    sliceNote = null;
   }
   function onTrimCommit(start: number, end: number): void {
     if (!draft) return;
@@ -363,6 +376,19 @@
   const trimRangeSamples = $derived(Math.max(0, trimEnd - trimStart));
   const trimRangeMs = $derived(Math.round((trimRangeSamples / WAV_SAMPLE_RATE) * 1000));
   const projectedSliceCount = $derived(sliceCountFor(trimStart, trimEnd));
+  // Silence pre-flight is intentionally NOT reactive: scanning
+  // every PCM sample on every trim-drag frame is O(slice_count
+  // * 44 032) and would make a 30 s + recording's drag visibly
+  // laggy on slower devices.  Instead, `chunkPcmToValidSlices`
+  // runs the check ONLY at click time inside `performSlice`
+  // (see [audio/slicer.ts]); the operator sees the geometric
+  // count pre-click ("Slice · 5") and a brief `sliceNote`
+  // post-click telling them how many of those 5 were silent
+  // and dropped.  Filtering at click time still prevents
+  // `DropRatioExceeded` from tripping on FE-uploaded silence;
+  // the only thing we give up is the up-front "this would
+  // skip K silent" hint, which is a fair trade for keeping the
+  // drag interaction smooth.
   // Samples in the trim range that fall past the last full
   // 1 s slice -- the slicer floor-divides, so anything below
   // a full window is dropped.  Telegraphed in the selection
@@ -372,6 +398,13 @@
     Math.max(0, trimRangeSamples - projectedSliceCount * SLICE_SAMPLES)
   );
   const unusedMs = $derived(Math.round((unusedSamples / WAV_SAMPLE_RATE) * 1000));
+  // Brief post-slice summary surfaced in the selection-status
+  // hint slot (NOT via the rose-banner `error` state, which is
+  // reserved for genuine failures).  Set in `performSlice`
+  // when the silence filter dropped any windows, cleared on
+  // any subsequent trim drag / new draft / new capture so it
+  // doesn't linger past the operator's next interaction.
+  let sliceNote = $state<string | null>(null);
   // Cumulative slice count for this category -- reads from the
   // slices store reactively, so adding / deleting slices flips the
   // Slice button's enabled state in real time without an explicit
@@ -387,6 +420,13 @@
   //                  much trim is needed to fit.
   const currentSliceCount = $derived(slices.countFor(workspaceId, categoryName));
   const atSliceCap = $derived(currentSliceCount >= MAX_SLICES_PER_CATEGORY);
+  // Cap binds on the geometric count because the silence filter
+  // is not pre-computed (see `sliceNote` rationale above).  In
+  // practice silent windows reduce the actual added count, so
+  // this is a conservative cap that may block batches whose
+  // post-filter count would have fit; the alternative
+  // (computing silence reactively) is what makes the trim drag
+  // laggy, so we accept the conservative block here.
   const wouldExceedCap = $derived(
     !atSliceCap && currentSliceCount + projectedSliceCount > MAX_SLICES_PER_CATEGORY
   );
@@ -618,9 +658,17 @@
     if (!canSlice || !draftPcm) return;
     slicing = true;
     error = null;
+    sliceNote = null;
     try {
-      const windows = chunkPcmToSlices(draftPcm, trimStart, trimEnd);
-      // Encode + hash every window in parallel.  The hash
+      // Silence filter runs ONLY here (at click time), not on
+      // every trim-drag frame -- scanning the full PCM
+      // reactively makes the drag laggy on long recordings.
+      // The filter still prevents `DropRatioExceeded` from
+      // tripping on FE-uploaded silence: any window the daemon
+      // would NaN-drop is skipped before encode + upload.  See
+      // [audio/silence.ts] for the framing.
+      const { kept: windows, silentDropped } = chunkPcmToValidSlices(draftPcm, trimStart, trimEnd);
+      // Encode + hash every kept window in parallel.  The hash
       // (sha256 of the encoded WAV bytes) is the slice's
       // canonical id -- same as the daemon-side filename
       // basename, same as the spectrogram + blob cache key.
@@ -632,15 +680,10 @@
           return { id, blob };
         })
       );
-      // Dedupe within the batch: byte-identical windows
-      // (operator recorded silence) collapse to one row.  IDB
-      // would dedupe via composite-key overwrite anyway; we
-      // dedupe early to (a) skip an extra `append` round-trip
-      // per duplicate and (b) surface the count to the
-      // operator.
-      // SvelteSet for the file's `.svelte`-suffix lint
-      // rule precedent; the set is purely function-local but
-      // the rule lacks a path-sensitivity model.
+      // Dedupe within the batch: byte-identical kept windows
+      // collapse to one row.  IDB would dedupe via composite-
+      // key overwrite anyway; we dedupe early to skip the
+      // extra `append` round-trips.
       const seen = new SvelteSet<string>();
       const unique: typeof stamped = [];
       for (const s of stamped) {
@@ -661,17 +704,15 @@
         await slices.append(record);
         void slices.enqueueUpload(record);
       }
-      const duplicates = stamped.length - unique.length;
-      if (duplicates > 0) {
-        // Soft notice via the inline error slot (the only
-        // operator-facing surface this pane has).  Not a hard
-        // failure -- the operator chose to slice; we just
-        // tell them how many of the produced windows hashed
-        // to the same content and so collapsed under the
-        // content-addressed id scheme.  Cleared on the next
-        // interaction.
-        const plural = stamped.length === 1 ? '' : 's';
-        error = `${stamped.length} window${plural} produced ${unique.length} unique slice${unique.length === 1 ? '' : 's'} (${duplicates} byte-identical duplicate${duplicates === 1 ? '' : 's'} collapsed).`;
+      // Terse post-slice note, only when the operator needs to
+      // know something they couldn't see from the slice count
+      // change in the right pane.  Silent skips are surfaced
+      // because the discrepancy ("I asked for 5, got 2") would
+      // otherwise be unexplained.  Duplicate collapse is no
+      // longer reported -- it's a side-effect of the content-
+      // addressed id scheme and rarely actionable.
+      if (silentDropped > 0) {
+        sliceNote = `${silentDropped} silent skipped`;
       }
     } catch (e) {
       error = e instanceof Error ? e.message : 'Could not slice the clip.';
@@ -1392,32 +1433,42 @@
     {/if}
   </div>
 
-  <!-- Selection status (draft only).  Telegraphs the trim range +
-       projected slice count.  Amber when below the 1 s slicer
-       minimum -- pairs with the disabled Slice button. -->
+  <!-- Selection status (draft only).  Telegraphs the trim range
+       + projected (geometric) slice count.  Amber when below
+       the 1 s slicer minimum, when at the cap, or when a batch
+       would exceed it -- pairs with the disabled Slice button.
+       When `sliceNote` is set (post-click), it overrides the
+       trim hint with the brief silent-skip summary; cleared by
+       the next drag / draft change. -->
   {#if draft && draftPcm && !isRecording && !isFinalizing && !isImporting}
     <p
       class="text-[11px] tabular-nums"
-      class:text-zinc-500={trimRangeSamples >= SLICE_SAMPLES && !atSliceCap && !wouldExceedCap}
-      class:text-amber-700={trimRangeSamples < SLICE_SAMPLES || atSliceCap || wouldExceedCap}
+      class:text-zinc-500={!!sliceNote ||
+        (trimRangeSamples >= SLICE_SAMPLES && !atSliceCap && !wouldExceedCap)}
+      class:text-amber-700={!sliceNote &&
+        (trimRangeSamples < SLICE_SAMPLES || atSliceCap || wouldExceedCap)}
     >
-      Selection:
-      <span class="font-mono">{(trimRangeMs / 1000).toFixed(1)} s</span>
-      ·
-      {#if trimRangeSamples < SLICE_SAMPLES}
-        Drag the handles to ≥ 1 s to enable slicing.
-      {:else if atSliceCap}
-        Category at the {MAX_SLICES_PER_CATEGORY}-slice cap. Delete some slices to slice more.
-      {:else if wouldExceedCap}
-        {projectedSliceCount}
-        {projectedSliceCount === 1 ? 'slice' : 'slices'} — only
-        <span class="font-mono">{sliceCapHeadroom}</span>
-        {sliceCapHeadroom === 1 ? 'slot' : 'slots'} left to the {MAX_SLICES_PER_CATEGORY} cap.
+      {#if sliceNote}
+        {sliceNote}
       {:else}
-        {projectedSliceCount}
-        {projectedSliceCount === 1 ? 'slice' : 'slices'} of 1 s each
-        {#if unusedMs >= 10}· <span class="font-mono">{(unusedMs / 1000).toFixed(1)} s</span>
-          unused{/if}
+        Selection:
+        <span class="font-mono">{(trimRangeMs / 1000).toFixed(1)} s</span>
+        ·
+        {#if trimRangeSamples < SLICE_SAMPLES}
+          Drag the handles to ≥ 1 s to enable slicing.
+        {:else if atSliceCap}
+          Category at the {MAX_SLICES_PER_CATEGORY}-slice cap. Delete some slices to slice more.
+        {:else if wouldExceedCap}
+          {projectedSliceCount}
+          {projectedSliceCount === 1 ? 'slice' : 'slices'} — only
+          <span class="font-mono">{sliceCapHeadroom}</span>
+          {sliceCapHeadroom === 1 ? 'slot' : 'slots'} left to the {MAX_SLICES_PER_CATEGORY} cap.
+        {:else}
+          {projectedSliceCount}
+          {projectedSliceCount === 1 ? 'slice' : 'slices'} of 1 s each
+          {#if unusedMs >= 10}· <span class="font-mono">{(unusedMs / 1000).toFixed(1)} s</span>
+            unused{/if}
+        {/if}
       {/if}
     </p>
   {/if}

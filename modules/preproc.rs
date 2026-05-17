@@ -381,4 +381,72 @@ mod tests {
             }
         }
     }
+
+    /// Even a *single* all-zero FFT frame produces an entirely-NaN
+    /// spectrogram, not just the silent rows.  One zero-magnitude
+    /// bin anywhere on the plane yields `0.5 * ln(0) = -inf`, which
+    /// drags the mean to `-inf`; the variance pass then computes
+    /// `(-inf - -inf)^2 = NaN`, std = NaN, and the final
+    /// `(v - mean) / std` smears NaN across every cell.
+    ///
+    /// The frontend's silence pre-flight (`web/src/lib/audio/silence.ts`)
+    /// relies on this contract: it filters a slice if *any* of its 43
+    /// FFT frames would have all-zero windowed PCM, on the assumption
+    /// that exactly that condition turns into the
+    /// `dropped_nan` increment in `extract_features` and burns the
+    /// dataset's `MAX_DROP_RATIO` budget.  If this test ever flips
+    /// (e.g. someone adds a log-domain epsilon, or replaces z-norm
+    /// with a NaN-tolerant variant), the frontend's filter becomes
+    /// either over-aggressive (false positives, valid slices dropped
+    /// pre-upload) or unaligned (silent slices reach training and
+    /// the drop-ratio gate fails opaquely).  Lock both halves of the
+    /// invariant: silent frame 0 (the leading-edge case the front
+    /// pad covers) and silent frame 42 (the trailing-edge case).
+    #[test]
+    fn any_silent_frame_produces_all_nan_spectrogram() {
+        let mut p = Preproc::new();
+
+        // Case A: only frame 0 is silent (pcm[0..1024] = 0, rest
+        // loud).  Frame 0's windowed input is all-zero (front pad
+        // contributes 1024 zeros, the right half multiplies non-zero
+        // window taps by zero PCM); every other frame sees loud audio
+        // and would produce finite bins on its own.  But frame 0's
+        // -inf row pulls the plane mean to -inf and the whole output
+        // becomes NaN.
+        let mut pcm_a = Box::new([0.1f32; WaveformLen::USIZE]);
+        for s in &mut pcm_a[..HopSamples::USIZE] {
+            *s = 0.0;
+        }
+        let s_a = p.spectrogram(&pcm_a);
+        for (t, row) in s_a.iter().enumerate() {
+            for (k, &v) in row.iter().enumerate() {
+                assert!(
+                    v.is_nan(),
+                    "leading-silence frame: expected NaN at t={t} k={k}, got {v}",
+                );
+            }
+        }
+
+        // Case B: only the last frame is silent (pcm[41984..44032] =
+        // 0, rest loud).  Frame 42 spans samples [41984, 44032) in
+        // real-sample terms (start = 42 * HopSamples - FRONT_PAD =
+        // 41984), so zeroing that range zeros the entire frame's
+        // windowed input.  Same NaN propagation as case A, but
+        // exercises the trailing edge.  Together the two cases bracket
+        // the framing geometry the FE filter mirrors.
+        let mut pcm_b = Box::new([0.1f32; WaveformLen::USIZE]);
+        let frame42_start = 42 * HopSamples::USIZE - FRONT_PAD;
+        for s in &mut pcm_b[frame42_start..frame42_start + FRAME_LEN] {
+            *s = 0.0;
+        }
+        let s_b = p.spectrogram(&pcm_b);
+        for (t, row) in s_b.iter().enumerate() {
+            for (k, &v) in row.iter().enumerate() {
+                assert!(
+                    v.is_nan(),
+                    "trailing-silence frame: expected NaN at t={t} k={k}, got {v}",
+                );
+            }
+        }
+    }
 }

@@ -1,4 +1,5 @@
 import { SLICE_SAMPLES } from './wav';
+import { wouldNanAtPreproc } from './silence';
 
 // Chunk a trimmed range of PCM samples into fixed-length slices.
 //
@@ -75,4 +76,67 @@ export function sliceCountFor(
   if (sliceSamples <= 0) return 0;
   const span = Math.max(0, endSamples - startSamples);
   return Math.floor(span / sliceSamples);
+}
+
+// Filtered slicing: same as [`chunkPcmToSlices`] but drops
+// windows that the daemon's preproc would NaN-reject (digital
+// silence in any FFT frame).  Returns the kept slices plus the
+// silent-skip count for the post-slice "X of Y skipped" notice.
+//
+// The skipped windows are never encoded / hashed / uploaded:
+// they'd just consume the operator's drop-ratio budget at
+// training time and surface as `DropRatioExceeded`.  Filtering
+// here means a sliced batch is guaranteed to survive
+// `extract_features` on the `dropped_nan` axis; the only way a
+// committed slice still drops at preproc is `dropped_io`,
+// which is structurally unreachable for FE-encoded PCM-i16
+// (the daemon's WAV ingest accepts our shape unconditionally).
+//
+// Inlines `chunkPcmToSlices`'s clamping so the silence check
+// runs against the *unallocated* PCM region (~88 KB per
+// reject) rather than a freshly-allocated 1 s buffer.  On a
+// recording that's mostly silence (a long bird-call trap with
+// sparse events, say), this avoids 100+ transient
+// `Float32Array` allocations whose only purpose was to be
+// immediately GC'd; on the common case (every window kept)
+// it's the same work as the prior implementation.
+export function chunkPcmToValidSlices(
+  pcm: Float32Array,
+  startSamples: number,
+  endSamples: number,
+  sliceSamples: number = SLICE_SAMPLES
+): { kept: Float32Array[]; silentDropped: number } {
+  if (sliceSamples <= 0) {
+    throw new Error('sliceSamples must be positive');
+  }
+  const clampedStart = Math.max(0, Math.min(startSamples, pcm.length));
+  const clampedEnd = Math.max(clampedStart, Math.min(endSamples, pcm.length));
+  const span = clampedEnd - clampedStart;
+  const count = Math.floor(span / sliceSamples);
+  if (count === 0) return { kept: [], silentDropped: 0 };
+
+  const kept: Float32Array[] = [];
+  let silentDropped = 0;
+  for (let i = 0; i < count; i++) {
+    const offset = clampedStart + i * sliceSamples;
+    // Silence check before allocation: `wouldNanAtPreproc`
+    // reads `pcm[offset..offset + PREPROC_WAVEFORM_LEN]`
+    // (44 032 samples), which is exactly the prefix the
+    // daemon's preproc consumes from a 44 100-sample slice.
+    // Skipping silent windows here is bit-for-bit equivalent
+    // to slicing them and then filtering -- `pcm.slice` would
+    // just memcpy the same samples the silence check already
+    // touched.
+    if (wouldNanAtPreproc(pcm, offset)) {
+      silentDropped++;
+      continue;
+    }
+    // `.slice(begin, end)` allocates a fresh buffer + memcpy
+    // in one pass.  Cheaper than `new Float32Array(n) +
+    // .set(...)`, which zero-fills before overwriting.  Each
+    // slice owns its buffer (subarray would alias the input
+    // and break the encoder's contract).
+    kept.push(pcm.slice(offset, offset + sliceSamples));
+  }
+  return { kept, silentDropped };
 }
