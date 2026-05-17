@@ -5,8 +5,19 @@
   import { SOCKET_LABEL, socketPillClass } from './socketPill';
 </script>
 
+<!-- Pinned to `--vis-panel-h` at every breakpoint, not just `lg+`.
+     Below `lg` the panels stack in a single grid column whose row
+     height is `auto`; without an explicit height, the canvases' own
+     DPR-sized `width`/`height` attributes (e.g. 1652×370 at a 826 px
+     wide pane on a 2× display) feed their ≈4.46:1 intrinsic aspect
+     ratio back into the content-based row sizing and drive the panel
+     height to vary with viewport width.  Same feedback loop already
+     documented (and worked around with `contain: size`) on InputPane.
+     Pinning the height here makes it width-invariant on every
+     screen and removes the visible jitter when dragging the window
+     edge through the `lg` breakpoint. -->
 <section
-  class="flex h-full flex-col rounded-xl border border-zinc-200 bg-white p-5 shadow-sm lg:h-(--vis-panel-h)"
+  class="flex h-(--vis-panel-h) flex-col rounded-xl border border-zinc-200 bg-white px-5 pt-3.5 pb-5 shadow-sm"
 >
   <!-- Metadata folds into the header so the bottom edge sits at exactly
        p-5 -- a separate footer pushed it to ~48 px and broke corner

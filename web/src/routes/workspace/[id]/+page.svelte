@@ -302,7 +302,7 @@
 {:else if detail}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div oncontextmenu={onPageContextMenu}>
-    <header class="mb-5">
+    <header class="mb-6">
       {#if editingName}
         <InlineName
           value={detail.name}
@@ -347,39 +347,30 @@
           </button>
         </div>
       {/if}
-      <p class="mt-1 text-[11px] text-zinc-500" title={detail.created_at}>
-        created {formatRelative(detail.created_at)}
+      <!-- Description strip: created · rev · modified, with the
+           upload-receipt "live" badge trailing the modified
+           timestamp it freshened.  Inline `·` separators match
+           the HeadCard pattern; each timestamp keeps its own
+           `title` so the absolute ISO is one hover away.  The
+           `·` separators sit OUTSIDE every span so hovering a
+           separator never fires an adjacent field's tooltip --
+           hover-affordance maps 1:1 to the visible label. -->
+      <p class="mt-1 text-[11px] text-zinc-500">
+        <span title={detail.created_at}>created {formatRelative(detail.created_at)}</span>
+        · rev {liveRevision} ·
+        <span title={detail.workspace_revision.at}
+          >modified {formatRelative(detail.workspace_revision.at)}</span
+        >
+        {#if revisionAdvanced}
+          <span
+            class="ml-1 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-800"
+            title="Advanced by recent upload(s); reload to refresh modified timestamp."
+          >
+            live
+          </span>
+        {/if}
       </p>
     </header>
-
-    <!-- Metadata strip: revision + id.  `font-mono text-[10px]` echoes
-         the Active Head card on Dashboard -- the project's idiom for
-         opaque technical identifiers. -->
-    <section
-      class="mb-6 grid grid-cols-1 gap-3 rounded-xl border border-zinc-200 bg-white p-4 shadow-sm sm:grid-cols-2"
-    >
-      <div>
-        <h3 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">Revision</h3>
-        <p class="mt-1 font-mono text-xs text-zinc-700">
-          rev {liveRevision}
-          <span class="text-zinc-400">· at {formatRelative(detail.workspace_revision.at)}</span>
-          {#if revisionAdvanced}
-            <span
-              class="ml-1 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-800"
-              title="Advanced by recent upload(s); reload to refresh `at` timestamp."
-            >
-              live
-            </span>
-          {/if}
-        </p>
-      </div>
-      <div class="min-w-0">
-        <h3 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">ID</h3>
-        <p class="mt-1 truncate font-mono text-[10px] text-zinc-700" title={detail.id}>
-          {detail.id}
-        </p>
-      </div>
-    </section>
 
     <!-- Dataset section.  CategoryList self-mounts: refreshes from
          the store and re-renders reactively on every mutation.

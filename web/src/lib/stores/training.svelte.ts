@@ -14,11 +14,16 @@
 // `hydrateHistory(ws)`: list the directory, sort by mtime,
 // fetch the top 2 JSONLs (eager), replay each through
 // `replayJsonl` to synthesise a `TrackedTrainingJob`, push
-// into `historyByWs`.  Older entries reveal lazily via
-// `loadMoreHistory(ws)` in batches of `PAGE_SIZE` so a
-// workspace with 50 past runs doesn't bake 50 HTTP requests
-// into every page load.  The eager 2 keep most operators'
-// "what did I just run" question instant; the rest is opt-in.
+// into `historyByWs`.  Older entries reveal on expand of the
+// "Show N older runs" disclosure: the expand handler refreshes
+// `discoveredByWs` from the backend (so the count reflects
+// current keep-last-N state, not the mount-time snapshot) and,
+// on the first expand only, auto-loads one batch of up to
+// `PAGE_SIZE` JSONLs.  Subsequent batches arrive via the
+// explicit "Load N more" click so the per-burst HTTP fan-out
+// stays bounded on eMMC backends.  The eager 2 keep most
+// operators' "what did I just run" question instant; the rest
+// is opt-in.
 //
 // Hydration is idempotent: a second call for the same
 // workspace returns immediately when `discoveredByWs` is
@@ -103,6 +108,7 @@
 
 import { SvelteMap } from 'svelte/reactivity';
 import { training as trainingApi } from '$lib/api/endpoints';
+import { isApiError } from '$lib/api/http';
 import { TrainingSubscriber } from '$lib/api/training-subscriber';
 import { TrainingLogTail } from '$lib/api/training-log-tail';
 import { capFirst, errorCopy } from '$lib/utils/error-copy';
@@ -177,15 +183,24 @@ const MAX_LOG_LINES = 500;
 
 // Maximum terminal jobs retained per workspace.  Holds session-
 // observed terminals AND entries loaded from the durable JSONL
-// backstop during `hydrateHistory` / `loadMoreHistory`.  Each
-// entry retains its full `epochs[]` + `logLines[]` (~30 KB),
-// so 50 lands a ~1.5 MB ceiling per workspace -- comfortable
-// for the paged-load model (operators who keep clicking "Load
-// older runs" can fill the cap several "Show more" clicks
-// deep without eviction surprising them).  Beyond the cap,
-// the oldest entries fall off on each push; the directory
-// listing still has them, so a future revisit can reload.
-const MAX_HISTORY_PER_WS = 50;
+// backstop during `hydrateHistory` / `loadMoreHistory`.  Pinned
+// to the daemon's `LOG_RETENTION_KEEP_COUNT` (see
+// `modules/file_mgr/log_retention.rs`) so the in-memory
+// surface matches what the producer-side retention keeps on
+// disk: a longer-lived session that runs ≥11 training jobs
+// no longer accumulates zombie entries that vanish on the
+// next page refresh.  Each entry retains its full `epochs[]` +
+// `logLines[]` (~30 KB), so 10 lands a ~300 KB ceiling per
+// workspace.  Beyond the cap, `pushHistoryBatch` evicts the
+// oldest on each push.  Bump in lockstep with the daemon
+// constant if either side ever changes.
+//
+// Exported so the TrainHistory retention-hint copy can
+// interpolate the same number it gates on -- the daemon ↔
+// frontend coupling stays a one-place mirror, but the
+// frontend ↔ UI copy is single-sourced.
+export const TRAINING_HISTORY_MAX_PER_WS = 10;
+const MAX_HISTORY_PER_WS = TRAINING_HISTORY_MAX_PER_WS;
 
 // Number of cards rendered eagerly when a workspace mounts.
 // The eager tier covers the typical operator question ("what
@@ -195,14 +210,22 @@ const MAX_HISTORY_PER_WS = 50;
 // the operator asks for them.
 const INITIAL_VISIBLE = 2;
 
-// Number of additional cards loaded per "Load older runs"
-// click.  Five matches the visual density of the eager tier
-// (an operator who clicks twice sees a comfortable browse
-// window of ~12 runs) without making a single click feel
-// expensive (5 parallel JSONL fetches is ~70 KB at typical
-// run sizes).  Exported so the TrainHistory "Load N more"
-// affordance can clamp its count against the same constant
-// without duplicating the magic number.
+// Per-click cap for the "Load N more" affordance (and for
+// the auto-load that fires on the first disclosure expand).
+// Five matches the visual density of the eager tier (one
+// click per visible row of finished runs) and bounds the
+// `Promise.all` parallelism so a slow eMMC backend doesn't
+// stall the UI on a single click.  Exported so the
+// TrainHistory button label can clamp its visible count
+// against the same constant without duplicating the magic
+// number.
+//
+// With the backend's `LOG_RETENTION_KEEP_COUNT = 10` cap
+// mirrored on the frontend by `MAX_HISTORY_PER_WS`, the
+// older tier holds at most `MAX_HISTORY_PER_WS -
+// INITIAL_VISIBLE = 8` entries, so a fully-loaded disclosure
+// is at most two clicks deep (5 + 3) -- explicit pagination,
+// not single-batch, keeps each click cheap.
 export const TRAINING_HISTORY_PAGE_SIZE = 5;
 const PAGE_SIZE = TRAINING_HISTORY_PAGE_SIZE;
 
@@ -308,8 +331,9 @@ class TrainingStore {
   // surface a permanent training-history list and (b) can
   // recover heads info without polling.  Dropped on
   // `forget(workspaceId)` (workspace delete).  Older entries
-  // are pruned daemon-side by the storage reaper (30-day
-  // retention) -- no operator-driven clear path lives here.
+  // are pruned daemon-side by producer-driven keep-last-N
+  // retention (`modules/file_mgr/log_retention.rs`) -- no
+  // operator-driven clear path lives here.
   private historyByWs = new SvelteMap<Uuid, TrackedTrainingJob[]>();
   // Counter that increments on every terminal transition --
   // workspace detail pages bind an `$effect` to this and
@@ -602,31 +626,90 @@ class TrainingStore {
   // Operator-driven log deletion does not live here.  An earlier
   // revision exposed `deleteAllFinished` / `deleteHistoryEntry`
   // and a "Clear finished" UI affordance, but both have been
-  // removed: the daemon's `storage_reaper` (file_mgr/
-  // storage_reaper.rs) already prunes per-workspace JSONL logs
-  // older than 30 days on its hourly sweep.  The clear-all path
-  // also tripped a subtle bug — N parallel per-entry deletes
-  // collided with the daemon's `max_delete_jobs = 1` slot,
-  // admitting one and 409'ing the rest, so a single click
-  // appeared to "clear" the whole list while only one file
-  // actually got removed.  Auto-rotation is the right layer for
-  // the retention policy.
+  // removed: the daemon enforces keep-last-N=10 per workspace
+  // per log tree at every producer open
+  // (`modules/file_mgr/log_retention.rs`), so `training_logs/`
+  // stays bounded without manual intervention.  The clear-all
+  // path also tripped a subtle bug — N parallel per-entry
+  // deletes collided with the daemon's `max_delete_jobs = 1`
+  // slot, admitting one and 409'ing the rest, so a single
+  // click appeared to "clear" the whole list while only one
+  // file actually got removed.  Producer-side retention is the
+  // right layer for the policy.
 
   // Toggle / explicit-set the "older runs" disclosure for
-  // `workspaceId`.  When opening for the first time and the
-  // older section has no loaded entries yet, also kicks off
-  // a `loadMoreHistory` to populate the first page.
+  // `workspaceId`.  On expand, kicks off a refresh + load
+  // chain so the disclosure operates on the backend's
+  // current state -- mount-time `discoveredByWs` drifts as
+  // the producer prunes older `<job_id>.jsonl` files past
+  // the backend's keep-last-N cap (and we can't observe
+  // cross-tab / external prunes any other way).  The chain
+  // is fire-and-forget; `loadingMoreByWs` is held across
+  // BOTH phases (directory re-list + JSONL fetches) so the
+  // UI's pending affordance covers the whole click → settle
+  // window, not just the load tail.
   setOlderExpanded(workspaceId: Uuid, expanded: boolean): void {
     this.olderExpandedByWs.set(workspaceId, expanded);
     if (expanded) {
-      // Auto-load the first page if nothing past the eager
-      // tier is loaded yet.  Fire-and-forget; the
-      // `loadingMoreByWs` flag drives the button's pending
-      // affordance.
-      const hist = this.historyByWs.get(workspaceId) ?? [];
-      if (hist.length <= INITIAL_VISIBLE) {
-        void this.loadMoreHistory(workspaceId);
+      void this.handleOlderExpand(workspaceId);
+    }
+  }
+
+  // Inner sequence for `setOlderExpanded(_, true)`:
+  //
+  //   1. Refresh the directory listing so
+  //      `loadableOlderCountFor` reads the backend's current
+  //      keep-last-N state and the "Show N older runs" badge
+  //      is honest at click time -- not a mount-time
+  //      snapshot the producer's retention has since
+  //      drifted past.
+  //   2. Auto-load the first batch (capped at `PAGE_SIZE`)
+  //      iff the older tier holds fewer than one batch worth
+  //      of entries.  An earlier revision gated on
+  //      `history.length <= INITIAL_VISIBLE` -- effectively
+  //      "the older tier is completely empty" -- but that
+  //      heuristic misses a very common case: after a fresh
+  //      mount loaded 2 eager entries and the operator
+  //      trained ONE job, the new terminal pushes the
+  //      bottom eager card into the older tier, so
+  //      `history.length` is now 3 (> INITIAL_VISIBLE) AND
+  //      `olderHistory.length` is 1 (< PAGE_SIZE).  The old
+  //      gate stayed false; the disclosure expanded showing
+  //      a single row instead of the ~5 the operator
+  //      expected from the badge.  Gating on the older
+  //      tier's own length fires correctly in both the
+  //      fresh-mount and post-train cases.
+  //
+  // Subsequent expansions (after the operator has loaded a
+  // full batch) re-run only the refresh -- the operator then
+  // drives further loads via the explicit "Load N more"
+  // affordance, so the per-click cap stays bounded and
+  // surprise auto-fetches don't pile up.  Any residual delta
+  // between fresh discovery and the cached history surfaces
+  // on the badge + button without triggering work.
+  //
+  // `loadingMoreByWs` is held across BOTH phases so the
+  // pending affordance covers the directory re-list too --
+  // on a slow `listLogs` the operator would otherwise see an
+  // instantly-expanded section that suddenly switches to a
+  // loading indicator partway through.  Acquiring the flag
+  // also serialises against the explicit "Load N more"
+  // click (`loadMoreHistory` no-ops while held), preventing
+  // two parallel `loadBatch` calls if a user clicks the
+  // pager during the auto-load tail.  We call `loadBatch`
+  // directly (not `loadMoreHistory`) to avoid the re-entry
+  // guard tripping on the flag we just set.
+  private async handleOlderExpand(workspaceId: Uuid): Promise<void> {
+    if (this.loadingMoreByWs.get(workspaceId)) return;
+    this.loadingMoreByWs.set(workspaceId, true);
+    try {
+      await this.refreshDiscovery(workspaceId);
+      const older = this.olderHistoryFor(workspaceId);
+      if (older.length < PAGE_SIZE) {
+        await this.loadBatch(workspaceId, PAGE_SIZE);
       }
+    } finally {
+      this.loadingMoreByWs.set(workspaceId, false);
     }
   }
 
@@ -687,16 +770,33 @@ class TrainingStore {
   // reveal -- i.e., discovered but not yet loaded into
   // `historyByWs`.  Drives the "Load N more" pagination
   // button's count + visibility.  Zero hides the affordance.
+  //
+  // Clamped at `MAX_HISTORY_PER_WS - history.length` to stay
+  // honest against backend-side retention: a session that
+  // trains many jobs causes the producer to prune older
+  // entries from disk, but `discoveredByWs` is a mount-time
+  // snapshot and does not refresh.  Without the clamp, a
+  // session that runs N jobs would inflate the "Show K older
+  // runs" badge by up to N stale entries that the user can
+  // never load (the JSONLs no longer exist).  The clamp ties
+  // the visible count to the backend's keep-last-N invariant:
+  // at most `MAX_HISTORY_PER_WS - history.length` more entries
+  // can possibly be loaded, regardless of how many stale
+  // jobIds linger in `discoveredByWs`.  `fetchAndReplay`'s
+  // 404 handler eventually prunes the stale ids so the loop
+  // count also converges.
   loadableOlderCountFor(workspaceId: Uuid): number {
     const discovered = this.discoveredByWs.get(workspaceId);
     if (!discovered) return 0;
-    const loadedIds = new Set<Uuid>((this.historyByWs.get(workspaceId) ?? []).map((j) => j.jobId));
+    const history = this.historyByWs.get(workspaceId) ?? [];
+    const loadedIds = new Set<Uuid>(history.map((j) => j.jobId));
     let n = 0;
     for (const r of discovered) {
       if (loadedIds.has(r.jobId)) continue;
       n++;
     }
-    return n;
+    const remainingCapacity = Math.max(0, MAX_HISTORY_PER_WS - history.length);
+    return Math.min(n, remainingCapacity);
   }
 
   // ── Persistent-history hydration methods ───────────────────
@@ -724,35 +824,7 @@ class TrainingStore {
     // past the redesign that hard-deletes instead of hiding.
     clearLegacyHiddenStorage(workspaceId);
     try {
-      const listing = await trainingApi.listLogs(workspaceId, { limit: 100 });
-      const discovered: DiscoveredRun[] = [];
-      for (const entry of listing.entries) {
-        if (entry.kind !== 'file') continue;
-        if (!entry.name.endsWith('.jsonl')) continue;
-        const jobId = entry.name.slice(0, -'.jsonl'.length);
-        if (jobId.length === 0) continue;
-        discovered.push({
-          jobId,
-          mtime: entry.mtime,
-          sizeBytes: entry.size_bytes ?? 0
-        });
-      }
-      // Newest-first by mtime; tie-break by jobId so the order
-      // is stable across listings (filesystems can produce
-      // sub-second-equal mtimes on fast back-to-back runs).
-      // Strict-weak tiebreak: return 0 on equal jobIds.  In
-      // practice `<workspace>/training_logs/<job_id>.jsonl` paths
-      // are unique per jobId so the equal case never fires, but
-      // a non-zero-on-equal comparator violates `Array.sort`'s
-      // contract and is fragile to future call sites that pass
-      // arrays with duplicates.
-      discovered.sort((a, b) => {
-        if (a.mtime > b.mtime) return -1;
-        if (a.mtime < b.mtime) return 1;
-        if (a.jobId < b.jobId) return -1;
-        if (a.jobId > b.jobId) return 1;
-        return 0;
-      });
+      const discovered = await this.fetchDiscoveryListing(workspaceId);
       this.discoveredByWs.set(workspaceId, discovered);
       // Eager tier: load up to `INITIAL_VISIBLE` non-active,
       // non-already-loaded entries.
@@ -768,11 +840,92 @@ class TrainingStore {
     }
   }
 
-  // Reveal the next page of older runs (or as many as remain).
-  // Drives the "Load N more" button.  No-op when hydration
-  // hasn't completed or there are no unloaded discovered
-  // entries; serialised against itself via `loadingMoreByWs`
-  // so a double-click can't fire two parallel batches.
+  // List the workspace's `training_logs/` directory and project
+  // the response into a sorted, capped `DiscoveredRun[]`.
+  // Shared between `hydrateHistory` (initial mount) and
+  // `refreshDiscovery` (older-disclosure expand) so both paths
+  // agree on shape, sort order, and the
+  // `MAX_HISTORY_PER_WS` ceiling.  Throws on listing error
+  // (caller decides how to surface).
+  //
+  // `limit: 100` keeps a comfortable headroom over the
+  // backend's `LOG_RETENTION_KEEP_COUNT = 10` for the
+  // transition window where a workspace straddles a daemon
+  // upgrade and still has pre-cap files on disk; the server
+  // sorts by jobId (not mtime), so over-fetching guarantees
+  // we see the actual mtime-newest entries when we sort
+  // client-side here.
+  private async fetchDiscoveryListing(workspaceId: Uuid): Promise<DiscoveredRun[]> {
+    const listing = await trainingApi.listLogs(workspaceId, { limit: 100 });
+    const discovered: DiscoveredRun[] = [];
+    for (const entry of listing.entries) {
+      if (entry.kind !== 'file') continue;
+      if (!entry.name.endsWith('.jsonl')) continue;
+      const jobId = entry.name.slice(0, -'.jsonl'.length);
+      if (jobId.length === 0) continue;
+      discovered.push({
+        jobId,
+        mtime: entry.mtime,
+        sizeBytes: entry.size_bytes ?? 0
+      });
+    }
+    // Newest-first by mtime; tie-break by jobId so the order
+    // is stable across listings (filesystems can produce
+    // sub-second-equal mtimes on fast back-to-back runs).
+    // Strict-weak tiebreak: return 0 on equal jobIds.  In
+    // practice `<workspace>/training_logs/<job_id>.jsonl` paths
+    // are unique per jobId so the equal case never fires, but
+    // a non-zero-on-equal comparator violates `Array.sort`'s
+    // contract and is fragile to future call sites that pass
+    // arrays with duplicates.
+    discovered.sort((a, b) => {
+      if (a.mtime > b.mtime) return -1;
+      if (a.mtime < b.mtime) return 1;
+      if (a.jobId < b.jobId) return -1;
+      if (a.jobId > b.jobId) return 1;
+      return 0;
+    });
+    // Clamp to `MAX_HISTORY_PER_WS` so the discovery surface
+    // never overstates the loadable count.  The backend's
+    // producer-side retention keeps at most that many
+    // `<job_id>.jsonl` files per tree, but a workspace
+    // straddling an upgrade window (or a transient race
+    // against a producer that hasn't run its first
+    // retention sweep yet) can briefly list more.  Trimming
+    // here keeps `loadableOlderCountFor` honest and prevents
+    // `loadBatch` from fetching entries that
+    // `pushHistoryBatch` would immediately evict (the
+    // newest `MAX_HISTORY_PER_WS` always win the sort).
+    return discovered.slice(0, MAX_HISTORY_PER_WS);
+  }
+
+  // Re-list the workspace's `training_logs/` directory and
+  // replace `discoveredByWs` with the fresh entries.  Called
+  // from the "Show N older runs" expand handler so the
+  // disclosure operates on the backend's current
+  // keep-last-N state -- including any pruning that happened
+  // since mount (session producer, cross-tab trains, daemon
+  // restart, ...).  Best-effort: a network failure leaves the
+  // existing discovery in place so the user can still
+  // interact with what we already know.
+  private async refreshDiscovery(workspaceId: Uuid): Promise<void> {
+    try {
+      const discovered = await this.fetchDiscoveryListing(workspaceId);
+      this.discoveredByWs.set(workspaceId, discovered);
+    } catch (e) {
+      console.warn('[training] refresh discovery failed', { workspaceId, error: e });
+    }
+  }
+
+  // Reveal up to `PAGE_SIZE` older-tier runs from the
+  // backend.  Drives BOTH the auto-load on the first
+  // disclosure expand and the explicit "Load N more"
+  // pagination button.  Bounded per-click so the
+  // `Promise.all` never fans out wider than `PAGE_SIZE`
+  // parallel JSONL fetches -- 8 parallel fetches was
+  // noticeably laggy on eMMC backends.  Serialised against
+  // itself via `loadingMoreByWs` so a double-click can't
+  // fire two parallel batches.
   async loadMoreHistory(workspaceId: Uuid): Promise<void> {
     if (!this.discoveredByWs.has(workspaceId)) return;
     if (this.loadingMoreByWs.get(workspaceId)) return;
@@ -820,7 +973,16 @@ class TrainingStore {
 
   // Fetch one JSONL page and replay it into a
   // `TrackedTrainingJob`.  Returns `null` when:
-  //   - the JSONL is unreadable (404 / parse error)
+  //   - the JSONL is unreadable (parse error / transient
+  //     network failure)
+  //   - the JSONL is permanently gone (HTTP 404 — the
+  //     producer's keep-last-N retention swept it past the
+  //     window after the mount-time directory listing
+  //     snapshotted its existence).  Confirmed-gone entries
+  //     are pruned from `discoveredByWs` here so the next
+  //     `loadableOlderCountFor` reads a converged count and
+  //     a subsequent `loadMoreHistory` click won't re-attempt
+  //     the same dead path.
   //   - replay produced no view (empty file)
   //   - the run is still in-flight (no terminal event in
   //     JSONL; either `recover()` will pick it up via SSE,
@@ -838,7 +1000,17 @@ class TrainingStore {
         limit: HYDRATION_LOG_LIMIT
       });
     } catch (e) {
-      console.warn('[training] replay fetch failed', { workspaceId, jobId, error: e });
+      if (isApiError(e) && e.status === 404) {
+        // The backend's producer-side keep-last-N retention
+        // swept this entry after we discovered it; prune the
+        // stale jobId from `discoveredByWs` so the
+        // loadable-count and re-attempt loop converge.
+        // Transient errors (5xx / network) leave the entry
+        // in place so the next mount's hydration can retry.
+        this.dropFromDiscovered(workspaceId, jobId);
+      } else {
+        console.warn('[training] replay fetch failed', { workspaceId, jobId, error: e });
+      }
       return null;
     }
     // Re-check active after the await: a fast-finishing run
@@ -848,6 +1020,20 @@ class TrainingStore {
     if (this.active?.jobId === jobId) return null;
     if (page.events.length === 0) return null;
     return replayJsonl(workspaceId, jobId, page.events);
+  }
+
+  // Remove a confirmed-stale jobId from `discoveredByWs`.
+  // Called when a `fetchAndReplay` hits a 404, indicating
+  // the backend's producer-side retention has pruned the
+  // file we discovered at mount time.  Idempotent and a
+  // no-op when the workspace has no discovery state or the
+  // id is already absent.
+  private dropFromDiscovered(workspaceId: Uuid, jobId: Uuid): void {
+    const prev = this.discoveredByWs.get(workspaceId);
+    if (!prev) return;
+    const next = prev.filter((r) => r.jobId !== jobId);
+    if (next.length === prev.length) return;
+    this.discoveredByWs.set(workspaceId, next);
   }
 
   // Clear all state for `workspaceId` (e.g. workspace deleted).

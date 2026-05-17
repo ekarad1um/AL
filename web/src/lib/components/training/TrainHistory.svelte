@@ -5,6 +5,7 @@
   import TrainHistoryItem from './TrainHistoryItem.svelte';
   import {
     training as trainingStore,
+    TRAINING_HISTORY_MAX_PER_WS,
     TRAINING_HISTORY_PAGE_SIZE
   } from '$lib/stores/training.svelte';
   import type { TrackedTrainingJob } from '$lib/stores/training.svelte';
@@ -19,10 +20,10 @@
   // ## Visibility tiers (since the persistent-history hydration
   //    landed in 2026-05)
   //
-  // The list is split into three regions so a workspace with
-  // 50 past runs doesn't bake 50 HTTP requests into every
-  // mount, but the operator's typical question ("what did I
-  // just run") still answers at the lowest possible cost:
+  // The list is split into three regions so the operator's
+  // typical question ("what did I just run") answers at the
+  // lowest possible cost on mount, while the rest of the
+  // backend's keep-last-N retention window is a click away:
   //
   //   - **Eager tier** (top, always visible):
   //       active card (if any, auto-expanded) +
@@ -31,12 +32,19 @@
   //   - **Older disclosure** (below the eager tier, collapsed
   //     by default):
   //       "▾ Show N older runs" — total non-hidden runs
-  //       beyond the eager tier (loaded or not).
+  //       beyond the eager tier (loaded or not).  Expanding
+  //       triggers a re-list of the directory so N reflects
+  //       the backend's current keep-last-N state, not the
+  //       mount-time snapshot the producer's retention has
+  //       since drifted past.
   //   - **Older list** (inside the disclosure, when expanded):
   //       every history row past the eager tier, plus a "Load
   //       N more ↓" pagination button when more remain
-  //       undiscovered.  Each "Load more" fetches PAGE_SIZE
-  //       JSONLs in parallel.
+  //       undiscovered.  Each "Load more" click fetches up to
+  //       `TRAINING_HISTORY_PAGE_SIZE` JSONLs in parallel
+  //       (bounded so the burst stays cheap on eMMC); the
+  //       first expand auto-fires one batch so the operator
+  //       sees content immediately.
   //
   // ## Loading + empty state choreography
   //
@@ -217,19 +225,24 @@
 </script>
 
 <!-- Section header.  No "Clear finished" affordance: the
-     daemon's storage reaper auto-prunes per-workspace JSONL
-     logs older than 30 days (`storage_reaper.rs`,
-     `LOG_AGE_THRESHOLD = 30 * 24 * 3600`, swept hourly).  A
-     manual clear-all path was redundant — and the previous
-     per-entry fan-out tripped the daemon's
-     `max_delete_jobs = 1` admission slot, so the operator
-     thought they'd cleared all rows but only one disk file
-     actually got deleted.  Auto-rotation is the right layer
-     for this policy; the right side of the header carries a
-     muted retention hint so an operator wondering "where did
-     my run from 2 months ago go?" has the answer in
-     peripheral vision rather than having to dig through
-     daemon docs. -->
+     daemon enforces a keep-last-N cap per workspace per log
+     tree at every producer open
+     (`modules/file_mgr/log_retention.rs`,
+     `LOG_RETENTION_KEEP_COUNT`).  A manual clear-all path
+     was redundant — and the previous per-entry fan-out
+     tripped the daemon's `max_delete_jobs = 1` admission
+     slot, so the operator thought they'd cleared all rows
+     but only one disk file actually got deleted.
+     Producer-side retention is the right layer for this
+     policy; the right side of the header carries a muted
+     retention hint so an operator wondering "where did my
+     (N+1)th-newest run go?" has the answer in peripheral
+     vision rather than having to dig through daemon docs.
+     The visible `N` interpolates `TRAINING_HISTORY_MAX_PER_WS`
+     (the store's mirror of the daemon constant), so the UI
+     copy stays single-sourced against the gate; the daemon ↔
+     frontend coupling is the only place that still has to
+     move in lockstep. -->
 <div class="flex flex-col gap-2">
   <div class="flex items-baseline justify-between">
     <h3 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">History</h3>
@@ -246,9 +259,9 @@
            number so the visual cost is one short phrase. -->
       <span
         class="text-[10px] text-zinc-400"
-        title="The daemon automatically removes per-workspace training-log files older than 30 days. The published head record (in the Heads section below) is unaffected — only the JSONL trace is pruned."
+        title="The daemon keeps the {TRAINING_HISTORY_MAX_PER_WS} most recent training-log files per workspace; older JSONL traces are pruned when a new run opens. The published head record (in the Heads section below) is unaffected — only the JSONL trace is pruned."
       >
-        Auto-rotated after 30 days
+        Keeps last {TRAINING_HISTORY_MAX_PER_WS} runs
       </span>
     {/if}
   </div>

@@ -38,18 +38,45 @@ body {
   color-scheme: light;
 }
 
-/* Visualization & Inference share a grid row at lg+ and must stay the
-   same height regardless of inference content (Top-K rows, head fields).
-   Without an explicit height, the grid row tracks whichever panel's
-   max-content is larger -- a rogue Top-K count would inflate the
-   spectrogram pane.  Both sections anchor to this height:
-     p-5 top      20  + header        34  (text-sm + mb-3)
-   + waveform   176  + gap-2           8
-   + spectro    176  + p-5 bottom     20  = 434 px = 27.125 rem
+/* Visualization & Inference are pinned to this height at every
+   breakpoint, not just where they share a grid row (lg+).  At <lg
+   they stack in a single column; without an explicit height there
+   the canvases' DPR-sized `width`/`height` attributes feed their
+   intrinsic aspect ratio (≈4.46:1 at typical pane widths) back into
+   the row's content sizing and drive panel height as a function of
+   viewport width -- the panel visibly shrinks/grows during a window
+   drag.  Pinning here forces both layouts to the same vertical
+   budget and isolates the canvases inside it.
+   Card body uses `px-5 pt-3.5 pb-5` -- the top inset is 6 px tighter
+   than the others on purpose, compensating for the full optical gap
+   above a `text-sm` heading's cap.  For 14 px / 20 px line-height
+   SF Pro Text:
+     half-leading above ascent       = (20 − 17)/2 = 1.5 px
+     ascent-above-cap (font - cap)   = 14 − 9.86 = 4.14 px
+                                       ─────────
+     leading + ascent above cap top  ≈ 5.6 px
+   With symmetric `p-5` the heading's cap top sits 20 + 5.6 = 25.6 px
+   below the card edge while the side ink sits at 20 px -- a visible
+   ~5 px asymmetry that reads as "the title is pushed away from the
+   top."  Trimming pt to 14 px brings the cap top to 14 + 5.6 ≈ 20 px,
+   matching the side ink within 0.5 px.  The status pill in the same
+   header drifts ~6 px upward as a result, but the soft tinted chip is
+   visually far less anchored than the dark heading text -- the
+   alignment that matters to the reader is text-to-edge, not
+   bg-fill-to-edge.  Same pattern InputPane / SlicePane already use one
+   tier down (`pt-1.5 pb-3`).
+     border top    1  + pt-3.5      14
+   + header       32  (text-sm 20 + mb-3 12)
+   + waveform   179  + gap-2         8
+   + spectro    179  + pb-5        20
+   + border bot   1                       = 434 px = 27.125 rem
    Inside Visualization, waveform and spectrogram each take `flex-1
-   min-h-0` so the inner 360 px (= 176 + 8 + 176) splits 50/50.
+   min-h-0` so the inner 366 px (= 179 + 8 + 179) splits 50/50.
    Inference fits this budget via `flex-1 min-h-0 overflow-y-auto` on
-   its Top-K wrapper. */
+   its Top-K wrapper, so a rogue Top-K count never inflates the
+   pane.  The pair also stays the same height as each other -- a
+   shared-row constraint at lg+ and a layout-consistency constraint
+   below it. */
 :root {
   --vis-panel-h: 27.125rem;
 }

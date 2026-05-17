@@ -152,7 +152,7 @@
   }
 </script>
 
-<section class="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm">
+<section class="rounded-xl border border-zinc-200 bg-white px-5 pt-3.5 pb-5 shadow-sm">
   <!-- Header: title + description form a left-hand block; the Add
        Category button vertically centres against the whole block.
        `items-center` agrees the vertical midpoint of the two

@@ -211,12 +211,13 @@ export const training = {
     api.delete<CancelResp>(
       `/api/v1/workspace/${encodeURIComponent(workspaceId)}/training/${encodeURIComponent(jobId)}`
     ),
-  // No client-bound `deleteLog` / `deleteAllLogs` -- the daemon's
-  // `storage_reaper` prunes per-workspace JSONLs older than 30
-  // days automatically (see `modules/file_mgr/storage_reaper.rs`),
-  // so no UI surface needs an explicit-delete affordance.  The
-  // bare-path DELETE endpoints still exist daemon-side for
-  // operational tooling.
+  // No client-bound `deleteLog` / `deleteAllLogs` -- the daemon
+  // enforces keep-last-N (N=10) per workspace per log tree on
+  // every producer open (see
+  // `modules/file_mgr/log_retention.rs`), so a workspace's
+  // `training_logs/` stays bounded without an explicit-delete
+  // affordance.  The bare-path DELETE endpoints still exist
+  // daemon-side for operational tooling.
   // Path builder for the durable JSONL backstop.  Exposed for
   // tooling; the `LogPageResp` reader below is the typed entry
   // point.  The backstop is sparse (today's training producer

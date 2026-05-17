@@ -186,7 +186,7 @@
     'select-chevron block w-full rounded-md border border-zinc-200 bg-white px-2.5 py-1.5 text-xs transition-colors hover:border-zinc-300 disabled:cursor-wait disabled:bg-zinc-50 disabled:text-zinc-400 disabled:hover:border-zinc-200';
 </script>
 
-<section class="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm">
+<section class="rounded-xl border border-zinc-200 bg-white px-5 pt-3.5 pb-5 shadow-sm">
   <header class="mb-4 flex items-baseline justify-between">
     <h2 class="text-sm font-semibold text-zinc-900">Configuration</h2>
     {#if config.error && !unavailable}
@@ -302,10 +302,28 @@
             class="space-y-3 transition-opacity duration-150 ease-out"
             class:opacity-60={inferApplying}
           >
-            <div>
-              <div class="flex items-baseline justify-between">
+            <!-- Slider row geometry mirrors the Microphone column's
+                 `<label>span + select</label>` (16 + mb-1 + 30 = 50 px) so the
+                 two columns are intrinsically the same height -- without
+                 that, the right column was 3 px taller per row (×2 rows =
+                 6 px), the grid stretched both cells to the taller, and the
+                 left column's Channel select picked up 6 px of unwanted
+                 slack between its bottom and the section's pb-5 edge.
+                 `flex flex-col gap-1` replaces the old block + `mt-1`:
+                 promoting the input out of inline-replaced-element layout
+                 removes the line-box-baseline overhead that block-stacked
+                 it 2 px below where its border-box ended.  `items-center`
+                 on the header + `leading-4` on the value span force the
+                 header flex to a flat 16 px (rather than baseline-aligning
+                 ascent boxes of mixed 11 / 12 px text, which pushed the
+                 flex to 17 px from the larger ascent of the value span);
+                 the small visual shift of the value baseline relative to
+                 the label is well below perception (≤0.5 px between SF
+                 Pro 11 and 12 px metrics). -->
+            <div class="flex flex-col gap-1">
+              <div class="flex items-center justify-between">
                 <label for="overlap-ratio" class="text-xs text-zinc-600">Overlap Ratio</label>
-                <span class="text-[11px] text-zinc-500">
+                <span class="text-[11px] leading-4 text-zinc-500">
                   <span class="font-mono text-zinc-700">{overlap.toFixed(2)}</span>
                   <span class="text-zinc-400">· ≈ {approxHz(overlap)}</span>
                 </span>
@@ -320,14 +338,31 @@
                 onchange={autoApplyInference}
                 disabled={inferApplying}
                 style="--slider-percent: {overlapPct}%"
-                class="mt-1"
               />
             </div>
 
-            <div>
-              <div class="flex items-baseline justify-between">
+            <!-- `-mb-1.75 md:mb-0` compensates for the range input's
+                 internal whitespace below the thumb when this slider is
+                 the section's last element (stacked layout below `md`).
+                 The input is 30 px tall to match the select height, but
+                 its visible content (6 px track + 16 px thumb, centered)
+                 only spans rows 7–23 within the input box -- the bottom
+                 7 px is transparent inside the input's border-box, so the
+                 card's `pb-5` measures from a phantom edge and the
+                 visible thumb sits 28 px from the card bottom while the
+                 track sides sit at 21 px from the card sides.  Pulling
+                 the container up by exactly 7 px restores ink-to-edge
+                 symmetry on mobile.  At `md+` the grid stretches the
+                 right column to row height (which is ≥ this column's
+                 intrinsic), so the negative margin gets absorbed into
+                 stretch slack -- but `md:mb-0` neutralizes it explicitly
+                 so the column intrinsic does not drift below the LEFT
+                 column's, which would resurrect the original 6 px slack
+                 the previous fix eliminated. -->
+            <div class="-mb-1.75 flex flex-col gap-1 md:mb-0">
+              <div class="flex items-center justify-between">
                 <label for="top-k" class="text-xs text-zinc-600">Top-K</label>
-                <span class="font-mono text-[11px] text-zinc-700">{topK}</span>
+                <span class="font-mono text-[11px] leading-4 text-zinc-700">{topK}</span>
               </div>
               <input
                 id="top-k"
@@ -339,7 +374,6 @@
                 onchange={autoApplyInference}
                 disabled={inferApplying}
                 style="--slider-percent: {topKPct}%"
-                class="mt-1"
               />
             </div>
           </div>

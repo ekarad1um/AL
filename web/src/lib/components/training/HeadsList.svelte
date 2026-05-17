@@ -128,7 +128,7 @@
   }
 </script>
 
-<section class="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm">
+<section class="rounded-xl border border-zinc-200 bg-white px-5 pt-3.5 pb-5 shadow-sm">
   <header class="mb-3 flex items-baseline justify-between">
     <h2 class="text-sm font-semibold text-zinc-900">Heads</h2>
     <span class="text-[11px] text-zinc-500">

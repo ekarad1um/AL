@@ -408,7 +408,7 @@
   }
 </script>
 
-<section class="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm">
+<section class="rounded-xl border border-zinc-200 bg-white px-5 pt-3.5 pb-5 shadow-sm">
   <!-- Header.  Title block on the left (with subtitle that
        carries the dataset-readiness / cross-workspace busy
        state -- but stays stable across this workspace's own

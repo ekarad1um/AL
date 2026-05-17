@@ -46,8 +46,12 @@
   });
 </script>
 
+<!-- Same `--vis-panel-h` lock as Visualization at every breakpoint.
+     At `lg+` we still share the grid row; at `<lg` we stack but want
+     the same vertical budget so the Top-K scroller / Active Head card
+     layout doesn't reflow with viewport width. -->
 <section
-  class="flex h-full flex-col rounded-xl border border-zinc-200 bg-white p-5 shadow-sm lg:h-(--vis-panel-h)"
+  class="flex h-(--vis-panel-h) flex-col rounded-xl border border-zinc-200 bg-white px-5 pt-3.5 pb-5 shadow-sm"
 >
   <!-- Mirrors Visualization's header: title + meta caption left, status
        pill right.  font-mono on Hz prevents digit-width jitter as the
