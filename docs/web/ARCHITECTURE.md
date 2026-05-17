@@ -177,3 +177,81 @@ digraph FrontendArchitecture {
     StreamAPI -> VizUI [label="Audio Pkt &\nInfer Results"];
 }
 ```
+
+## F. Dataset Sync Mechanism
+
+The Dataset Management Module's sync layer is content-addressed and revision-gated. The design optimises for the common case where the operator's local IDB already reflects the daemon's state (page refresh, workspace switch back-and-forth, idle polling) by eliminating per-category dataset GETs in that path. It also enforces strict laziness for the expensive operations (WAV download + FFT render) so a workspace with hundreds of slices doesn't burn bandwidth + CPU on cards the operator never looked at.
+
+### F.1. Content-addressed identity
+
+Every slice's canonical identity is the SHA-256 of its WAV bytes (lowercase hex, computed via `crypto.subtle.digest` at slice production time). The same string is:
+
+- The daemon-side filename basename: `<sha>.wav`.
+- The IDB `slices` primary-key suffix (composite `[workspace_id, category_name, id]` — the composite admits the same content in two categories).
+- The `spectrograms` cache key (shared across categories and workspaces; same content yields one rendered PNG).
+- The in-memory blob cache key (per-tab session).
+
+The daemon's PUT receipt's `sha256` MUST equal our pre-computed id; a mismatch is treated as an upload failure. Downloaded bytes are also verified post-fetch (sha256 of received bytes vs the slice id) before reaching any cache. `sliceIdFromFilename` strictly validates `^[0-9a-f]{64}$`; non-conforming foreign-named files on the daemon are silently skipped during reconcile (their bytes would fail the integrity check anyway).
+
+### F.2. Three-tier sync hierarchy
+
+**Tier 1 — workspace-revision short-circuit (steady state; zero dataset GETs).** A persisted `workspace_sync` IDB row holds `last_synced_revision_id` per workspace. On workspace mount, the page compares the freshly-fetched `detail.workspace_revision.id` to this record (via an in-memory mirror, `lastSyncedRevisions`, that's read from IDB once per session). When `synced >= workspaceRevision`, the per-category dataset GETs are skipped entirely — the UI renders straight from IDB. The `>=` (rather than `===`) admits the case where our auto-advance (see F.4) bumped the mirror past the page's last-known detail rev.
+
+**Tier 2 — per-category index reconcile (cheap; only on revision advance, first visit, or explicit force).** Concurrency-capped (3 categories at once) fan-out of `GET /assets/datasets/<cat>`. Pure set-difference rules on filenames:
+
+- committed-local + filename in daemon listing → no-op (same content by construction).
+- committed-local + filename absent → orphan; drop the row (only when the listing call succeeded — a failing listing leaves IDB alone).
+- `local | uploading | failed` → preserve always (no daemon presence by definition).
+- daemon-only file with sha-shaped basename → synthesise a committed row.
+
+Successful workspace-wide reconcile persists `workspace_sync` to `max(workspaceRevision, currentMirror)` — never regressing past a value already advanced by auto-advance. The next mount's Tier 1 short-circuit then hits.
+
+**Tier 3 — lazy materialisation on visibility (the WAV + FFT cost).** Slice bytes and spectrograms are fetched only when a `SliceCard` becomes visible. A single grid-rooted `IntersectionObserver` (with a `64px` rootMargin pre-fetch buffer) populates a `visibleIds` set; each card debounces its fetch trigger by 150 ms so fast-scroll transits don't queue work the operator never paused on. Concurrency caps: 6 simultaneous WAV downloads, 3 simultaneous FFT renders. Cached spectrograms (PNG blobs) live in IDB keyed by sha256 and are valid forever per content hash — no invalidation logic needed (different bytes produce a different hash, hence a different cache row).
+
+### F.3. Workspace poller
+
+A 2 s tick fetches `GET /workspace/{id}` while the page is visible. It compares the daemon's `workspace_revision.id` to the persisted `workspace_sync` value (via the in-memory mirror — NOT against `latestRevisions`, which the poller bumps itself and would silently mask failed reconciles). On advance, it flips per-category stale bits AND fires a background Tier 2 reconcile. Failed or in-flight-blocked reconciles leave the persisted value behind the daemon, so the next tick retries until success.
+
+Three short-circuit gates skip a tick without a daemon round-trip:
+
+- `document.hidden` (background tab); resumes on `visibilitychange` with an immediate tick.
+- `slices.mutationsInFlightFor(id) > 0` (operator is uploading/deleting — our own mutations would false-positive against pre-receipt store state).
+- Single-flight `fetching` flag (a slow daemon tick doesn't pile up concurrent fetches).
+
+### F.4. Auto-advance on local commits
+
+When a local upload's receipt rev equals `lastSyncedRevisions[ws] + 1`, our upload is provably the only daemon-rev-advancing event between `synced` and `receipt.rev` (the daemon's rev counter is sequential and monotonic). The mirror advances atomically and a fire-and-forget `putWorkspaceSync` persists the new value. The strict `+1` check is multi-tab-safe: if a concurrent external upload landed first, our receipt rev jumps past `+1`, the check fails, and we fall back to the poller-driven reconcile to discover the external delta. The optimisation eliminates the redundant Tier 2 reconcile that the poller would otherwise fire after every local commit (since `incoming > synced` would be true until reconcile catches up).
+
+### F.5. Robustness guarantees
+
+- **Mirror, IDB, and `latestRevisions` are jointly monotonic.** Every writer flows through `setLastSyncedAtLeast` / `setRevisionAtLeast`. The reconcile's IDB write uses `max(workspaceRevision, mirror)` so a stale-rev reconcile (caller's prop lagged auto-advance) doesn't regress the persisted record.
+
+- **Forget-race guards.** Every `await` in `refresh` / `reconcileWorkspace` is followed by a `lists.has(k)` (or `workspacesLoaded.has(workspaceId)`) check before any in-memory or IDB write that would resurrect a workspace currently being wiped.
+
+- **In-memory merge on refresh.** The per-category refresh captures a `startIds` snapshot before its awaits and merges the reconciled result with the live in-memory state at the end. Appends, deletes, and state transitions that landed during the await window are preserved — the operator's just-sliced row stays visible even when a poll-driven reconcile fires concurrently. Synthesise is dedup'd by `seenFilenames` populated from every kept row (not just committed-matched), so a local row whose content also exists on the daemon doesn't produce a duplicate-id row.
+
+- **`AbortController` at enqueue time.** The upload pipeline's controller is created when `enqueueUpload` is called (not when `runUpload` actually dispatches), so a `delete()` that lands while the upload is still queued can abort it before it gets a pool slot. Identity-checked cleanup at the wrapper's `finally` ensures a re-enqueue after delete doesn't cross-clobber the successor's entry.
+
+- **Recursion catch-up.** When `reconcileWorkspace` completes successfully, it checks if `latestRevisions > succeededAt` (where `succeededAt` is captured AFTER the put-await to reflect any auto-advance bumps that landed during it). If so, recurse with the live category set and the newer rev — without waiting for the next poller tick. The post-await read suppresses redundant recursion when our own auto-advance closed the gap.
+
+- **No content-addressed cache eviction on per-slice delete.** Spectrogram and blob caches are keyed by content hash; another slice anywhere may still rely on the entry. The cache grows linearly with unique content hashes seen in the session (~3-4 KB per spectrogram PNG); `resetDB` is the single reset point.
+
+### F.6. Error handling
+
+- Daemon listing 5xx → refresh's catch preserves in-memory state, flips the loading flag, sets an error message on the per-category list. Next refresh trigger retries.
+- Daemon listing 404 → treated as empty (operator added the category but hasn't uploaded a slice yet).
+- Spectrogram render failure → SliceCard logs the warning, renders without an image. Scrolling away and back triggers a fresh attempt (the cache was never populated).
+- Daemon returns bytes with sha mismatch → throw from `getSliceBlob`; SliceCard handles the same as a render failure.
+- IDB write failure on bulk ops → caught and swallowed at the call site; the in-memory list remains authoritative until the next refresh re-attempts.
+
+### F.7. IDB schema
+
+| Store | Key | Purpose |
+| --- | --- | --- |
+| `categories` | `[workspace_id, name]` | Operator-added categories not yet materialised on the daemon (empty dirs aren't listed by the daemon). |
+| `drafts` | `[workspace_id, category_name]` | Single in-progress clip per category (Input Module retains only the most recent). |
+| `slices` | `[workspace_id, category_name, id]` | Per-slice records; `id` = sha256 hex of WAV bytes; composite key admits same content in two categories. |
+| `workspace_sync` | `workspace_id` | `last_synced_revision_id` per workspace; powers the Tier 1 short-circuit. |
+| `spectrograms` | `sha256` | Cached PNG bytes, shared across categories + workspaces by content hash. |
+
+Workspace delete cleans the workspace's own rows in `categories` / `drafts` / `slices` / `workspace_sync`. `spectrograms` is intentionally not workspace-scoped (content-addressed, may be referenced by other workspaces) — `resetDB` is the only operation that wipes it.
