@@ -29,19 +29,27 @@ class StreamsStore implements PcmSource {
 
   readonly sampleRate = PCM_SAMPLE_RATE;
   readonly renderLatencyMs = DEFAULT_RENDER_LATENCY_MS;
-  // Visible ring-buffer capacity in seconds.  Exposed so callers
-  // sizing a stream capture (InputPane's "Stream" mode) can cap
-  // their offered duration to what we'll actually have history
-  // for at stop time.
+  // PCM ring capacity in seconds.  Sized for visualizer lookback
+  // (the dashboard's live waveform reads a sliding window from
+  // here), NOT for long-form capture -- the InputPane stream
+  // capture taps `pushPcm` via `tap()` below to accumulate beyond
+  // ring rollover.  Exposed as a constant so `EnvelopeWaveform`
+  // and other visualizers can size their internal scratch buffers
+  // against the maximum window they could ever paint.
   readonly ringSeconds = PCM_BUFFER_SECONDS;
   private readonly ring = new Float32Array(PCM_SAMPLE_RATE * PCM_BUFFER_SECONDS);
   private writeIdx = 0;
   private totalSamplesWritten = 0;
 
   // Exclusive sample index of the latest PCM write.  Used by
-  // out-of-stream consumers (e.g. InputPane's stream-capture mode)
-  // that need to anchor a start point and extract a window at
-  // stop time.  Read-only -- `pushPcm` is the only mutator.
+  // visualizers (`EnvelopeWaveform`, the dashboard's `WaveformCanvas`)
+  // to anchor a shared playhead so panels reading the ring at
+  // slightly different moments still align on the same audio-time
+  // window.  Read-only -- `pushPcm` is the only mutator.  (The
+  // InputPane stream capture used to read this to size a
+  // post-stop `snapshotAt` window; it now accumulates via `tap()`
+  // below instead, since the ring is too shallow for long-form
+  // capture.)
   get latestSample(): number {
     return this.totalSamplesWritten;
   }
@@ -63,6 +71,13 @@ class StreamsStore implements PcmSource {
   private client: StreamClient | null = null;
   private started = false;
   private inferenceTimes: number[] = [];
+  // PCM taps fired AFTER each frame lands in the ring (so a tap can
+  // read `latestSample` and see the just-pushed packet included).
+  // Used by `InputPane`'s stream-capture mode to accumulate the
+  // captured signal beyond the ring's 10 s rollover -- the ring
+  // itself is sized for visualizer lookback, not for long-form
+  // capture.
+  private readonly pcmTaps = new Set<(pcm: Float32Array) => void>();
 
   start(): void {
     if (this.started) return;
@@ -163,6 +178,28 @@ class StreamsStore implements PcmSource {
   private pushPcm(pcm: Float32Array): void {
     this.writeIdx = pushToRing(this.ring, this.writeIdx, pcm);
     this.totalSamplesWritten += pcm.length;
+    // Fan out to taps AFTER the ring write so taps reading
+    // `latestSample` from inside the callback see the just-pushed
+    // packet's samples included.  `pushToRing` has copied `pcm`'s
+    // contents into the ring, so the original transferred
+    // ArrayBuffer would otherwise GC at function return; a tap that
+    // retains the reference keeps the buffer alive for free.
+    if (this.pcmTaps.size > 0) {
+      for (const tap of this.pcmTaps) tap(pcm);
+    }
+  }
+
+  // Subscribe to each PCM packet pushed into the ring.  The callback
+  // receives a reference to the worker-transferred Float32Array;
+  // the tap may retain it (no extra memcpy required) or read +
+  // drop, the store does not depend on either choice.  Returns a
+  // dispose closure that removes the tap idempotently.  Order of
+  // dispatch across multiple taps is insertion order.
+  tap(cb: (pcm: Float32Array) => void): () => void {
+    this.pcmTaps.add(cb);
+    return () => {
+      this.pcmTaps.delete(cb);
+    };
   }
 
   private trackInferenceFps(): void {

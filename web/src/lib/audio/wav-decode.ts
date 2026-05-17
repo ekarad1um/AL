@@ -21,9 +21,9 @@
 //
 // For *imported* WAV files (which may arrive at any rate / bit
 // depth), the pipeline still goes through `decodeAudioFile` +
-// `resampleMono` in `resample.ts` -- that's the only place we want
-// the browser's WAV decoder to handle the matrix of (sample rate,
-// bit depth, channel count) shapes.
+// `encodeWavFromFloat32` in `resample.ts` -- that's the only place
+// we want the browser's WAV decoder to handle the matrix of
+// (sample rate, bit depth, channel count) shapes.
 
 import { WAV_SAMPLE_RATE } from './wav';
 

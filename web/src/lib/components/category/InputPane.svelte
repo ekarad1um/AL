@@ -3,14 +3,19 @@
   import { Recorder, type RecorderResult } from '$lib/audio/recorder.svelte';
   import { drafts } from '$lib/stores/drafts.svelte';
   import { encodeWavPcm16, SLICE_SAMPLES, WAV_SAMPLE_RATE } from '$lib/audio/wav';
-  import { decodeAudioFile, resampleMono } from '$lib/audio/resample';
+  import { decodeAudioFile, encodeWavFromChunks, encodeWavFromFloat32 } from '$lib/audio/resample';
   import { readWavMagic, decodeCanonicalWav } from '$lib/audio/wav-decode';
   import { chunkPcmToSlices, sliceCountFor } from '$lib/audio/slicer';
   import { sha256Hex } from '$lib/audio/sha256';
   import { slices } from '$lib/stores/slices.svelte';
   import { SvelteSet } from 'svelte/reactivity';
   import { streams } from '$lib/stores/streams.svelte';
-  import { formatRecordingClock, formatDuration, formatBytes } from '$lib/utils/format';
+  import {
+    formatRecordingClock,
+    formatDuration,
+    formatDurationHuman,
+    formatBytes
+  } from '$lib/utils/format';
   import { MAX_SLICES_PER_CATEGORY, prettyCategoryName } from './labels';
   import LiveRecorderWaveform from './LiveRecorderWaveform.svelte';
   import EnvelopeWaveform from '$lib/components/EnvelopeWaveform.svelte';
@@ -55,18 +60,29 @@
     workspaceName: string; // for export filename
     maxDurationMs?: number;
   }
-  let { workspaceId, categoryName, workspaceName, maxDurationMs = 60_000 }: Props = $props();
+  // Mirrors `DEFAULT_MAX_DURATION_MS` in [recorder.svelte.ts] (see
+  // the comment there for the size + duration rationale -- the two
+  // axes converge on ~50 min at the canonical 88.2 KB/s WAV bitrate
+  // so the captured WAV lands just under the 256 MiB import cap).
+  // The default is duplicated here only so the prop has a literal
+  // fallback for callers that omit it; if it ever drifts from the
+  // recorder default, recording and the stream-stop hint will
+  // disagree.
+  let { workspaceId, categoryName, workspaceName, maxDurationMs = 3_000_000 }: Props = $props();
 
-  // Hard cap on a single dropped / picked WAV.  64 MiB ≈ 12 minutes
-  // of mono 44.1 kHz PCM-16 (≈ 88 200 B/s) -- comfortably above the
-  // 60-second recording cap so an operator with a longer source
-  // recorded elsewhere can still trim a 1 s window out of it.  Past
-  // this, the decode + resample either (a) blows multi-second / OOM
-  // in a browser tab, or (b) inflates the in-memory Float32Array
-  // to gigabyte scale.  Enforced on `file.size` BEFORE the decode
-  // pipeline fires so over-cap files never reach the audio decoder;
-  // operator copy includes both sizes so the rejection is actionable.
-  const MAX_IMPORT_BYTES = 64 * 1024 * 1024;
+  // Hard cap on a single dropped / picked WAV.  256 MiB ≈ 50 min 43 s
+  // of mono 44.1 kHz PCM-16 (= 88 200 B/s) -- exactly the artefact
+  // ceiling the recording cap is aligned to, so an operator who
+  // records a long take in this app and re-imports it elsewhere
+  // hits the same wall on both sides.  Past 256 MiB the decode +
+  // resample path peaks past ~2 GiB transient (a 1-hour 48 kHz mono
+  // WAV imports as ~660 MiB Float32 from `decodeAudioData`, then
+  // the OAC source + output buffers stack on top during resample),
+  // which OOMs lower-end machines.  Enforced on `file.size` BEFORE
+  // the decode pipeline fires so over-cap files never reach the
+  // audio decoder; operator copy includes both sizes so the
+  // rejection is actionable.
+  const MAX_IMPORT_BYTES = 256 * 1024 * 1024;
 
   type Op = 'recording' | 'streaming' | 'finalizing' | 'importing' | null;
 
@@ -76,22 +92,30 @@
   let op = $state<Op>(null);
   let maxReached = $state(false);
   let error = $state<string | null>(null);
-  // Stream-capture state.  The `streams` singleton always has the
-  // current 10 s of decoded opus PCM; we anchor a start sample at
-  // capture begin and extract the window at stop.  `streamRafId`
-  // drives the duration counter (no `setInterval` so the tick
-  // freezes with the RAF when the tab is hidden, same shape as the
-  // recorder's level loop).  Cap stream capture at the smaller of
-  // `maxDurationMs` and the streams' ring length so we never ask
-  // for samples that have already rolled out.
+  // Stream-capture state.  The `streams` singleton's ring is sized
+  // for the visualizer (10 s lookback for the dashboard's live
+  // waveform), NOT for capture -- snapshotting it at stop would
+  // cap us at 10 s every time.  Instead we attach a PCM tap on
+  // `start` that pushes each delivered worker-transferred Float32
+  // frame straight into a chunks accumulator (same architecture
+  // the mic recorder uses with its worklet port), then the chunks
+  // feed `encodeWavFromChunks` at stop.  The cap is governed by
+  // `maxDurationMs` (matches the mic recorder's 50 min default),
+  // not by the ring depth.
+  //
+  // `streamRafId` drives the duration counter (no `setInterval` so
+  // the tick freezes with the RAF when the tab is hidden, same
+  // shape as the recorder's level loop).  The setTimeout-based
+  // auto-stop keeps firing in a hidden tab, so the cap is enforced
+  // on wall clock regardless of RAF state.
   let streamStartedAtMs = $state(0);
-  let streamStartSample = 0;
   let streamDurationMs = $state(0);
   let streamRafId = 0;
   let streamAutoStopTimer: ReturnType<typeof setTimeout> | null = null;
-  const streamMaxDurationMs = $derived(
-    Math.min(maxDurationMs, Math.floor(streams.ringSeconds * 1000))
-  );
+  let streamChunks: Float32Array[] = [];
+  let streamCapturedSamples = 0;
+  let streamTapDispose: (() => void) | null = null;
+  const streamMaxDurationMs = $derived(maxDurationMs);
   // Hoisted near `op` so downstream `$effect` / `$derived` (level
   // meter, waveform branch, header clock) can reference it
   // without a temporal-dead-zone error -- a `$derived` is only
@@ -371,13 +395,14 @@
     !!draftPcm &&
       !slicing &&
       trimRangeSamples >= SLICE_SAMPLES &&
-      // 60 s drafts × 1 s slices = 60.  Hard cap matches the
-      // recorder's max-duration so a single Slice click never
-      // produces an unreasonable batch.
-      projectedSliceCount <= 60 &&
-      // Cumulative cap: a single click can't push the per-category
-      // count past `MAX_SLICES_PER_CATEGORY`.  See the constant's
-      // commentary in `labels.ts` for the rationale.
+      // Cumulative cap is the only batch-size ceiling: a single
+      // click can't push the per-category count past
+      // `MAX_SLICES_PER_CATEGORY`.  See the constant's commentary
+      // in `labels.ts` for the rationale.  The earlier per-click
+      // cap of 60 was tied to a long-since-superseded 60 s
+      // recorder cap; with the recorder now capped at 50 min,
+      // `wouldExceedCap` is what binds the batch size (one click
+      // can fully fill an empty category up to MAX, no more).
       !atSliceCap &&
       !wouldExceedCap
   );
@@ -666,6 +691,8 @@
       cancelAnimationFrame(streamRafId);
       streamRafId = 0;
     }
+    streamTapDispose?.();
+    streamTapDispose = null;
   });
 
   // Also tear down playback when the underlying draft is removed
@@ -727,18 +754,20 @@
   // ── Stream capture (opus stream → draft) ───────────────────────
   //
   // The dashboard's opus stream is always-on (started by the
-  // layout), so capturing from it is just: anchor a start sample,
-  // tick the duration counter at RAF, on stop snapshot the elapsed
-  // window from the streams ring and run it through the same
-  // resample + encode pipeline that the mic recorder uses.  No
-  // device-acquisition step, no AudioContext per pane -- the
-  // singleton already handles all of that.
+  // layout), so capturing from it is just: install a PCM tap on
+  // `streams` that pushes each delivered worker-transferred
+  // Float32 packet into the chunk accumulator, tick the duration
+  // counter at RAF, and on stop pipe the accumulator through
+  // `encodeWavFromChunks` -- same finalize the mic recorder uses,
+  // so the two surfaces share one resample + quantise + blob-wrap
+  // pass.  No device-acquisition step, no AudioContext per pane.
   //
-  // The ring is `streams.ringSeconds` (10 s) deep, so a longer
-  // capture would silently truncate the early portion.  Cap the
-  // stream capture at that depth so the operator gets exactly
-  // what they asked for + an honest auto-stop pill when they
-  // overshoot.
+  // The streams' 10 s ring is for visualizer lookback, not capture:
+  // accumulating chunks means we can record for the full
+  // `maxDurationMs` (50 min default) regardless of how shallow the
+  // ring is.  The earlier "snapshot the ring at stop" design
+  // capped capture at the ring depth (always 10 s) and is what
+  // this version replaces.
   function tickStreamDuration(): void {
     if (op !== 'streaming') {
       streamRafId = 0;
@@ -753,9 +782,29 @@
     error = null;
     maxReached = false;
     streamStartedAtMs = performance.now();
-    streamStartSample = streams.latestSample;
     streamDurationMs = 0;
+    streamChunks = [];
+    streamCapturedSamples = 0;
     op = 'streaming';
+    // Flip `op` BEFORE attaching the tap so the callback's `op`
+    // guard reads `'streaming'` for every packet from the very
+    // first dispatch -- JS is single-threaded so no packet can
+    // arrive in the synchronous gap between the assignment and
+    // `streams.tap(...)`, but the ordering also keeps the
+    // invariant honest if a future refactor splits these calls
+    // across a microtask boundary.  Each tap fire takes ownership
+    // of the worker-transferred Float32Array; the streams store
+    // has already copied its samples into the ring, so retaining
+    // the reference here keeps the underlying ArrayBuffer alive
+    // for our accumulator without an extra memcpy.  The `op !==
+    // 'streaming'` guard inside the callback is belt-and-
+    // suspenders: stopStream / cancelStream dispose the tap before
+    // flipping `op`, so in practice this never trips.
+    streamTapDispose = streams.tap((pcm) => {
+      if (op !== 'streaming') return;
+      streamChunks.push(pcm);
+      streamCapturedSamples += pcm.length;
+    });
     if (streamRafId === 0) {
       streamRafId = requestAnimationFrame(tickStreamDuration);
     }
@@ -776,20 +825,20 @@
       cancelAnimationFrame(streamRafId);
       streamRafId = 0;
     }
+    // Detach the tap BEFORE flipping `op` so a packet delivered in
+    // the same event-loop tick can't sneak into the accumulator
+    // after the official stop boundary.
+    streamTapDispose?.();
+    streamTapDispose = null;
     op = 'finalizing';
-    const endSample = streams.latestSample;
-    // Clamp to the ring's available depth -- if for any reason
-    // (RAF stall, tab throttle) more than the ring has elapsed
-    // between start and stop, the earliest part has already
-    // rolled out; honour what we still have.
-    const elapsedSamples = Math.min(
-      endSample - streamStartSample,
-      Math.floor(streams.ringSeconds * streams.sampleRate)
-    );
-    if (elapsedSamples <= 0) {
-      // Tap-too-short or the stream had no fresh samples (closed
-      // socket).  Leave the prior draft (if any) intact, same as
-      // a zero-sample mic stop.
+    const chunks = streamChunks;
+    const totalSamples = streamCapturedSamples;
+    streamChunks = [];
+    streamCapturedSamples = 0;
+    if (totalSamples <= 0) {
+      // Tap-too-short or the stream had no fresh packets (closed
+      // socket between start and stop).  Leave the prior draft
+      // (if any) intact, same as a zero-sample mic stop.
       op = null;
       return;
     }
@@ -797,17 +846,18 @@
       // Widen to `number` -- `streams.sampleRate` is literally typed
       // as the constant 48000 and `WAV_SAMPLE_RATE` as 44100, so a
       // narrow-types equality check would be `false` at compile
-      // time.  The cast lets the rate-equal branch survive a future
-      // sample-rate change (or a different PcmSource passed in)
-      // without ripping the resample call.
+      // time.  The cast lets the rate-equal branch (inside
+      // `encodeWavFromChunks`) survive a future sample-rate change
+      // (or a different PcmSource passed in) without ripping the
+      // call site.
       const captureRate = streams.sampleRate as number;
-      const captured = streams.snapshotAt(endSample, elapsedSamples);
-      const resampled =
-        captureRate === WAV_SAMPLE_RATE
-          ? captured
-          : await resampleMono(captured, captureRate, WAV_SAMPLE_RATE);
-      const blob = encodeWavPcm16(resampled, WAV_SAMPLE_RATE);
-      const durationMs = Math.round((resampled.length / WAV_SAMPLE_RATE) * 1000);
+      const { blob, outputSamples } = await encodeWavFromChunks(
+        chunks,
+        totalSamples,
+        captureRate,
+        WAV_SAMPLE_RATE
+      );
+      const durationMs = Math.round((outputSamples / WAV_SAMPLE_RATE) * 1000);
       await saveResult(
         { blob, durationMs, sampleRate: WAV_SAMPLE_RATE },
         'imported',
@@ -829,6 +879,10 @@
       cancelAnimationFrame(streamRafId);
       streamRafId = 0;
     }
+    streamTapDispose?.();
+    streamTapDispose = null;
+    streamChunks = [];
+    streamCapturedSamples = 0;
     streamDurationMs = 0;
     maxReached = false;
     op = null;
@@ -931,10 +985,8 @@
         return;
       }
       const { pcm, sampleRate } = await decodeAudioFile(file);
-      const targetPcm =
-        sampleRate === WAV_SAMPLE_RATE ? pcm : await resampleMono(pcm, sampleRate, WAV_SAMPLE_RATE);
-      const blob = encodeWavPcm16(targetPcm, WAV_SAMPLE_RATE);
-      const durationMs = Math.round((targetPcm.length / WAV_SAMPLE_RATE) * 1000);
+      const { blob, outputSamples } = await encodeWavFromFloat32(pcm, sampleRate, WAV_SAMPLE_RATE);
+      const durationMs = Math.round((outputSamples / WAV_SAMPLE_RATE) * 1000);
       await saveResult({ blob, durationMs, sampleRate: WAV_SAMPLE_RATE }, 'imported', file.name);
     } catch (e) {
       error = e instanceof Error ? e.message : 'Could not import the file.';
@@ -1092,7 +1144,7 @@
   const recordTitle = $derived<string | undefined>(
     selectedSource.kind === 'stream'
       ? canStream
-        ? `Capture the live opus stream (auto-stops at ${Math.round(streamMaxDurationMs / 1000)}s).`
+        ? `Capture the live opus stream (auto-stops at ${formatDurationHuman(streamMaxDurationMs)}).`
         : 'Stream is not connected. Open the Dashboard or wait for the daemon to come back online.'
       : undefined
   );
@@ -1238,11 +1290,11 @@
   <!-- Waveform + vertical loudness meter.  Meter only mounts when
        there's signal to read so an idle pane runs full waveform
        width.  `flex-1 min-h-0` (no `min-h-32` floor) lets this slot
-       compress under variable chrome (error chips, "imported from",
-       cap notices) so the outer pane stays welded to the grid's
-       `min-h-80` floor instead of ratcheting taller when an error
-       fires.  Worst-case compression bottoms out at ~70-90 px,
-       still readable. -->
+       compress under variable chrome (error chips, cap notices)
+       so the outer pane stays welded to the grid's `min-h-80`
+       floor instead of ratcheting taller when an error fires.
+       Worst-case compression bottoms out at ~70-90 px, still
+       readable. -->
   <div class="flex min-h-0 flex-1 gap-2">
     <div class="relative flex-1 overflow-hidden rounded-md bg-zinc-50">
       {#if isRecording || (isFinalizing && !isStreaming)}
@@ -1579,7 +1631,17 @@
   </div>
 
   {#if maxReached && !isRecording && !isStreaming}
-    <span class="text-[11px] text-amber-700"> Auto-stopped at the duration cap. </span>
+    <!-- `leading-tight` (1.25 → 13.75 px line-box on 11 px text)
+         tightens the default 1.5 leading.  Without it, the trailing
+         notice's visible glyph-to-corner gap inflates to ~15 px and
+         breaks the pane's `pb-3` (12 px = `px-3`) corner-symmetry
+         contract; the tight leading brings it down to ~13.75 px,
+         well within tolerance.  13.75 px > the ~13 px Inter glyph
+         height (ascender + descender) so descenders stay fully
+         painted -- a tighter `leading-none` (11 px line-box) would
+         sit under the glyph and clip them at any `overflow-hidden`
+         ancestor. -->
+    <span class="text-[11px] leading-tight text-amber-700">Auto-stopped at the duration cap.</span>
   {/if}
 
   <!-- Recorder / generic error chips.  Both share the same
@@ -1644,11 +1706,5 @@
         </svg>
       </button>
     </div>
-  {/if}
-
-  {#if draft?.source === 'imported' && draft.original_name}
-    <p class="text-[11px] text-zinc-400" title={draft.original_name}>
-      Imported from <span class="text-zinc-500">{draft.original_name}</span>
-    </p>
   {/if}
 </div>

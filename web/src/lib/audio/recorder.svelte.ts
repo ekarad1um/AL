@@ -1,5 +1,5 @@
-import { encodeWavPcm16, WAV_SAMPLE_RATE } from './wav';
-import { resampleMono } from './resample';
+import { WAV_SAMPLE_RATE } from './wav';
+import { encodeWavFromChunks } from './resample';
 import type { PcmSource } from './pcm-source';
 import { CursorSmoother } from './cursor-smoother';
 import { envelopeFromRing, pushToRing } from './ring-buffer';
@@ -45,16 +45,42 @@ export type RecorderState = 'idle' | 'requesting' | 'recording' | 'finalizing' |
 
 export interface RecorderResult {
   blob: Blob;
-  pcm: Float32Array;
   durationMs: number;
   sampleRate: number; // always WAV_SAMPLE_RATE = 44_100
 }
 
 export interface RecorderOptions {
-  // Soft cap on a single recording.  Default 60 s -- long enough for
-  // a complex phrase, short enough that the operator notices a
-  // forgotten-to-stop session before IDB grows uncomfortably.  The
-  // recorder auto-stops at this duration; the caller's `onstop`
+  // Soft cap on a single recording.  Default 50 min -- the recording
+  // module is bounded by two artefact-budget axes, NOT by anything
+  // downstream like slice count (an operator can record a long take
+  // and pick slices selectively from any subset of it):
+  //   - Size: the finalized WAV must fit inside the same 256 MiB
+  //     ceiling that `MAX_IMPORT_BYTES` enforces on dropped files,
+  //     so recording and import share one storage ceiling.
+  //   - Duration: this `maxDurationMs` cap.
+  // At fixed-rate 44.1 kHz mono 16-bit PCM (= 88 200 B/s), the two
+  // axes collapse onto the same point: 256 MiB / 88.2 KB/s ≈
+  // 3 043.5 s ≈ 50 min 43.5 s.  Pinning the duration cap to 50 min
+  // (3 000 000 ms) lands just under that size ceiling
+  // (252.3 MiB WAV; ~3.7 MiB headroom) and keeps the arithmetic
+  // clean, mirroring the original 12 min / 64 MiB design at 4x
+  // scale.
+  //
+  // Other implicit ceilings the cap stays well clear of:
+  //   - Finalize-time peak RAM (chunks-during-populate + OAC source
+  //     + OAC output + WAV bytes) peaks around 1.07 GiB transiently
+  //     at 50 min via the stream-encode finalize in [resample.ts]:
+  //     549 MiB chunks overlap with a freshly-allocated 549 MiB
+  //     OAC source during the populate loop, then the chunks null
+  //     out as they fold in.  Safe on 8 GiB+ machines; a 1-hour
+  //     cap would push past 1.3 GiB and tighten the safety margin
+  //     on mid-range laptops without buying a round-number
+  //     duration in return.
+  //   - `formatRecordingClock` formats as `M:SS.c` with the minute
+  //     field unpadded; at 50 min the clock reads "50:00.0"
+  //     (7 chars, identical width to the prior 12 min "12:00.0").
+  //
+  // The recorder auto-stops at this duration; the caller's `onstop`
   // callback fires with the finalized result.
   maxDurationMs?: number;
   // Optional callback fired when the recorder auto-stops at the
@@ -71,7 +97,7 @@ export interface StartOptions {
   deviceId?: string;
 }
 
-const DEFAULT_MAX_DURATION_MS = 60_000;
+const DEFAULT_MAX_DURATION_MS = 3_000_000;
 
 // Inline AudioWorklet source.  The processor copies each input
 // frame's plane 0 (mono channel) and posts it as a transferable so
@@ -144,7 +170,9 @@ export class Recorder implements PcmSource {
   private analyser: AnalyserNode | null = null;
   private workletNode: AudioWorkletNode | null = null;
   // Recorded chunks accumulate here.  Each is a transferred buffer
-  // from the worklet (no copy on receipt).  Concatenated at finalize.
+  // from the worklet (no copy on receipt).  At finalize the array
+  // is moved into `encodeWavFromChunks`, which streams them straight
+  // into the OAC source storage / WAV bytes -- no concat step.
   private chunks: Float32Array[] = [];
   private capturedSamples = 0;
   private captureRate = 48_000;
@@ -255,8 +283,8 @@ export class Recorder implements PcmSource {
       this.workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => {
         // Hot path -- runs at the worklet's render-quantum rate
         // (~375 Hz at 48 kHz / 128-sample frames).  Stash for the
-        // final WAV encode (concatenated once at finalize) and
-        // copy into the live ring for the waveform canvas to
+        // final WAV encode (consumed chunk-by-chunk at finalize)
+        // and copy into the live ring for the waveform canvas to
         // envelope at RAF.  Both writes are O(frame length); the
         // canvas read is O(canvas width).
         if (this.state !== 'recording') return;
@@ -304,6 +332,13 @@ export class Recorder implements PcmSource {
   // alloc failure).  A re-entrant stop() while not in `recording`
   // state (idle / finalizing / error) is a no-op that returns null
   // -- the first call owns the in-flight finalize.
+  //
+  // Finalize hands the captured chunk list straight to
+  // `encodeWavFromChunks`, which folds resample + quantise + blob-
+  // wrap into a single allocation pass and releases each chunk's
+  // ArrayBuffer as it's consumed.  See the module header in
+  // `resample.ts` for the memory-peak comparison vs the old
+  // concat + slice + encode pipeline.
   async stop(): Promise<RecorderResult | null> {
     if (this.state !== 'recording') return null;
     this.state = 'finalizing';
@@ -313,7 +348,9 @@ export class Recorder implements PcmSource {
     }
     this.cancelLevelLoop();
     // Pull the captured samples + rate before tearing the graph
-    // down; teardown clears the state.
+    // down; teardown clears the state.  Move the chunks array out
+    // of `this` before handing it to the encoder, which takes
+    // ownership and nulls slots as it consumes them.
     const totalSamples = this.capturedSamples;
     const inputRate = this.captureRate;
     const chunks = this.chunks;
@@ -325,15 +362,17 @@ export class Recorder implements PcmSource {
         this.state = 'idle';
         return null;
       }
-      const merged = concatFloat32(chunks, totalSamples);
-      const pcm = await resampleMono(merged, inputRate, WAV_SAMPLE_RATE);
-      const blob = encodeWavPcm16(pcm, WAV_SAMPLE_RATE);
-      const durationMs = Math.round((pcm.length / WAV_SAMPLE_RATE) * 1000);
+      const { blob, outputSamples } = await encodeWavFromChunks(
+        chunks,
+        totalSamples,
+        inputRate,
+        WAV_SAMPLE_RATE
+      );
+      const durationMs = Math.round((outputSamples / WAV_SAMPLE_RATE) * 1000);
       this.durationMs = durationMs;
       this.state = 'idle';
       return {
         blob,
-        pcm,
         durationMs,
         sampleRate: WAV_SAMPLE_RATE
       };
@@ -497,16 +536,6 @@ export class Recorder implements PcmSource {
       this.ctx = null;
     }
   }
-}
-
-function concatFloat32(chunks: Float32Array[], total: number): Float32Array {
-  const out = new Float32Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    out.set(c, offset);
-    offset += c.length;
-  }
-  return out;
 }
 
 // Map the various DOMException flavours getUserMedia surfaces into
