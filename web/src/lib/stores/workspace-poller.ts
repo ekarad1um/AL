@@ -169,18 +169,29 @@ export class WorkspacePoller {
       // resume) reconciles cleanly.
       if (slices.mutationsInFlightFor(wsId) > 0) return;
 
-      const known = slices.latestRevisionFor(wsId) ?? -1;
       const incoming = detail.workspace_revision.id;
+      // Always advance the in-memory "highest daemon revision
+      // seen" -- the UI's live revision chip + the slices
+      // store's recursion-on-newer-rev hook read from this.
       slices.setRevisionAtLeast(wsId, incoming);
-      if (incoming > known) {
+      // Compare against the LAST REVISION WE FULLY RECONCILED
+      // (mirrors the persisted `workspace_sync` row), not the
+      // in-memory upper bound.  A failed / in-flight-blocked
+      // reconcile leaves the persisted record behind the
+      // daemon, and this comparison keeps re-firing until one
+      // succeeds.  Using `latestRevisionFor` here would let
+      // the poller silently swallow the advance (it bumps
+      // `latestRevisions` itself), masking the failure.
+      const synced = slices.lastSyncedRevisionFor(wsId) ?? -1;
+      if (incoming > synced) {
         // External advance.  Flip per-category stale + the
         // workspace's categories-list stale; expanded SlicePane
         // and the CategoryList effect re-fire from their
         // tracked-stale reads and run their refreshers under
-        // `untrack`.  Bulk badge counts on collapsed rows are
-        // not invalidated (lazy-on-expand is the explicit design
-        // trade-off).
-        slices.markStaleForWorkspace(wsId);
+        // `untrack`.  `markStaleForWorkspace` also kicks a
+        // background Tier 2 reconcile so the persisted
+        // `workspace_sync` record catches up to `incoming`.
+        slices.markStaleForWorkspace(wsId, incoming);
         categories.markStale(wsId);
       }
     } catch (e) {

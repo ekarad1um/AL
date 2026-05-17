@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import { getSliceSpectrogramUrl } from '$lib/audio/spectrogram';
+  import { sliceFilename } from '$lib/idb/db';
   import type { SliceRecord } from '$lib/idb/db';
 
   // One slice rendered as a rectangular card with its spectrogram
@@ -82,6 +83,14 @@
     // Manual retry path for `state === 'failed'` slices.  The
     // SlicePane wires this to `slices.enqueueUpload(id)`.
     onRetry: () => void;
+    // True when the parent's IntersectionObserver reports
+    // this card's `data-slice-id` element as intersecting the
+    // grid viewport (or its `rootMargin`-extended buffer).
+    // Drives the lazy spectrogram fetch -- the WAV download +
+    // FFT only fires when the operator has the card in view
+    // for the debounce window.  Out-of-view cards never burn
+    // network or CPU.
+    visible: boolean;
   }
   let {
     slice,
@@ -89,6 +98,7 @@
     selected,
     multiSelectActive,
     deleting,
+    visible,
     onPlay,
     onPick,
     onDelete,
@@ -105,42 +115,86 @@
   const progressPct = $derived(
     isUploading ? Math.round(Math.max(0, Math.min(1, slice.upload_progress ?? 0)) * 100) : 0
   );
+  // Daemon-facing filename derived from the content-addressed
+  // id (`<sha256>.wav`).  Used in aria labels + screen-reader
+  // copy so the operator hears a meaningful identifier
+  // referenced by name.
+  const filename = $derived(sliceFilename(slice.id));
 
   let url = $state<string | null>(null);
-  let pending = $state(true);
+  // `pending` starts false -- a card that never becomes
+  // visible never enters the loading state.  Flipped to true
+  // when the debounce timer actually fires the fetch.
+  let pending = $state(false);
 
-  // Lazy spectrogram URL.  The effect tracks only the id (via the
-  // `$derived sliceId`); the slice itself is read inside `untrack`
-  // so upload-progress patches don't re-fire — cache hits would be
-  // cheap, but the Promise/microtask churn compounds across a
-  // 30-slice batch mid-upload.  Real id changes still remount via
-  // the parent's `{#each}` key.
+  // Viewport-gated + debounced spectrogram fetch.
+  //
+  // Trigger conditions:
+  //   * `visible` is true (IntersectionObserver in SlicePane
+  //     reports the card's `data-slice-id` element as
+  //     intersecting the grid's viewport + rootMargin).
+  //   * `url` is null (we don't already have a rendered URL).
+  //
+  // Debounce: 150 ms after the card enters view.  Fast-scroll
+  // transits (card visible <150 ms) clear the timer in the
+  // effect cleanup and never trigger a fetch -- saves the
+  // network + FFT work for cards the operator never paused
+  // on.  150 ms also covers the IntersectionObserver's
+  // initial-frame fire so the first paint isn't blocked.
+  //
+  // Cache layers (read inside `getSliceSpectrogramUrl`):
+  //   1. In-memory `urlCache` (per-tab session).
+  //   2. IDB-persisted `spectrograms` row (cross-session).
+  //   3. Cold render: fetch WAV bytes -> FFT -> PNG.  Network
+  //      cost only here.
+  //
+  // Effect re-fires when `visible` or `slice.id` change.  The
+  // `slice` reference (read inside `untrack`) may flip
+  // identity from a SvelteMap mutation in the parent (e.g. an
+  // upload-progress patch); we don't re-fetch in that case
+  // because `slice.id` is stable across patches.
+  //
+  // Error handling: failed fetch leaves `url = null`; the card
+  // renders without a spectrogram (still playable + deletable).
+  // Scrolling away + back re-fires this effect (via
+  // visibleIds churn); since the failed render never cached
+  // anything, the retry attempt fires fresh.
   const sliceId = $derived(slice.id);
   $effect(() => {
     const id = sliceId;
+    const inView = visible;
+    if (!inView) return;
+    if (url !== null) return;
     let cancelled = false;
-    pending = true;
-    untrack(() => {
-      void getSliceSpectrogramUrl(slice)
-        .then((u) => {
-          if (cancelled) return;
-          url = u;
-        })
-        .catch((e: unknown) => {
-          if (cancelled) return;
-          // Spectrogram failure is decorative -- log to console and
-          // leave the card without an image.  The operator can
-          // still click to play / right-click to delete.
-          console.warn(`[slice ${id}] spectrogram render failed`, e);
-          url = null;
-        })
-        .finally(() => {
-          if (cancelled) return;
-          pending = false;
-        });
-    });
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      pending = true;
+      untrack(() => {
+        void getSliceSpectrogramUrl(slice)
+          .then((u) => {
+            if (cancelled) return;
+            url = u;
+          })
+          .catch((e: unknown) => {
+            if (cancelled) return;
+            console.warn(`[slice ${id}] spectrogram render failed`, e);
+            url = null;
+          })
+          .finally(() => {
+            if (cancelled) return;
+            pending = false;
+          });
+      });
+    }, 150);
     return () => {
       cancelled = true;
+      clearTimeout(timer);
+      // Reset `pending` so a card whose fetch was cancelled
+      // mid-flight (visibility flipped to false after the
+      // debounce fired but before the fetch resolved) doesn't
+      // leave its spinner stuck.  The `.finally` callback
+      // bails on `cancelled` and never clears it on its own.
+      pending = false;
     };
   });
 
@@ -233,8 +287,8 @@
     class:hover:border-zinc-400={!playing && !isFailed && !selected}
     onclick={onCardClick}
     aria-label={multiSelectActive
-      ? `${selected ? 'Deselect' : 'Select'} slice ${slice.filename}`
-      : `Play slice ${slice.filename}`}
+      ? `${selected ? 'Deselect' : 'Select'} slice ${filename}`
+      : `Play slice ${filename}`}
     title={isFailed
       ? `Upload failed: ${slice.last_error ?? 'unknown error'}.  Right-click to retry.`
       : isUploading
@@ -312,7 +366,7 @@
        + `aria-busy` on the wrapper, plus the `sr-only` phrase
        below for screen readers. -->
   {#if deleting}
-    <span class="sr-only">Deleting slice {slice.filename}</span>
+    <span class="sr-only">Deleting slice {filename}</span>
   {/if}
 
   <!-- Upload progress overlay.  Visible only while `state ===
@@ -341,7 +395,7 @@
       disabled={deleting}
       class="absolute bottom-1 left-1 inline-flex items-center gap-0.5 rounded-md bg-rose-100 px-1 py-0.5 text-[9px] font-medium text-rose-800 transition duration-200 ease-out hover:bg-rose-200"
       onclick={onRetryClick}
-      aria-label="Retry upload for slice {slice.filename}"
+      aria-label="Retry upload for slice {filename}"
       title={slice.last_error
         ? `Upload failed: ${slice.last_error}.  Click to retry.`
         : 'Upload failed.  Click to retry.'}
@@ -385,7 +439,7 @@
       class:ring-zinc-300={!selected}
       class:hover:ring-blue-400={!selected}
       class:hover:bg-blue-50={!selected}
-      aria-label={selected ? `Deselect slice ${slice.filename}` : `Select slice ${slice.filename}`}
+      aria-label={selected ? `Deselect slice ${filename}` : `Select slice ${filename}`}
       title={selected ? 'Deselect' : 'Select'}
     >
       {#if selected}
@@ -409,7 +463,7 @@
       disabled={deleting}
       class="pointer-events-none absolute top-1.5 right-1.5 inline-flex h-5 w-5 items-center justify-center rounded-md bg-white text-rose-700 opacity-0 shadow-sm transition duration-200 ease-out group-hover:pointer-events-auto group-hover:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 hover:bg-rose-50"
       onclick={onDeleteClick}
-      aria-label="Delete slice {slice.filename}"
+      aria-label="Delete slice {filename}"
       title="Delete slice"
     >
       <svg

@@ -206,7 +206,7 @@
         {formatDurationHuman(durationMs)}
       </span>
     </div>
-    <p class="break-words text-rose-900">{reason}</p>
+    <p class="wrap-break-word text-rose-900">{reason}</p>
   </div>
 {:else if view.state === 'cancelled'}
   <!-- Cancelled: same single-column shape as failed but neutral

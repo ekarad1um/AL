@@ -149,7 +149,7 @@
             >
               {fmtTime(line.at)}
             </span>
-            <span class="break-words whitespace-pre-wrap text-zinc-800">{line.message}</span>
+            <span class="wrap-break-word whitespace-pre-wrap text-zinc-800">{line.message}</span>
           </li>
         {/each}
       </ol>

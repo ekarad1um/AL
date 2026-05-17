@@ -6,7 +6,9 @@
   import { decodeAudioFile, resampleMono } from '$lib/audio/resample';
   import { readWavMagic, decodeCanonicalWav } from '$lib/audio/wav-decode';
   import { chunkPcmToSlices, sliceCountFor } from '$lib/audio/slicer';
+  import { sha256Hex } from '$lib/audio/sha256';
   import { slices } from '$lib/stores/slices.svelte';
+  import { SvelteSet } from 'svelte/reactivity';
   import { streams } from '$lib/stores/streams.svelte';
   import { formatRecordingClock, formatDuration, formatBytes } from '$lib/utils/format';
   import { MAX_SLICES_PER_CATEGORY, prettyCategoryName } from './labels';
@@ -593,24 +595,58 @@
     error = null;
     try {
       const windows = chunkPcmToSlices(draftPcm, trimStart, trimEnd);
-      const queuedIds: string[] = [];
-      for (const samples of windows) {
-        const blob = encodeWavPcm16(samples, WAV_SAMPLE_RATE);
-        const id = crypto.randomUUID();
-        const filename = `${id.slice(0, 8)}.wav`;
-        await slices.append({
+      // Encode + hash every window in parallel.  The hash
+      // (sha256 of the encoded WAV bytes) is the slice's
+      // canonical id -- same as the daemon-side filename
+      // basename, same as the spectrogram + blob cache key.
+      const stamped = await Promise.all(
+        windows.map(async (samples) => {
+          const blob = encodeWavPcm16(samples, WAV_SAMPLE_RATE);
+          const buf = await blob.arrayBuffer();
+          const id = await sha256Hex(buf);
+          return { id, blob };
+        })
+      );
+      // Dedupe within the batch: byte-identical windows
+      // (operator recorded silence) collapse to one row.  IDB
+      // would dedupe via composite-key overwrite anyway; we
+      // dedupe early to (a) skip an extra `append` round-trip
+      // per duplicate and (b) surface the count to the
+      // operator.
+      // SvelteSet for the file's `.svelte`-suffix lint
+      // rule precedent; the set is purely function-local but
+      // the rule lacks a path-sensitivity model.
+      const seen = new SvelteSet<string>();
+      const unique: typeof stamped = [];
+      for (const s of stamped) {
+        if (seen.has(s.id)) continue;
+        seen.add(s.id);
+        unique.push(s);
+      }
+      const created_at = new Date().toISOString();
+      for (const { id, blob } of unique) {
+        const record = {
           id,
           workspace_id: workspaceId,
           category_name: categoryName,
-          filename,
           blob,
-          state: 'local',
-          created_at: new Date().toISOString()
-        });
-        queuedIds.push(id);
+          state: 'local' as const,
+          created_at
+        };
+        await slices.append(record);
+        void slices.enqueueUpload(record);
       }
-      for (const id of queuedIds) {
-        void slices.enqueueUpload(id);
+      const duplicates = stamped.length - unique.length;
+      if (duplicates > 0) {
+        // Soft notice via the inline error slot (the only
+        // operator-facing surface this pane has).  Not a hard
+        // failure -- the operator chose to slice; we just
+        // tell them how many of the produced windows hashed
+        // to the same content and so collapsed under the
+        // content-addressed id scheme.  Cleared on the next
+        // interaction.
+        const plural = stamped.length === 1 ? '' : 's';
+        error = `${stamped.length} window${plural} produced ${unique.length} unique slice${unique.length === 1 ? '' : 's'} (${duplicates} byte-identical duplicate${duplicates === 1 ? '' : 's'} collapsed).`;
       }
     } catch (e) {
       error = e instanceof Error ? e.message : 'Could not slice the clip.';

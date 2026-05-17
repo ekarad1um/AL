@@ -5,6 +5,7 @@ import { enqueueDelete } from '$lib/api/delete-queue';
 import { deleteCategoriesForWorkspace } from '$lib/idb/categories';
 import { deleteDraftsForWorkspace } from '$lib/idb/drafts';
 import { deleteSlicesForWorkspace } from '$lib/idb/slices';
+import { deleteWorkspaceSync } from '$lib/idb/workspace-sync';
 import { categories as categoriesStore } from '$lib/stores/categories.svelte';
 import { drafts as draftsStore } from '$lib/stores/drafts.svelte';
 import { slices as slicesStore } from '$lib/stores/slices.svelte';
@@ -218,7 +219,20 @@ class WorkspacesStore {
         await Promise.all([
           deleteCategoriesForWorkspace(id).catch(() => 0),
           deleteDraftsForWorkspace(id).catch(() => 0),
-          deleteSlicesForWorkspace(id).catch(() => 0)
+          deleteSlicesForWorkspace(id).catch(() => 0),
+          // Persisted sync record.  Without this, a delete-then-
+          // recreate at the same id (rare, but possible via
+          // local seed data) would inherit a stale sync record
+          // and Tier-1-short-circuit an incoming reconcile.
+          //
+          // Spectrogram PNGs are NOT GC'd here -- they're
+          // content-addressed by sha256 (shared across every
+          // workspace + category with the same content), so a
+          // workspace-scoped GC would risk evicting cache rows
+          // another workspace still relies on.  The cache
+          // grows linearly with unique content hashes seen in
+          // the session; `resetDB` is the single reset point.
+          deleteWorkspaceSync(id).catch(() => undefined)
         ]);
       } catch (e) {
         // Terminal failure leaves the workspace on disk -- refresh

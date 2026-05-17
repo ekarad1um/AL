@@ -1,15 +1,20 @@
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import {
+  bulkDeleteSlices,
   bulkPutSlices,
   deleteSlice as idbDeleteSlice,
   deleteSlicesForCategory,
   listSlicesForCategory,
-  putSlice
+  putSlice,
+  sliceKey
 } from '$lib/idb/slices';
-import { getDB, STORE_SLICES } from '$lib/idb/db';
-import type { SliceRecord } from '$lib/idb/db';
-import { revokeSliceSpectrograms } from '$lib/audio/spectrogram';
-import { revokeSliceBlobs } from '$lib/audio/slice-fetch';
+import { getDB, sliceFilename, sliceIdFromFilename, STORE_SLICES } from '$lib/idb/db';
+import type { SliceKey, SliceRecord } from '$lib/idb/db';
+import {
+  deleteWorkspaceSync,
+  getWorkspaceSync,
+  putWorkspaceSync
+} from '$lib/idb/workspace-sync';
 import { assets } from '$lib/api/endpoints';
 import { enqueueDelete } from '$lib/api/delete-queue';
 import { awaitJobTerminal } from '$lib/api/jobs';
@@ -17,10 +22,7 @@ import { isTransientUploadError, sleepAbortable, UploadPool, xhrPut } from '$lib
 import { capFirst, errorCopy, isNotFound } from '$lib/utils/error-copy';
 import type { AssetReceipt, Uuid } from '$lib/api/types';
 
-// Per-target failure record returned from `deleteMany`.  Shape
-// matches the workspaces store's `BulkDeleteFailure` so a future
-// cross-module "delete outcome" surface can treat the two paths
-// the same.
+// Per-target failure record returned from `deleteMany`.
 export interface BulkSliceDeleteFailure {
   id: string;
   filename: string;
@@ -35,20 +37,61 @@ export interface BulkSliceDeleteOutcome {
 // Reactive cache over the IDB `slices` store, sliced per
 // `(workspace_id, category_name)`.  Slices flow through the state
 // machine `local → uploading → committed | failed` (see
-// [idb/db.ts]); the store owns persistence + upload pipeline +
-// in-memory cache.  Reactivity discipline mirrors the drafts +
-// categories stores: SvelteMap is reactive on `.set` / `.delete`;
-// values are NOT deeply reactive so every mutation replaces the
-// slice with a fresh object.  Callers wrap `refresh()` in
-// `untrack` to avoid the `$effect` reactive-loop trap documented
-// in NOTES.md §"$effect + refresh() reactive-loop trap".
+// [idb/db.ts]).
+//
+// Content-addressed identity:
+//   Slice id is the sha256 hex of the WAV bytes.  Filename is
+//   derived (`<id>.wav`).  Two slices in different categories
+//   with byte-identical content share an in-memory + IDB
+//   cache row for spectrograms and blobs but live as
+//   independent IDB rows in the slices store (composite key
+//   `[workspace_id, category_name, id]`).  Within one category,
+//   re-slicing identical audio deduplicates by IDB-overwrite.
+//
+// Three-tier sync hierarchy keyed by the workspace revision:
+//
+//   Tier 1 -- workspace-mount short-circuit.
+//     `refreshForWorkspace` reads the persisted `workspace_sync`
+//     row.  If `last_synced_revision_id === workspaceRevision`
+//     AND not forced, the per-category index GETs are skipped
+//     entirely -- the UI renders straight from IDB.
+//
+//   Tier 2 -- per-category index reconcile.
+//     Triggered on workspace mount when the sync record is
+//     absent / behind, on poller-detected revision advance, and
+//     on explicit operator refresh.  Pure set difference of
+//     filenames:
+//       daemon-only  -> synthesise committed row.
+//       local-committed missing on daemon -> drop (only when
+//                                             the listing call
+//                                             succeeded).
+//       local non-committed -> preserve always.
+//       common -> identical by construction (filename = sha256
+//                 of bytes); no work.
+//     Successful workspace-wide reconcile writes the sync
+//     record.
+//
+//   Tier 3 -- lazy materialisation.
+//     Bytes (`getSliceBlob`) and spectrograms
+//     (`getSliceSpectrogramUrl`) read IDB first; both caches
+//     are content-addressed (keyed by sha256) so they're valid
+//     forever for a given hash.  See
+//     [audio/slice-fetch.ts] + [audio/spectrogram.ts].
+//
+// Reactivity discipline mirrors the drafts + categories stores:
+// SvelteMap is reactive on `.set` / `.delete`; values are NOT
+// deeply reactive so every mutation replaces the slice with a
+// fresh object.  Callers wrap `refresh()` in `untrack` to avoid
+// the `$effect` reactive-loop trap documented in NOTES.md.
 
 function key(workspaceId: Uuid, categoryName: string): string {
   return `${workspaceId} ${categoryName}`;
 }
 
-// Mirror of [idb/slices.ts]'s comparator -- inlined so the bulk-
-// refresh path can sort partitions without touching the IDB layer.
+function flightKey(workspaceId: Uuid, categoryName: string, id: string): string {
+  return `${workspaceId}/${categoryName}/${id}`;
+}
+
 function byCreatedAsc(a: SliceRecord, b: SliceRecord): number {
   if (a.created_at === b.created_at) return 0;
   return a.created_at < b.created_at ? -1 : 1;
@@ -68,158 +111,111 @@ const EMPTY_LIST: Readonly<SliceList> = Object.freeze({
   error: null as string | null
 });
 
-// Slice states that count as "pending" for the resume / banner
-// surfaces.  `committed` is the only finished state.
 const PENDING_STATES: ReadonlySet<SliceRecord['state']> = new Set(['local', 'uploading', 'failed']);
 
-// Per-category sync status surfaced by the CategoryRow badge.
-// Priority cascade (high → low): failed > uploading > pending >
-// synced > empty.  `failed` wins because it's the only state that
-// needs operator attention; others progress on their own.  `empty`
-// hides the pill so an unused category doesn't shout a no-op
-// status (the count chip already telegraphs the empty case).
 export type CategorySyncStatus = 'empty' | 'synced' | 'pending' | 'uploading' | 'failed';
 
-// Bounded-concurrency upload pool: 3 workers matches PLAN's
-// default.  Daemon has no per-workspace cap, but the operator's
-// network does and 60 simultaneous XHRs to one origin is rude.
 const MAX_CONCURRENT_UPLOADS = 3;
-
-// Transient-failure retry policy.  PUT is idempotent on the daemon
-// side, so retrying with the same body is safe.  Exponential
-// backoff with ±25 % jitter avoids synchronised retry storms when
-// several in-flight slices hit the same daemon event.  4 attempts
-// × 8 s cap puts the worst-case slot-hold at ~10-12 s before a
-// slice gives up and the pool slot frees.
 const UPLOAD_RETRY_ATTEMPTS = 4;
 const UPLOAD_RETRY_BASE_MS = 500;
 const UPLOAD_RETRY_MAX_MS = 8000;
 
-// Concurrency cap for the proactive per-category index reconcile
-// fired after the bulk IDB load and on poller-driven revision
-// advance.  Same value as `MAX_CONCURRENT_UPLOADS`: per-category
-// `listCategory` GETs are cheap (no fsync, no body) and the
-// daemon's directory-listing path is single-threaded, so going
-// past 3 doesn't meaningfully shorten wall-clock for typical
-// workspaces (≤ 10 categories) -- it just risks bunching SD-card
-// reads on the device's eMMC.  Worst-case wall-clock at 3 workers
-// over 10 categories is ~150 ms (50 ms / GET on localhost),
-// invisible to the operator's first-paint.
 const MAX_CONCURRENT_INDEX_FETCHES = 3;
 
-// Concurrency-limited fan-out.  Used by
-// `reconcileIndexesForWorkspace` to spread per-category daemon
-// listings across a few workers without serialising (slow when
-// per-call latency is in the 30-100 ms range and a workspace has
-// many categories) or blasting (rude to the daemon's single-
-// threaded listing path and a waste of origin connection
-// budget).  Best-effort: a per-task throw is caught here so
-// sibling tasks finish regardless; the underlying `refresh()`
-// already routes the failure onto the list's `error` field so
-// the UI can surface it.
-async function withConcurrency<T>(
+async function withConcurrency<T, R>(
   items: readonly T[],
   limit: number,
-  fn: (item: T) => Promise<void>
-): Promise<void> {
-  if (items.length === 0) return;
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = Array.from<R | undefined>({ length: items.length });
   let cursor = 0;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
     for (;;) {
       const idx = cursor;
       cursor += 1;
       if (idx >= items.length) return;
-      try {
-        await fn(items[idx]);
-      } catch {
-        // Per-task failure already surfaces on the list's `error`
-        // via `refresh()`'s catch block.  Swallowed here so a
-        // single bad category doesn't strand the sibling workers
-        // mid-batch.
-      }
+      results[idx] = await fn(items[idx]);
     }
   });
   await Promise.all(workers);
+  return results as R[];
+}
+
+// Construct a committed SliceRecord from a daemon listing
+// entry the client hasn't seen locally.  Returns null for any
+// filename that doesn't fit the strict `<sha256hex>.wav` shape
+// (see `sliceIdFromFilename`) -- foreign-named files are
+// silently skipped because their bytes wouldn't pass the
+// content-addressed integrity check on download anyway.
+function synthesiseServerSlice(
+  workspaceId: Uuid,
+  categoryName: string,
+  filename: string,
+  mtime: string
+): SliceRecord | null {
+  const id = sliceIdFromFilename(filename);
+  if (id === null) return null;
+  return {
+    id,
+    workspace_id: workspaceId,
+    category_name: categoryName,
+    blob: null,
+    state: 'committed',
+    created_at: mtime
+  };
 }
 
 class SlicesStore {
   private lists = new SvelteMap<string, SliceList>();
-  // Workspaces for which `refreshForWorkspace` has already walked
-  // IDB.  Reactive so a CategoryList `$effect` can fan out badges
-  // the moment the bulk load resolves.
   private workspacesLoaded = new SvelteSet<Uuid>();
 
-  // Upload pool caps concurrent XHRs; per-slice abort controllers
-  // let `delete()` cancel an in-flight upload mid-stream.
   private uploadPool = new UploadPool(MAX_CONCURRENT_UPLOADS);
+  // Keyed by `flightKey(ws, cat, id)`: two slices with the
+  // same content hash in different (ws, cat) tuples are
+  // distinct uploads.
   private inflightUploads = new SvelteMap<string, AbortController>();
-  // Slice ids currently mid-`delete()`.  Mirrors the workspaces
-  // store's `deleting` set; SlicePane / SliceCard gate every
-  // operator action on this membership (no replay clicks, no
-  // batch picking up draining rows, no menu over a tombstone).
-  // Pure in-memory: a tab close mid-batch is self-healing via
-  // `refresh`'s daemon-as-master orphan reconciliation.
+  // `flightKey(ws, cat, id)` of slices mid-`delete()`.  Mirrors
+  // the workspaces store's `deleting` set.  In-memory only --
+  // tab close mid-batch is self-healing via the next mount's
+  // reconcile pass.
   deletingIds = new SvelteSet<string>();
-  // Latest revision id observed for the workspace from ANY source
-  // -- upload receipts, the workspace detail page's initial load,
-  // and the workspace poller's periodic GET.  Monotonic upward
-  // because the daemon's `WorkspaceRevision` is monotonic upward;
-  // every writer funnels through `setRevisionAtLeast` so the
-  // invariant is enforced in one place.  Consumers: the detail
-  // page's "live" revision chip; the poller's "did revision
-  // advance" comparison.
+  // Highest daemon revision observed for the workspace, from
+  // ANY source (upload receipts, poller, mount detail).
+  // Monotonic upward.  Used by the UI's "live revision" chip
+  // and by `reconcileWorkspace`'s post-success recursion to
+  // detect "an advance landed during our sync, catch up
+  // immediately instead of waiting for the next poll tick".
   private latestRevisions = new SvelteMap<Uuid, number>();
-  // Per-workspace count of in-flight mutations: slice uploads
-  // (`runUpload`), slice deletes hitting the daemon (`delete`),
-  // remote category deletes (`categories.delete`), and workspace
-  // deletes (`workspaces.runDelete`).  The poller reads this via
-  // `mutationsInFlightFor` and defers its revision check when
-  // > 0, so an external advance is never compared against an
-  // unsettled local store -- one reconciliation tick after the
-  // counter drains catches up.  `SvelteMap` for consistency with
-  // the other counters in this store + the file's `.svelte.ts`
-  // lint rule; the poller itself reads non-reactively (it lives
-  // outside Svelte's tracking domain), so the reactive surface
-  // is just a side-effect of the convention, not load-bearing.
+  // In-memory mirror of `workspace_sync.last_synced_revision_id`.
+  // Populated on the first `refreshForWorkspace` read of the
+  // IDB record; advanced on every successful
+  // `putWorkspaceSync`.  The poller's "should I trigger a
+  // reconcile?" gate compares against THIS, not
+  // `latestRevisions` -- if a reconcile fails (or is blocked
+  // re-entrantly), `lastSyncedRevisions` stays behind the
+  // daemon, and the next poll re-triggers.  Using
+  // `latestRevisions` for that gate would silently mask
+  // failed reconciles because the poller itself bumps
+  // `latestRevisions` to `incoming` on every advance.
+  private lastSyncedRevisions = new SvelteMap<Uuid, number>();
   private mutationsInFlight = new SvelteMap<Uuid, number>();
-  // Per-category stale set.  Keys mirror `lists` (`${ws} ${cat}`).
-  // A workspace poller adds keys on revision advance; `refresh`
-  // clears them on a successful reconcile.  Kept as a separate
-  // `SvelteSet` (not a field on `SliceList`) so callers can
-  // track *just* staleness as a reactive dep without picking up
-  // the surrounding list's intermediate `loading: true` writes
-  // -- the existing reactive-loop trap documented in NOTES.md
-  // bit us once already and we don't want a per-category effect
-  // to re-fire on every `markUploading` patch the upload pipeline
-  // makes against the same key.
+  // Per-category stale set.  Poller stamps keys on detected
+  // revision advance; the per-category refresh path clears
+  // them on a successful reconcile.
   private staleKeys = new SvelteSet<string>();
-  // Workspaces with a `reconcileIndexesForWorkspace` task in
-  // flight.  In-flight guard: a second trigger (a poller-driven
-  // stale advance landing while the first reconcile is still
-  // draining) is a no-op.  Without this, two visible-tab edits
-  // to the same workspace would have the second tab's poller
-  // fire a new reconcile every 2 s even while the previous one
-  // was still in flight, amplifying GET traffic without benefit.
-  // Bare `Set` because no reactive consumer reads this state
-  // (it's purely an internal coordination flag).
+  // Workspaces with an in-flight Tier 2 reconcile.  Re-entry
+  // guard.
   private reconcilingWorkspaces = new Set<Uuid>();
 
   for(workspaceId: Uuid, categoryName: string): SliceList {
     return this.lists.get(key(workspaceId, categoryName)) ?? EMPTY_LIST;
   }
 
-  // Convenience derived for the quantity badge in CategoryRow.
-  // Reads `entries.length` from the per-category list; returns 0
-  // when the list isn't loaded yet (the operator sees the badge
-  // populate as soon as the bulk load resolves -- no flashing
-  // "—" placeholder needed).
   countFor(workspaceId: Uuid, categoryName: string): number {
     return this.for(workspaceId, categoryName).entries.length;
   }
 
-  // Aggregate sync status for the per-category pill.  Short-circuits
-  // on `failed` (the top of the priority cascade); otherwise picks
-  // the highest of uploading > pending > synced after a single pass.
   syncStatusFor(workspaceId: Uuid, categoryName: string): CategorySyncStatus {
     const entries = this.for(workspaceId, categoryName).entries;
     if (entries.length === 0) return 'empty';
@@ -232,42 +228,42 @@ class SlicesStore {
     }
     if (hasUploading) return 'uploading';
     if (hasLocal) return 'pending';
-    // Entries non-empty with nothing failed/uploading/local left:
-    // every remaining row is `committed`.
     return 'synced';
   }
 
-  // Highest revision id known to this tab for `workspaceId` from
-  // ANY source -- upload receipts, the workspace detail page's
-  // initial GET, and the workspace poller's periodic GET -- or
-  // `null` if the workspace has never been observed in this
-  // session.  Writers funnel through `setRevisionAtLeast`; the
-  // monotonic invariant means a stale reader (e.g. a delayed
-  // poll response) cannot regress the value.  Consumers: the
-  // detail page's "live" revision chip + the poller's "did the
-  // daemon advance past what we know" comparison.
   latestRevisionFor(workspaceId: Uuid): number | null {
     return this.latestRevisions.get(workspaceId) ?? null;
   }
 
-  // Monotonic-up revision setter.  All revision writers (upload
-  // receipts, poller, page-detail loads) go through here so the
-  // invariant lives in one place; a stale receipt or a delayed
-  // poll response that arrives with an older value is a no-op
-  // rather than a regression.
   setRevisionAtLeast(workspaceId: Uuid, revision: number): void {
     const prior = this.latestRevisions.get(workspaceId) ?? -1;
     if (revision > prior) this.latestRevisions.set(workspaceId, revision);
   }
 
+  // Highest workspace revision this tab has fully reconciled
+  // to (and persisted into `workspace_sync`).  The poller
+  // compares against this -- not `latestRevisionFor` -- so a
+  // failed or re-entry-blocked reconcile leaves the gate open
+  // for the next tick to retry.
+  lastSyncedRevisionFor(workspaceId: Uuid): number | null {
+    return this.lastSyncedRevisions.get(workspaceId) ?? null;
+  }
+
+  private setLastSyncedAtLeast(workspaceId: Uuid, revision: number): void {
+    const prior = this.lastSyncedRevisions.get(workspaceId) ?? -1;
+    if (revision > prior) this.lastSyncedRevisions.set(workspaceId, revision);
+  }
+
+  private loadedCategoryNames(workspaceId: Uuid): string[] {
+    const prefix = `${workspaceId} `;
+    const names: string[] = [];
+    for (const k of this.lists.keys()) {
+      if (k.startsWith(prefix)) names.push(k.slice(prefix.length));
+    }
+    return names;
+  }
+
   // ── In-flight mutation bracketing ────────────────────────────
-  //
-  // Public so the categories store can bracket its remote
-  // DELETE; slices-internal mutations (upload, single-row delete)
-  // bracket themselves below.  The poller reads
-  // `mutationsInFlightFor` and defers a revision check when it
-  // is > 0, matching the design's "sync after the local changes
-  // are done" rule.
 
   beginMutation(workspaceId: Uuid): void {
     this.mutationsInFlight.set(workspaceId, (this.mutationsInFlight.get(workspaceId) ?? 0) + 1);
@@ -284,38 +280,26 @@ class SlicesStore {
   }
 
   // ── Staleness (workspace poller integration) ─────────────────
-  //
-  // The workspace detail page's poller compares its remembered
-  // revision against `GET /workspace/{id}` every ~2 s; on advance,
-  // it calls `markStaleForWorkspace(id)`.  The flag is per-
-  // category so the SlicePane's `$effect` can re-fire only when
-  // its own key flips -- a tracked read on `isStale(ws, cat)`
-  // and an untracked refresh inside the effect compose into
-  // "lazy revalidation on expand AND on detected advance for the
-  // currently expanded category" without dragging the bulk badge
-  // path into the dependency graph.
 
   isStale(workspaceId: Uuid, categoryName: string): boolean {
     return this.staleKeys.has(key(workspaceId, categoryName));
   }
 
-  // Mark every currently-loaded category in `workspaceId` as
-  // stale AND kick off a proactive per-category reconcile against
-  // the daemon.  Categories not yet in `lists` are skipped because
-  // their first `refresh` (on operator expand) always fetches
-  // fresh anyway -- there is no cache to invalidate.
-  //
-  // The proactive reconcile is what makes the collapsed-row badge
-  // counts converge after another tab / external CLI advances the
-  // workspace revision.  Without it, the SlicePane `$effect`'s
-  // tracked `isStale` read would only re-refresh the currently-
-  // expanded category, and every other category's badge would
-  // stay at the previous count until the operator manually
-  // expanded it.  The in-flight guard inside
-  // `reconcileIndexesForWorkspace` means a burst of poll ticks
-  // (e.g. a sibling tab streaming uploads) amplifies into at most
-  // one in-flight reconcile per workspace.
-  markStaleForWorkspace(workspaceId: Uuid): void {
+  // True iff the slice is currently mid-`delete()`.  The
+  // `flightKey` namespace matches the upload pipeline's so the
+  // pane-side gates can read one consistent membership.
+  isDeleting(workspaceId: Uuid, categoryName: string, id: string): boolean {
+    return this.deletingIds.has(flightKey(workspaceId, categoryName, id));
+  }
+
+  // Poller-driven invalidation on detected revision advance.
+  // Stamps the per-category stale flag for every loaded
+  // category (so an expanded SlicePane re-fires its
+  // per-category refresh on the tracked-stale dep) AND kicks
+  // a background workspace-wide reconcile so collapsed-badge
+  // counts + the persisted `workspace_sync` record converge
+  // to `workspaceRevision`.
+  markStaleForWorkspace(workspaceId: Uuid, workspaceRevision: number): void {
     const prefix = `${workspaceId} `;
     const names: string[] = [];
     for (const k of this.lists.keys()) {
@@ -325,13 +309,10 @@ class SlicesStore {
       }
     }
     if (names.length > 0) {
-      void this.reconcileIndexesForWorkspace(workspaceId, names);
+      void this.reconcileWorkspace(workspaceId, names, workspaceRevision);
     }
   }
 
-  // Iterate every per-workspace pending slice (any state in
-  // PENDING_STATES).  Used by the resume-uploads banner to count
-  // "what's left" + by `resumePending` to actually re-queue them.
   pendingFor(workspaceId: Uuid): SliceRecord[] {
     const result: SliceRecord[] = [];
     const prefix = `${workspaceId} `;
@@ -344,170 +325,236 @@ class SlicesStore {
     return result;
   }
 
-  // Bulk-load every slice for `workspaceId` and partition into the
-  // per-category map -- one IDB query covers every collapsed-row
-  // badge instead of an expand-each round-trip.  Empty categories
-  // also flip to `loaded: true` so the SlicePane's `!loaded`
-  // spinner doesn't flash on first expand of slice-less rows.
-  // Idempotent via `workspacesLoaded`; `forget()` clears the entry
-  // on workspace delete.
-  //
-  // Every bulk-loaded key is also stamped stale: the bulk read is
-  // IDB-only, so per-category `refresh` (which fetches the daemon
-  // listing + reconciles orphans + synthesises server-only rows)
-  // MUST run on first expand for the daemon to be the master of
-  // committed state.  Without the stale stamp the per-category
-  // `refresh` would short-circuit on `loaded && !error`, and a
-  // cache-wipe-and-return session would never see server-only
-  // slices -- they'd be invisible until the operator forced a
-  // refresh, defeating the lazy-fetch design.  After the first
-  // expand reconciles, `refresh` clears stale and subsequent
-  // collapse / expand cycles short-circuit on the cached entries.
+  // ── Tier 1: workspace-mount sync ─────────────────────────────
+
   async refreshForWorkspace(
     workspaceId: Uuid,
     categoryNames: string[],
+    workspaceRevision: number,
     force = false
   ): Promise<void> {
-    if (this.workspacesLoaded.has(workspaceId) && !force) return;
-    try {
-      const db = await getDB();
-      const rows = await db.getAllFromIndex(STORE_SLICES, 'by-workspace', workspaceId);
-      // Partition.  Initialise every passed-in category to an
-      // empty list so even slice-less categories transition to
-      // `loaded: true`.  Slices whose `category_name` isn't in the
-      // input list (orphans of a server-deleted category whose IDB
-      // rows linger) still get bucketed so the operator can act
-      // on them later.  `SvelteMap` over bare `Map`: the file's
-      // `.svelte.ts` extension makes the lint rule eager about
-      // reactive collections; this Map is purely function-local
-      // but the rule lacks a path-sensitivity model.
-      const grouped = new SvelteMap<string, SliceRecord[]>();
-      for (const name of categoryNames) grouped.set(name, []);
-      for (const row of rows) {
-        const list = grouped.get(row.category_name) ?? [];
-        list.push(row);
-        grouped.set(row.category_name, list);
+    // Bulk IDB load.  Always runs (one indexed query; the
+    // per-category lists are what every other surface reads
+    // from).  Idempotent via `workspacesLoaded`.
+    if (!this.workspacesLoaded.has(workspaceId)) {
+      try {
+        const db = await getDB();
+        const rows = await db.getAllFromIndex(STORE_SLICES, 'by-workspace', workspaceId);
+        const grouped = new SvelteMap<string, SliceRecord[]>();
+        for (const name of categoryNames) grouped.set(name, []);
+        for (const row of rows) {
+          const list = grouped.get(row.category_name) ?? [];
+          list.push(row);
+          grouped.set(row.category_name, list);
+        }
+        for (const [name, entries] of grouped) {
+          entries.sort(byCreatedAsc);
+          const k = key(workspaceId, name);
+          if (!this.lists.has(k)) {
+            this.lists.set(k, {
+              entries,
+              loading: false,
+              loaded: true,
+              error: null
+            });
+          }
+        }
+        this.workspacesLoaded.add(workspaceId);
+        this.resumePending(workspaceId);
+      } catch (e) {
+        console.warn('[slices] bulk refresh failed', e);
       }
-      for (const [name, entries] of grouped) {
-        entries.sort(byCreatedAsc);
-        const k = key(workspaceId, name);
-        this.lists.set(k, {
-          entries,
-          loading: false,
-          loaded: true,
-          error: null
-        });
-        // Stamp stale so the per-category `refresh` proceeds on
-        // first expand (see the block comment above for the
-        // cache-wipe / cross-tab rationale).
-        this.staleKeys.add(k);
-      }
-      this.workspacesLoaded.add(workspaceId);
-      // Auto-resume any cross-reload pending uploads now that the
-      // bulk-load has populated the in-memory state.  Co-located
-      // here (rather than chained in the caller) so it fires
-      // exactly once per first-load and not on every reactive
-      // re-trigger of the calling effect.  The pool dedupes
-      // against in-flight ids so a freshly-sliced batch already
-      // queued by `InputPane.performSlice` isn't double-queued.
-      this.resumePending(workspaceId);
-    } catch (e) {
-      // Don't mark the workspace loaded on failure -- the next
-      // mount can retry.  Per-category refreshes still work
-      // (they'll do their own IDB query and fail or succeed
-      // independently).
-      console.warn('[slices] bulk refresh failed', e);
     }
-    // Proactively reconcile every category's index against the
-    // daemon, capped at `MAX_CONCURRENT_INDEX_FETCHES` workers.
-    // The bulk IDB load above surfaces badge counts from local
-    // state (zero on cache-cleared / first-visit sessions);
-    // without this follow-up the operator would have to expand
-    // every category to see its actual slice count.  Fire-and-
-    // forget: callers are reactive `$effect`s that don't await,
-    // and the per-category lists transition to daemon-truth
-    // incrementally as each `refresh()` resolves.  Slice BLOBS
-    // remain lazy (operator-on-expand) -- only the per-category
-    // index reconciles here, so workspaces with thousands of
-    // slices don't pull megabytes of WAV bytes at first mount.
+
+    // Seed the in-memory mirror from IDB on first sighting;
+    // subsequent calls (CategoryList's effect re-fires on
+    // every revision advance, plus refreshes after category
+    // mutations) hit the cached value and skip the IDB
+    // round-trip.  Cross-tab writes to `workspace_sync` won't
+    // propagate into our mirror -- the failure mode is "we
+    // over-reconcile", which is correct (just slightly
+    // wasteful), not "we miss data".
     //
-    // Runs even if the bulk IDB load above threw: the per-
-    // category `refresh()` does its own IDB read + daemon GET
-    // and is resilient to a missing in-memory partition.
-    void this.reconcileIndexesForWorkspace(workspaceId, categoryNames);
+    // Re-read the mirror AFTER the IDB seed because a
+    // concurrent `setLastSyncedAtLeast` may have landed
+    // during our await window:
+    //   * `reconcileWorkspace` from a parallel mount or a
+    //     poller-driven markStale, on its success path.
+    //   * `markCommitted`'s auto-advance (which can only
+    //     fire once the mirror has been seeded by one of
+    //     the paths above -- it needs a defined `priorSynced`
+    //     to satisfy the `+1 === revisionId` check).
+    // Using the local IDB-derived value would force an
+    // unnecessary reconcile when our cumulative state is
+    // already ahead.
+    let synced = this.lastSyncedRevisions.get(workspaceId);
+    if (synced === undefined) {
+      const sync = await getWorkspaceSync(workspaceId).catch(() => undefined);
+      if (sync !== undefined) {
+        this.setLastSyncedAtLeast(workspaceId, sync.last_synced_revision_id);
+      }
+      synced = this.lastSyncedRevisions.get(workspaceId);
+    }
+
+    // Tier 1 short-circuit.  Skip the reconcile if we are AT
+    // OR AHEAD of the caller's known revision.  `synced >
+    // workspaceRevision` happens when `markCommitted`'s
+    // auto-advance ran since the caller's last detail fetch
+    // (poller refreshes detail every 2 s; the page's prop is
+    // momentarily behind our auto-advanced mirror).  Skipping
+    // the reconcile there is correct: our IDB has the
+    // caller's claimed state plus our own commits.  External
+    // changes that landed AFTER caller's snapshot will be
+    // discovered by the next poller tick (which compares
+    // against `lastSyncedRevisions`, not against
+    // `workspaceRevision`).
+    if (!force && synced !== undefined && synced >= workspaceRevision) {
+      return;
+    }
+
+    if (categoryNames.length === 0) return;
+    void this.reconcileWorkspace(workspaceId, categoryNames, workspaceRevision);
   }
 
-  // Concurrency-capped per-category index sync against the
-  // daemon listing.  Each per-category call routes through the
-  // same `refresh()` path that an operator-driven expand would
-  // hit, so the reconciliation rules (daemon-as-master for
-  // committed state, orphan GC, synthesised server-only rows)
-  // apply uniformly regardless of trigger.
-  //
-  // Triggered from two places:
-  //   1. After the bulk IDB load in `refreshForWorkspace` -- so
-  //      first-mount + cache-cleared sessions see daemon-truth
-  //      badge counts without operator-driven expansion.
-  //   2. From `markStaleForWorkspace` on poller-detected
-  //      revision advance -- so collapsed categories' badge
-  //      counts converge after another tab / external CLI
-  //      writes to the workspace.
-  //
-  // Re-entrant-safe: a second call while a previous reconcile
-  // is in flight is a no-op.  The poller fires `markStale*`
-  // every 2 s when visible, so without the in-flight gate a
-  // sparse-revision-advance burst (e.g. another tab streaming
-  // uploads) would pile up redundant reconciles.  The flag
-  // bounds amplification to "one reconcile in flight per
-  // workspace, period."
-  async reconcileIndexesForWorkspace(
+  // ── Tier 2: workspace-scoped reconcile ───────────────────────
+
+  async reconcileWorkspace(
     workspaceId: Uuid,
-    categoryNames: readonly string[]
+    categoryNames: readonly string[],
+    workspaceRevision: number
   ): Promise<void> {
     if (this.reconcilingWorkspaces.has(workspaceId)) return;
     if (categoryNames.length === 0) return;
     this.reconcilingWorkspaces.add(workspaceId);
+    let succeededAt: number | null = null;
     try {
-      await withConcurrency(categoryNames, MAX_CONCURRENT_INDEX_FETCHES, (name) =>
-        this.refresh(workspaceId, name)
+      const outcomes = await withConcurrency(categoryNames, MAX_CONCURRENT_INDEX_FETCHES, (name) =>
+        this.refresh(workspaceId, name, true).then(
+          () => true,
+          () => false
+        )
       );
+      const allSucceeded = outcomes.every((ok) => ok);
+      const everyCategorySettled = categoryNames.every((name) => {
+        const list = this.lists.get(key(workspaceId, name));
+        return list?.loaded === true && list.error === null;
+      });
+      // Forget-race guard: if `forget(workspaceId)` ran during
+      // the reconcile (workspace-delete chain), the workspace
+      // is being wiped; resurrecting a sync row for it would
+      // leave an orphan in IDB that a same-UUID re-create
+      // would inherit.  `workspacesLoaded` is the
+      // single-source-of-truth flag set by the bulk-load and
+      // cleared by `forget`; the `workspacesLoaded.has` gate
+      // closes the window cleanly.
+      if (allSucceeded && everyCategorySettled && this.workspacesLoaded.has(workspaceId)) {
+        // Persist the MAX of our reconcile's rev and the
+        // current mirror.  Our reconcile verified the
+        // workspace state at `workspaceRevision`; if
+        // `markCommitted`'s auto-advance bumped mirror past
+        // that during our per-category fan-out, mirror's
+        // value is a stricter upper bound (covers our
+        // reconcile's state PLUS our committed slice).
+        // Writing `workspaceRevision` directly would regress
+        // IDB past `markCommitted`'s fire-and-forget
+        // `putWorkspaceSync`; that regression is recoverable
+        // on next mount, but sidestepping it keeps the
+        // steady-state cleaner.
+        //
+        // `setLastSyncedAtLeast` is monotonic and runs first
+        // so mirror reflects `max(prior, workspaceRevision)`;
+        // then `persistRev` reads the consolidated value.
+        // The `??` fallback is defensive -- after the
+        // setLastSyncedAtLeast call mirror is guaranteed to
+        // be at least `workspaceRevision`.
+        this.setLastSyncedAtLeast(workspaceId, workspaceRevision);
+        const persistRev = this.lastSyncedRevisions.get(workspaceId) ?? workspaceRevision;
+        await putWorkspaceSync({
+          workspace_id: workspaceId,
+          last_synced_revision_id: persistRev,
+          last_synced_at: new Date().toISOString()
+        }).catch(() => undefined);
+        // Capture `succeededAt` AFTER the put-await so the
+        // recursion check below reflects auto-advance bumps
+        // that landed during our await.  Without this, a
+        // local upload commit during reconcile would inflate
+        // `latestRevisions` (from `setRevisionAtLeast` in
+        // `runUpload`) past our pre-await `persistRev`,
+        // triggering a recursion that re-fetches every
+        // category listing -- even though the auto-advance
+        // already covered the delta (mirror == latestRevisions
+        // and the auto-advance fired its own
+        // `putWorkspaceSync` to consolidate IDB).  Reading
+        // the post-await mirror means succeededAt tracks the
+        // consolidated synced state; the recursion only
+        // fires for genuinely external advances that
+        // bumped latestRevisions without a matching auto-
+        // advance (the gap case).
+        succeededAt = this.lastSyncedRevisions.get(workspaceId) ?? persistRev;
+      }
     } finally {
       this.reconcilingWorkspaces.delete(workspaceId);
     }
+
+    // Catch-up: if the daemon advanced past `workspaceRevision`
+    // while we were syncing (e.g. another tab landed an upload
+    // during our listing fan-out, or a poll tick blocked by the
+    // in-flight guard above noted the advance), re-fire
+    // immediately instead of waiting for the next poll tick.
+    // Only enters on the success path -- a failed reconcile
+    // self-heals via the poller's `incoming > synced` gate on
+    // the next tick.  Uses the LIVE loaded-category set so a
+    // freshly-added category between calls participates.
+    if (succeededAt !== null) {
+      const newest = this.latestRevisions.get(workspaceId);
+      if (newest !== undefined && newest > succeededAt) {
+        const live = this.loadedCategoryNames(workspaceId);
+        if (live.length > 0) {
+          void this.reconcileWorkspace(workspaceId, live, newest);
+        }
+      }
+    }
   }
 
-  // Per-category sync.  Reads local IDB + the daemon's category
-  // listing in parallel and reconciles with the daemon as master
-  // for `committed` state:
-  //   - daemon-only file → synthesise a `committed` row (bytes
-  //     lazy-fetch via `getSliceBlob`).  Covers cross-tab uploads
-  //     and re-syncs after IDB-quota GC.
-  //   - local `committed` + daemon has it → preserve.
-  //   - local `committed` + daemon missing → ORPHAN: GC the row
-  //     and revoke its caches.  Most commonly: a previous session's
-  //     batch-delete closed the tab between the daemon's terminal
-  //     and `idbDeleteSlice`.
-  //   - local `local` / `uploading` / `failed` → preserve.  These
-  //     have no daemon presence by definition; `resumePending`
-  //     re-queues them.
-  // A 404 on the category dir is the empty case; other errors
-  // surface on the list.
+  // ── Per-category sync ────────────────────────────────────────
+  //
+  // Pure set-difference of filenames between local IDB and the
+  // daemon listing:
+  //
+  //   committed local + filename in daemon listing
+  //     -> no-op (identical by content-addressing).
+  //   committed local + filename absent from daemon listing
+  //     -> orphan; drop the row.  ONLY fires when the listing
+  //        call succeeded -- a failing listing leaves the list
+  //        as-is.
+  //   local | uploading | failed
+  //     -> preserved; these states have no daemon presence by
+  //        definition.  `resumePending` re-queues them.
+  //   daemon-only file
+  //     -> synthesise a `committed` row.
+  //
+  // A 404 on the category dir is the empty case (operator
+  // added the category but never uploaded a slice yet); other
+  // errors surface on the list.
   async refresh(workspaceId: Uuid, categoryName: string, force = false): Promise<void> {
     const k = key(workspaceId, categoryName);
     const existing = this.lists.get(k);
     const stale = this.staleKeys.has(k);
-    // Cache short-circuit.  Skip when the slice is loaded, error-
-    // free, AND not flagged stale by the poller.  A `force=true`
-    // caller bypasses every gate (used by the workspace-delete
-    // cleanup path, never by routine reads).  Stale is cleared at
-    // the end of the success branch below, so the second effect
-    // pass triggered by that clear still short-circuits here.
     if (existing?.loaded && !force && !existing.error && !stale) return;
     if (existing?.loading && !force) return;
 
+    // Snapshot the in-memory entries at refresh start.  Used at
+    // the end to distinguish "was deleted during refresh" (in
+    // start, not in current) from "was synthesised by refresh"
+    // (not in start, not in current).  Without this, the
+    // merge-on-finish step couldn't safely drop orphans the
+    // operator deleted mid-await.
+    const startEntries = existing?.entries ?? [];
+    const startIds = new SvelteSet(startEntries.map((s) => s.id));
+
     this.lists.set(k, {
       ...EMPTY_LIST,
-      entries: existing?.entries ?? [],
+      entries: startEntries,
       loading: true,
       loaded: existing?.loaded ?? false
     });
@@ -516,11 +563,6 @@ class SlicesStore {
       const [localRows, serverListing] = await Promise.all([
         listSlicesForCategory(workspaceId, categoryName),
         assets.listCategory(workspaceId, categoryName, { limit: 1000 }).catch((e: unknown) => {
-          // A missing `datasets/<class>/` directory is the empty
-          // case -- happens any time the operator added the
-          // category but hasn't uploaded a slice yet.  Treat
-          // 404 as an empty listing; let other errors propagate
-          // so the slice list shows them.
           if (isNotFound(e)) {
             return { entries: [], total: 0, offset: 0, limit: 1000 };
           }
@@ -528,211 +570,270 @@ class SlicesStore {
         })
       ]);
 
-      // Forget-race guard (early).  The Promise.all above is the
-      // longest await in this method (network listing + IDB
-      // round-trip) and therefore the widest window for a
-      // workspace-delete-driven `forget(workspaceId)` to land.
-      // Bailing here skips the synthesised-rows `bulkPutSlices`
-      // write below, which would otherwise commit IDB rows for a
-      // workspace whose IDB is concurrently being wiped by
-      // `deleteSlicesForWorkspace` -- leaving orphan rows that
-      // linger across the workspace's lifetime.  A second,
-      // matching guard lives just before the final `lists.set`
-      // below to catch a forget that lands during the IDB-write
-      // phase.
+      // Forget-race guard: a workspace-delete may have cleared
+      // this entry while we awaited the listing + IDB.
       if (!this.lists.has(k)) return;
 
-      // `SvelteSet` / `SvelteMap` even though these are purely
-      // function-local: the file's `.svelte.ts` extension makes
-      // the `svelte/prefer-svelte-reactivity` lint rule eager
-      // about reactive collections, and it doesn't have a path-
-      // sensitivity model.  Same precedent as the `grouped` map
-      // in `refreshForWorkspace` above.
-      const serverFilenames = new SvelteSet<string>();
-      for (const entry of serverListing.entries) {
-        if (entry.kind === 'file' && entry.name.endsWith('.wav')) {
-          serverFilenames.add(entry.name);
-        }
-      }
-
-      // Split local rows into kept + orphans.  An orphan is a
-      // local row whose `state` says it's been committed to the
-      // daemon but the daemon's listing doesn't include the
-      // file -- daemon-as-master wins, so the row is dropped.
-      const kept: SliceRecord[] = [];
-      const orphans: SliceRecord[] = [];
-      const keptByFilename = new SvelteMap<string, SliceRecord>();
-      for (const row of localRows) {
-        if (row.state === 'committed' && !serverFilenames.has(row.filename)) {
-          orphans.push(row);
-        } else {
-          kept.push(row);
-          keptByFilename.set(row.filename, row);
-        }
-      }
-
-      // Synthesise rows for daemon-only files.  Deterministic id
-      // (`srv:<ws>:<cat>:<filename>`) keeps the row stable across
-      // re-syncs so the IDB write idempotently overwrites.
-      //
-      // Batch every synthesised record into ONE IDB transaction
-      // via `bulkPutSlices` instead of opening N independent
-      // transactions in sequence -- on a cache-cleared session
-      // with a 200-slice category that's a 200-tx-per-category
-      // hit (~600-1000 ms) collapsing to one 30-50 ms tx.  The
-      // batch is gathered synchronously here so the orphan-GC
-      // step below can still run in parallel with it.
-      const synthesised: SliceRecord[] = [];
+      // Index daemon entries by filename.  Only `.wav` files
+      // count; directory entries are noise.
+      // SvelteMap (not bare Map) is the file-wide discipline
+      // for the `.svelte.ts` lint rule.
+      const serverFilenames = new SvelteMap<string, { name: string; mtime: string }>();
       for (const entry of serverListing.entries) {
         if (entry.kind !== 'file' || !entry.name.endsWith('.wav')) continue;
-        if (keptByFilename.has(entry.name)) continue;
-        const synthetic: SliceRecord = {
-          id: `srv:${workspaceId}:${categoryName}:${entry.name}`,
-          workspace_id: workspaceId,
-          category_name: categoryName,
-          filename: entry.name,
-          blob: null,
-          state: 'committed',
-          created_at: entry.mtime
-        };
-        synthesised.push(synthetic);
-        kept.push(synthetic);
-      }
-      if (synthesised.length > 0) {
-        // Best-effort: a failed transaction (typically IDB quota)
-        // leaves the in-memory list authoritative until the next
-        // refresh.  Matches the old per-record `.catch` swallow.
-        await bulkPutSlices(synthesised).catch(() => undefined);
+        serverFilenames.set(entry.name, { name: entry.name, mtime: entry.mtime });
       }
 
-      // GC orphans.  IDB deletes parallelise (disjoint keys);
-      // failures are swallowed because `kept` already excludes
-      // orphans from the in-memory list -- a stuck IDB row is
-      // harmless until the next refresh retries.
-      if (orphans.length > 0) {
-        const orphanIds = orphans.map((o) => o.id);
-        await Promise.all(orphans.map((o) => idbDeleteSlice(o.id).catch(() => undefined)));
-        revokeSliceSpectrograms(orphanIds);
-        revokeSliceBlobs(orphanIds);
+      const kept: SliceRecord[] = [];
+      const toPut: SliceRecord[] = [];
+      const toDeleteKeys: SliceKey[] = [];
+
+      // Walk local rows; classify by state + presence on the
+      // daemon.  Locally-mutable states are always preserved;
+      // committed rows are the only ones subject to the
+      // daemon-as-master rule.
+      //
+      // `seenFilenames` tracks every kept row's filename so the
+      // synthesise loop below doesn't add a second row for the
+      // same content -- it's populated for BOTH branches:
+      //   * committed-matched: prevents synthesising a redundant
+      //     committed row (current behaviour).
+      //   * non-committed: prevents synthesising a "committed"
+      //     duplicate when the daemon already has the file under
+      //     the same content hash (operator re-sliced identical
+      //     content, OR another tab uploaded the same bytes
+      //     while our local upload is still pending).  Without
+      //     this, `kept` would carry two rows with the same id
+      //     (one local, one committed-synthetic) and the merge
+      //     step would push duplicates into `finalEntries` --
+      //     producing duplicate-key warnings from Svelte's
+      //     keyed `{#each}` and a flickering double-render.
+      const seenFilenames = new SvelteSet<string>();
+      for (const row of localRows) {
+        if (row.state !== 'committed') {
+          kept.push(row);
+          seenFilenames.add(sliceFilename(row.id));
+          continue;
+        }
+        const fname = sliceFilename(row.id);
+        if (serverFilenames.has(fname)) {
+          // Filename match = content identity by construction.
+          kept.push(row);
+          seenFilenames.add(fname);
+        } else {
+          // Orphan: remote-deleted by another client.
+          toDeleteKeys.push(sliceKey(row));
+        }
       }
 
-      kept.sort(byCreatedAsc);
-      // Forget-race guard: `forget(workspaceId)` may have cleared
-      // this entry while we were awaiting the listing / IDB / orphan
-      // deletes above.  If so, leave the Map empty rather than
-      // recreating an entry for a workspace that no longer exists --
-      // a leaked entry outlives the workspace deletion and would
-      // shadow a same-id re-create (rare via local seed data, per
-      // the matching guard for `mutationsInFlight` in `forget`).
+      // Synthesise rows for daemon entries absent from IDB.
+      for (const [filename, remote] of serverFilenames) {
+        if (seenFilenames.has(filename)) continue;
+        const synthetic = synthesiseServerSlice(workspaceId, categoryName, filename, remote.mtime);
+        if (synthetic !== null) {
+          kept.push(synthetic);
+          toPut.push(synthetic);
+        }
+      }
+
+      if (toPut.length > 0) {
+        await bulkPutSlices(toPut).catch(() => undefined);
+      }
+      if (toDeleteKeys.length > 0) {
+        await bulkDeleteSlices(toDeleteKeys).catch(() => undefined);
+      }
+
+      // Forget-race guard #2: re-check after the IDB writes.
       if (!this.lists.has(k)) return;
+
+      // Merge `kept` with the current in-memory state to absorb
+      // mutations (append / delete / state transitions) that
+      // landed during our await window.  Without this, a
+      // newly-appended slice (state='local') gets overwritten
+      // out of in-memory; a row whose upload completed mid-
+      // refresh has its committed state reverted to the IDB-
+      // snapshot state.
+      //
+      // For each row in `kept`:
+      //   * was in startIds but not in current -> deleted during
+      //     refresh (operator delete); drop.
+      //   * is in current with a different state -> use current's
+      //     row (state-change mid-refresh, e.g. local -> committed
+      //     from an upload receipt).
+      //   * otherwise -> use kept's row.
+      // For each row in current not in `kept`:
+      //   * non-committed (local / uploading / failed) -> appended
+      //     during refresh; preserve.
+      //   * committed AND not in startIds -> appended-AND-committed
+      //     during refresh window.  Our localRows snapshot was
+      //     taken before the append, and the daemon listing was
+      //     fetched before the PUT propagated, so `kept` includes
+      //     it from neither side.  But `currentEntries` has the
+      //     authoritative committed state -- preserve.  Without
+      //     this clause, an operator who slices + the upload
+      //     completes while a poll-driven reconcile is in flight
+      //     would briefly see their new card vanish from the UI
+      //     (it's still in IDB, but invisible until the next
+      //     refresh trigger picks it back up).
+      //   * committed AND in startIds -> true orphan (was
+      //     committed at refresh start, daemon listing now says
+      //     it's gone, no concurrent local mutation explains it).
+      //     Drop.  The "committed-at-start, transitioned through
+      //     local-state-during-refresh, listing missed PUT"
+      //     scenario is logically impossible: markCommitted fires
+      //     only after PUT completes, which by then propagates
+      //     to listings.
+      const currentList = this.lists.get(k);
+      const currentEntries = currentList?.entries ?? [];
+      const currentById = new SvelteMap<string, SliceRecord>();
+      for (const entry of currentEntries) currentById.set(entry.id, entry);
+
+      const finalEntries: SliceRecord[] = [];
+      const finalIds = new SvelteSet<string>();
+      for (const row of kept) {
+        const inCurrent = currentById.get(row.id);
+        if (inCurrent === undefined) {
+          if (startIds.has(row.id)) {
+            // Was in our memory at start, gone now ->
+            // deleted during refresh.  Drop.
+            continue;
+          }
+          // Not in start, not in current -> new (synthesised
+          // or refreshed from IDB).  Use kept's row.
+          finalEntries.push(row);
+        } else {
+          // In current -> prefer current's version (its state
+          // reflects any mid-refresh mutation).
+          finalEntries.push(inCurrent);
+        }
+        finalIds.add(row.id);
+      }
+      for (const entry of currentEntries) {
+        if (finalIds.has(entry.id)) continue;
+        // Preserve if non-committed (locally-tracked, no daemon
+        // presence) OR if committed-but-not-in-startIds
+        // (appended-and-committed during refresh -- listing
+        // missed the PUT propagation).  Skip committed-and-in-
+        // startIds entries: those are true orphans the daemon
+        // confirmed are gone.
+        if (entry.state !== 'committed' || !startIds.has(entry.id)) {
+          finalEntries.push(entry);
+        }
+      }
+
+      finalEntries.sort(byCreatedAsc);
       this.lists.set(k, {
-        entries: kept,
+        entries: finalEntries,
         loading: false,
         loaded: true,
         error: null
       });
-      // Reconcile against the daemon succeeded -- clear the stale
-      // mark so the SlicePane's effect stops re-firing.  Order
-      // matters: the `lists.set` above is untracked by the per-
-      // category effect (it tracks `isStale` only) and the
-      // `staleKeys.delete` here is the single notification that
-      // settles the dependency graph.
       this.staleKeys.delete(k);
     } catch (e) {
-      // Same guard as the success path -- a forget mid-await
-      // shouldn't be papered over with a stale error entry.
       if (!this.lists.has(k)) return;
+      // Preserve whatever current in-memory state is -- mutations
+      // (appends, deletes, state changes) that landed during the
+      // failed refresh should NOT be reverted to the pre-refresh
+      // snapshot.  Just flip the loading flag and stamp the
+      // error.
+      const current = this.lists.get(k);
+      if (!current) return;
       this.lists.set(k, {
-        entries: existing?.entries ?? [],
+        ...current,
         loading: false,
-        loaded: existing?.loaded ?? true,
         error: errorCopy(e)
       });
+      throw e;
     }
   }
 
   // ── Upload pipeline ──────────────────────────────────────────
   //
-  // Local slices flow through `uploadPool` (capped at
-  // `MAX_CONCURRENT_UPLOADS`).  Each task drives the slice through
-  // `local → uploading → committed | failed`; XHR progress events
-  // patch the in-memory record so SliceCards render the progress
-  // ring without an IDB round-trip per byte.
+  // The `AbortController` is created at ENQUEUE time (not when
+  // the pool actually dispatches `runUpload`) so a `delete()`
+  // that lands while our task is still queued can abort it
+  // before it slips into the pool slot and PUTs bytes to a
+  // slice the operator just removed.  Without this, the queued
+  // window between `enqueueUpload` and `runUpload`'s first
+  // line is a race (delete found `inflightUploads.get(fk)`
+  // empty -> no abort handle -> queued task slipped through).
+  //
+  // The same eager controller also closes a back-to-back-enqueue
+  // dedup race: two synchronous enqueues for the same `fk`
+  // would otherwise both pass the `inflightUploads.has(fk)`
+  // gate (since the entry was only set inside `runUpload`,
+  // after the pool slot acquired).
 
-  // Enqueue an upload by slice id.  Idempotent: a re-entry for an
-  // already-uploading slice is a no-op (the abort controller is
-  // the source of truth).  Returned promise resolves on commit
-  // (or rejects on failure / cancel) so callers can chain.
-  enqueueUpload(sliceId: string): Promise<void> {
-    if (this.inflightUploads.has(sliceId)) {
+  enqueueUpload(record: Pick<SliceRecord, 'workspace_id' | 'category_name' | 'id'>): Promise<void> {
+    const fk = flightKey(record.workspace_id, record.category_name, record.id);
+    if (this.inflightUploads.has(fk)) {
       return Promise.resolve();
     }
-    return this.uploadPool.submit(() => this.runUpload(sliceId));
+    const controller = new AbortController();
+    this.inflightUploads.set(fk, controller);
+    return this.uploadPool.submit(async () => {
+      try {
+        await this.runUpload(record.workspace_id, record.category_name, record.id, controller);
+      } finally {
+        // Identity-checked cleanup.  A `delete()` that aborted
+        // OUR controller also removed our map entry; a
+        // subsequent enqueue (e.g. operator re-added the slice
+        // via re-slicing identical audio) may have repopulated
+        // it with a different controller.  Clear only when we
+        // are still the registered owner -- otherwise we would
+        // clobber the successor's entry.
+        if (this.inflightUploads.get(fk) === controller) {
+          this.inflightUploads.delete(fk);
+        }
+      }
+    });
   }
 
-  // Re-queue every pending slice in a workspace -- the cross-reload
-  // recovery path.  `enqueueUpload` dedupes against in-flight ids
-  // so re-firing this for a batch already draining the pool is a
-  // no-op.  Daemon PUT is idempotent (same body -> same final
-  // state) so a previous session's `uploading` row is safe to
-  // re-attempt.
   resumePending(workspaceId: Uuid): void {
     for (const slice of this.pendingFor(workspaceId)) {
-      void this.enqueueUpload(slice.id);
+      void this.enqueueUpload(slice);
     }
   }
 
-  private async runUpload(sliceId: string): Promise<void> {
-    const slice = this.findSliceById(sliceId);
-    if (!slice) return; // deleted before the upload could start
+  private async runUpload(
+    workspaceId: Uuid,
+    categoryName: string,
+    id: string,
+    controller: AbortController
+  ): Promise<void> {
+    // Aborted before we got a pool slot (delete fired while
+    // queued).  Bail before touching any slice state.  Read
+    // through a local so TS's control-flow narrowing of
+    // `signal.aborted` past this point doesn't flag the
+    // catch-branch re-read as "always-falsy" (the underlying
+    // value flips asynchronously, but TS models it as a
+    // single-shot narrow).
+    const initiallyAborted: boolean = controller.signal.aborted;
+    if (initiallyAborted) return;
+    const slice = this.findSlice(workspaceId, categoryName, id);
+    if (!slice) return;
     if (!slice.blob || slice.blob.size === 0) {
-      // Defensive: should not happen for local / failed slices.
-      // Mark failed so the operator sees the stall instead of a
-      // silent no-op.
       await this.markFailed(slice, 'No local bytes to upload.');
       return;
     }
-
-    const controller = new AbortController();
-    this.inflightUploads.set(sliceId, controller);
-    // Bracket the entire upload as one in-flight mutation against
-    // the workspace so the poller defers its revision check while
-    // any of our PUTs are racing the daemon's revision counter.
-    // The bracket is on the workspace (not the slice) because the
-    // revision lives at workspace granularity; a batch of 10
-    // slices counts as 10 mutations and the poller waits until
-    // all are settled.
-    this.beginMutation(slice.workspace_id);
+    this.beginMutation(workspaceId);
 
     try {
       await this.markUploading(slice);
 
-      const url = assets.slicePutPath(slice.workspace_id, slice.category_name, slice.filename);
-      // Retry loop.  Slice stays `uploading` across attempts (no
-      // per-attempt IDB rewrite).  Backoff runs INSIDE the pool
-      // slot so a transient-failing slice doesn't oscillate
-      // between attempting and queued -- worst case ~10-12 s held
-      // before final failure, still a small fraction of any
-      // real-world batch's drain time.
+      const url = assets.slicePutPath(workspaceId, categoryName, sliceFilename(id));
       let lastError: unknown = null;
       for (let attempt = 1; attempt <= UPLOAD_RETRY_ATTEMPTS; attempt++) {
         if (attempt > 1) {
-          // Reset visible progress so the eye reads "new attempt"
-          // rather than a stale partial byte; memory-only so no
-          // IDB write.
-          this.setProgress(sliceId, 0);
+          this.setProgress(workspaceId, categoryName, id, 0);
           const wait = Math.min(
             UPLOAD_RETRY_BASE_MS * Math.pow(2, attempt - 2),
             UPLOAD_RETRY_MAX_MS
           );
-          // ±25 % jitter so concurrent slot failures don't re-fire
-          // on the same daemon event.
           const jittered = wait * (0.75 + Math.random() * 0.5);
           try {
             await sleepAbortable(jittered, controller.signal);
           } catch {
-            // Aborted by delete / forget / clearForCategory.  No
-            // state-machine update -- caller already cleaned up.
             return;
           }
         }
@@ -742,80 +843,66 @@ class SlicesStore {
             body: slice.blob,
             contentType: 'audio/wav',
             onProgress: (loaded, total) => {
-              if (total > 0) this.setProgress(sliceId, loaded / total);
+              if (total > 0) this.setProgress(workspaceId, categoryName, id, loaded / total);
             },
             signal: controller.signal
           });
-          // Funnel into the single monotonic-up writer.  The
-          // workspace detail's "live" revision chip + the
-          // poller's "did revision advance" gate both read from
-          // the same map; routing every writer through one
-          // setter keeps the invariant in one place.
-          this.setRevisionAtLeast(slice.workspace_id, receipt.workspace_revision_id);
+          this.setRevisionAtLeast(workspaceId, receipt.workspace_revision_id);
+          if (receipt.sha256 !== id) {
+            // Content-addressed receipt verification.  If the
+            // daemon's hash differs from our pre-computed id,
+            // bytes were corrupted in transport (or our
+            // pre-compute disagreed with the daemon's algo --
+            // both should not happen).  Treat as upload
+            // failure; operator can retry.
+            lastError = new Error(
+              `Daemon receipt sha256 (${receipt.sha256}) did not match slice id (${id}).`
+            );
+            break;
+          }
           await this.markCommitted(slice, receipt.workspace_revision_id);
           return;
         } catch (e) {
-          if (controller.signal.aborted) {
-            // Cancelled mid-transfer.  Same shape as the abort-
-            // during-backoff branch above.
-            return;
-          }
+          if (controller.signal.aborted) return;
           lastError = e;
-          if (!isTransientUploadError(e)) {
-            // Permanent failure (4xx other than 429: bad
-            // request, not-found, conflict, etc.).  No point in
-            // burning more attempts -- bail out and let the
-            // operator decide.
-            break;
-          }
-          // Transient -- fall through to the next loop iteration
-          // (or out of the loop if we've exhausted attempts).
+          if (!isTransientUploadError(e)) break;
         }
       }
 
       await this.markFailed(slice, errorCopy(lastError));
     } finally {
-      this.inflightUploads.delete(sliceId);
-      this.endMutation(slice.workspace_id);
+      this.endMutation(workspaceId);
     }
   }
 
   // ── Slice-record mutations + IDB persistence ─────────────────
 
-  // Locate a slice by id across every per-workspace+category
-  // list.  O(N) over the entire cache; fine for our scale (low
-  // hundreds of slices per session).
-  private findSliceById(sliceId: string): SliceRecord | undefined {
-    for (const list of this.lists.values()) {
-      for (const entry of list.entries) {
-        if (entry.id === sliceId) return entry;
-      }
-    }
-    return undefined;
+  private findSlice(workspaceId: Uuid, categoryName: string, id: string): SliceRecord | undefined {
+    const list = this.lists.get(key(workspaceId, categoryName));
+    if (!list) return undefined;
+    return list.entries.find((s) => s.id === id);
   }
 
-  // Replace an in-memory slice with a transformed copy.  Writes
-  // a fresh `entries` array so SvelteMap notifies subscribers.
-  // Returns the next record so callers can chain (e.g. persist
-  // to IDB).
   private patchInMemory(
-    sliceId: string,
+    workspaceId: Uuid,
+    categoryName: string,
+    id: string,
     transform: (s: SliceRecord) => SliceRecord
   ): SliceRecord | undefined {
-    for (const [k, list] of this.lists) {
-      const idx = list.entries.findIndex((s) => s.id === sliceId);
-      if (idx < 0) continue;
-      const next = transform(list.entries[idx]);
-      const entries = list.entries.slice();
-      entries[idx] = next;
-      this.lists.set(k, { ...list, entries });
-      return next;
-    }
-    return undefined;
+    const k = key(workspaceId, categoryName);
+    const list = this.lists.get(k);
+    if (!list) return undefined;
+    const idx = list.entries.findIndex((s) => s.id === id);
+    if (idx < 0) return undefined;
+    const next = transform(list.entries[idx]);
+    const entries = list.entries.slice();
+    entries[idx] = next;
+    this.lists.set(k, { ...list, entries });
+    return next;
   }
 
   private async markUploading(slice: SliceRecord): Promise<void> {
-    const next = this.patchInMemory(slice.id, (s) => ({
+    const next = this.patchInMemory(slice.workspace_id, slice.category_name, slice.id, (s) => ({
       ...s,
       state: 'uploading',
       upload_progress: 0,
@@ -824,19 +911,20 @@ class SlicesStore {
     if (next) await putSlice(next).catch(() => undefined);
   }
 
-  private setProgress(sliceId: string, progress: number): void {
-    // Memory-only -- IDB-writing every progress tick would
-    // thrash the IDB transaction log.  The SliceCard reads from
-    // memory so the ring still animates smoothly.
-    this.patchInMemory(sliceId, (s) => ({ ...s, upload_progress: progress }));
+  private setProgress(
+    workspaceId: Uuid,
+    categoryName: string,
+    id: string,
+    progress: number
+  ): void {
+    this.patchInMemory(workspaceId, categoryName, id, (s) => ({
+      ...s,
+      upload_progress: progress
+    }));
   }
 
   private async markCommitted(slice: SliceRecord, revisionId: number): Promise<void> {
-    // Drop the blob to free origin quota; the daemon now holds
-    // the canonical copy.  In-memory record carries `blob: null`
-    // too so subsequent renders / plays go through
-    // `getSliceBlob`'s lazy-fetch path.
-    const next = this.patchInMemory(slice.id, (s) => ({
+    const next = this.patchInMemory(slice.workspace_id, slice.category_name, slice.id, (s) => ({
       ...s,
       state: 'committed',
       blob: null,
@@ -845,10 +933,48 @@ class SlicesStore {
       workspace_revision_id: revisionId
     }));
     if (next) await putSlice(next).catch(() => undefined);
+
+    // Auto-advance the persisted sync record ONLY if our
+    // upload's receipt rev is exactly one past where we were
+    // synced.  In that case our upload is provably the only
+    // workspace mutation between (synced) and (revisionId);
+    // no external advance happened in the gap; we can claim
+    // "synced to revisionId" without risking missing data.
+    //
+    // The strict `+1` check is intentionally pessimistic --
+    // a multi-tab race where another client interleaved an
+    // upload would leave a gap (receipts arrive out of
+    // monotonic order, or daemon-rev numbers skip), the
+    // check fails, and we fall back to the poller's
+    // `incoming > synced` gate to drive a reconcile.
+    //
+    // Without this optimisation, every local upload commit
+    // triggers a Tier 2 reconcile on the next poll tick
+    // (synced = N stays behind incoming = N+1 from our own
+    // PUT) -- N category-listing GETs of pure wasted
+    // bandwidth, since we already KNOW our upload was the
+    // only delta.
+    //
+    // Fire-and-forget the IDB write: IDB serialises writes
+    // on the same connection so back-to-back batch commits
+    // produce monotonic last-write-wins on the row; if a
+    // write hasn't flushed when the tab closes, next session
+    // re-reads the older value and re-reconciles (self-
+    // healing).
+    const wsId = slice.workspace_id;
+    const priorSynced = this.lastSyncedRevisions.get(wsId) ?? -1;
+    if (priorSynced + 1 === revisionId) {
+      this.setLastSyncedAtLeast(wsId, revisionId);
+      void putWorkspaceSync({
+        workspace_id: wsId,
+        last_synced_revision_id: revisionId,
+        last_synced_at: new Date().toISOString()
+      }).catch(() => undefined);
+    }
   }
 
   private async markFailed(slice: SliceRecord, error: string): Promise<void> {
-    const next = this.patchInMemory(slice.id, (s) => ({
+    const next = this.patchInMemory(slice.workspace_id, slice.category_name, slice.id, (s) => ({
       ...s,
       state: 'failed',
       upload_progress: undefined,
@@ -857,26 +983,27 @@ class SlicesStore {
     if (next) await putSlice(next).catch(() => undefined);
   }
 
-  // Append a fresh slice.  The Slice action calls this N times per
-  // click; each call appends one row (no batching) so a partial
-  // failure (e.g. IDB quota) leaves the prior slices visible.
-  //
-  // Dedupe by id before tail-inserting: if `refreshForWorkspace` (or
-  // a per-category `refresh`) ran concurrently, its IDB walk would
-  // have seen our `putSlice` commit and folded the row into the
-  // refreshed list -- so a naive append would duplicate it.  The
-  // check is O(N) in entries length; entries.length is bounded by
-  // MAX_SLICES_PER_CATEGORY so the cost is trivial.
+  // Append a slice.  IDB's composite key means re-slicing
+  // byte-identical audio in the same (workspace, category)
+  // overwrites the prior row -- the caller (`InputPane`) reads
+  // the post-put list length to surface a "duplicates
+  // collapsed" hint.
   async append(record: SliceRecord): Promise<void> {
     await putSlice(record);
     const k = key(record.workspace_id, record.category_name);
     const existing = this.lists.get(k);
     const baseEntries = existing?.entries ?? [];
-    const entries = baseEntries.some((s) => s.id === record.id)
-      ? baseEntries
-      : [...baseEntries, record];
-    // Tail insert preserves `created_at` ascending order (IDB query
-    // sorts the same way; the cache mirrors it).
+    // Replace if an entry with this id already exists, else
+    // append.  Tail-insert preserves `created_at` ascending
+    // order (IDB query mirrors it).
+    const replaceIdx = baseEntries.findIndex((s) => s.id === record.id);
+    let entries: SliceRecord[];
+    if (replaceIdx >= 0) {
+      entries = baseEntries.slice();
+      entries[replaceIdx] = record;
+    } else {
+      entries = [...baseEntries, record];
+    }
     this.lists.set(k, {
       ...EMPTY_LIST,
       entries,
@@ -886,59 +1013,32 @@ class SlicesStore {
     });
   }
 
-  // Remove a single slice.  Three paths fan out:
-  //   1. In-flight upload: abort the XHR.  The runUpload's
-  //      `signal.aborted` branch skips the state-machine update
-  //      so we don't write `failed` over the row we're about to
-  //      delete.
-  //   2. `committed` row with a `workspace_revision_id`: the
-  //      file exists on the daemon; fire `DELETE
-  //      /assets/datasets/<class>/<filename>` through the
-  //      global delete queue + await its SSE terminal.
-  //   3. `local` / `uploading` (post-abort) / `failed`: no
-  //      daemon-side presence; just drop the IDB row + caches.
-  //
-  // All three revoke spectrogram + blob caches in lock-step so
-  // the browser GCs the underlying canvas + WAV bytes the moment
-  // the row disappears from the grid.
   async delete(record: SliceRecord): Promise<void> {
-    // Idempotency guard: a re-entrant `delete()` (keyboard Enter on
-    // a focused button, double-fire from a stale queue) is a no-op.
-    // The pane-side `deletingIds` gates are the primary defence;
-    // this is the store-side belt-and-braces.
-    if (this.deletingIds.has(record.id)) return;
-    // Mark up front so every consumer (card gray-out, selection
-    // mutators, batch filter) sees the row as off-limits before
-    // any async work fires.  `finally` clears unconditionally so
-    // a one-off failure never strands the card in a tombstone.
-    this.deletingIds.add(record.id);
-    // Only a committed row's delete advances the daemon's
-    // revision (the others are pure-local cleanup).  Capture the
-    // flag up front so the finally bracket is symmetric across
-    // every early-return path.
+    const fk = flightKey(record.workspace_id, record.category_name, record.id);
+    if (this.deletingIds.has(fk)) return;
+    this.deletingIds.add(fk);
     const remoteDelete = record.state === 'committed';
     if (remoteDelete) this.beginMutation(record.workspace_id);
     try {
-      const controller = this.inflightUploads.get(record.id);
+      const controller = this.inflightUploads.get(fk);
       if (controller) {
         controller.abort();
-        this.inflightUploads.delete(record.id);
+        this.inflightUploads.delete(fk);
       }
       if (remoteDelete) {
         try {
           await enqueueDelete(() => this.runRemoteDelete(record));
         } catch (e) {
-          // Re-throw and skip local cleanup: the daemon still has
-          // the file, and dropping the IDB row would just have the
-          // next refresh re-synthesise it -- a sync fight.  Operator
-          // sees the row back in its prior state and can retry.
           console.warn('[slices] remote delete failed', e);
           throw e;
         }
       }
-      await idbDeleteSlice(record.id);
-      revokeSliceSpectrograms([record.id]);
-      revokeSliceBlobs([record.id]);
+      await idbDeleteSlice(record.workspace_id, record.category_name, record.id);
+      // No cache eviction: spectrogram + blob caches are
+      // content-addressed (keyed by sha256); another slice
+      // anywhere with the same content may still rely on the
+      // entry.  Content-addressed caches accumulate; `resetDB`
+      // is the single reset point.
       const k = key(record.workspace_id, record.category_name);
       const existing = this.lists.get(k);
       if (!existing) return;
@@ -947,19 +1047,11 @@ class SlicesStore {
         entries: existing.entries.filter((s) => s.id !== record.id)
       });
     } finally {
-      this.deletingIds.delete(record.id);
+      this.deletingIds.delete(fk);
       if (remoteDelete) this.endMutation(record.workspace_id);
     }
   }
 
-  // Bulk-delete a snapshot of slice records.  Fans out to
-  // `delete()` per record so the same 3-path branch (in-flight
-  // abort / committed DELETE / local IDB cleanup) runs untouched.
-  // Committed slices serialise through `enqueueDelete` (daemon
-  // `max_delete_jobs = 1`); local-only deletes parallelise on
-  // disjoint IDB keys.  Failures are captured per-target so the
-  // caller can surface them and retry survivors -- SlicePane
-  // re-selects failed ids; the workspaces store does the same.
   async deleteMany(targets: SliceRecord[]): Promise<BulkSliceDeleteOutcome> {
     const failed: BulkSliceDeleteFailure[] = [];
     let succeeded = 0;
@@ -971,45 +1063,33 @@ class SlicesStore {
         } catch (e) {
           const message =
             e instanceof Error && e.message ? capFirst(e.message, 'Delete failed.') : errorCopy(e);
-          failed.push({ id: record.id, filename: record.filename, error: message });
+          failed.push({ id: record.id, filename: sliceFilename(record.id), error: message });
         }
       })
     );
     return { succeeded, failed };
   }
 
-  // Run the daemon-side DELETE + await its async job terminal.
-  // Same SSE-terminal contract as the workspace + category delete
-  // paths -- consistent across the delete family.
   private async runRemoteDelete(slice: SliceRecord): Promise<void> {
-    const ack = await assets.deleteSlice(slice.workspace_id, slice.category_name, slice.filename);
+    const ack = await assets.deleteSlice(
+      slice.workspace_id,
+      slice.category_name,
+      sliceFilename(slice.id)
+    );
     await awaitJobTerminal(ack.job_id);
   }
 
-  // Bulk-drop every slice for a `(workspace_id, category_name)`
-  // pair.  Called from the categories-store delete path so a
-  // category removal scrubs the slice list in lock-step with the
-  // category row.  Aborts every in-flight upload for the
-  // category first (no point in racing the daemon's category
-  // wipe), then revokes the caches.
-  //
-  // The daemon-side DELETE is already wired by the categories
-  // store (it issues `DELETE /assets/datasets/<class>` for
-  // server-side categories); this helper only handles the local
-  // IDB + cache cleanup.
   async clearForCategory(workspaceId: Uuid, categoryName: string): Promise<void> {
     const existing = this.lists.get(key(workspaceId, categoryName));
     if (existing && existing.entries.length > 0) {
       for (const slice of existing.entries) {
-        const controller = this.inflightUploads.get(slice.id);
+        const fk = flightKey(workspaceId, categoryName, slice.id);
+        const controller = this.inflightUploads.get(fk);
         if (controller) {
           controller.abort();
-          this.inflightUploads.delete(slice.id);
+          this.inflightUploads.delete(fk);
         }
       }
-      const ids = existing.entries.map((s) => s.id);
-      revokeSliceSpectrograms(ids);
-      revokeSliceBlobs(ids);
     }
     await deleteSlicesForCategory(workspaceId, categoryName);
     const k = key(workspaceId, categoryName);
@@ -1017,62 +1097,50 @@ class SlicesStore {
       ...EMPTY_LIST,
       loaded: true
     });
-    // Just wiped the category locally; any prior stale mark from
-    // a poller advance is now moot -- a refresh would just walk
-    // an empty IDB partition + (404 → empty) daemon listing.
     this.staleKeys.delete(k);
   }
 
-  // Drop in-memory cache entries for a workspace.  Pairs with
-  // `deleteSlicesForWorkspace` in the workspace-delete cleanup:
-  // the IDB rows go away on disk, and these in-memory keys (which
-  // would point at dead state) get forgotten too.  Aborts every
-  // in-flight upload for the affected scope; revokes spectrogram
-  // + blob caches so the browser GCs both image and WAV bytes.
   forget(workspaceId: Uuid, categoryName?: string): void {
-    const drop = (k: string): void => {
+    const drop = (k: string, name: string): void => {
       const list = this.lists.get(k);
       if (list && list.entries.length > 0) {
-        const ids = list.entries.map((s) => s.id);
-        for (const id of ids) {
-          const controller = this.inflightUploads.get(id);
+        for (const slice of list.entries) {
+          const fk = flightKey(workspaceId, name, slice.id);
+          const controller = this.inflightUploads.get(fk);
           if (controller) {
             controller.abort();
-            this.inflightUploads.delete(id);
+            this.inflightUploads.delete(fk);
           }
         }
-        revokeSliceSpectrograms(ids);
-        revokeSliceBlobs(ids);
       }
       this.lists.delete(k);
       this.staleKeys.delete(k);
     };
     if (categoryName !== undefined) {
-      drop(key(workspaceId, categoryName));
+      drop(key(workspaceId, categoryName), categoryName);
       return;
     }
     const prefix = `${workspaceId} `;
     for (const k of Array.from(this.lists.keys())) {
-      if (k.startsWith(prefix)) drop(k);
+      if (k.startsWith(prefix)) {
+        const name = k.slice(prefix.length);
+        drop(k, name);
+      }
     }
     this.workspacesLoaded.delete(workspaceId);
     this.latestRevisions.delete(workspaceId);
-    // Defensive: drop any residual mutation count.  Real flows
-    // can't leak here (uploads + deletes bracket via `finally`),
-    // but a workspace-delete that fires while a slice upload was
-    // mid-stream would still see this counter > 0 -- without the
-    // explicit clear, the next workspace using the same id (rare
-    // but not impossible via local seed data) would inherit a
-    // stale gate that pauses its poller indefinitely.
+    // Drop the in-memory mirror too -- a re-created workspace
+    // with the same UUID (rare but possible via local seed
+    // data) would otherwise inherit the prior workspace's
+    // synced-revision claim, which would Tier-1-short-circuit
+    // an incoming reconcile against the empty new workspace.
+    this.lastSyncedRevisions.delete(workspaceId);
     this.mutationsInFlight.delete(workspaceId);
-    // Mirror cleanup for the reconcile in-flight flag.  A
-    // workspace-delete observed mid-reconcile would otherwise
-    // leave the flag set indefinitely (the reconcile's per-
-    // category `refresh()` short-circuits as soon as `forget`
-    // clears the lists, so the flag's `finally` does fire
-    // eventually -- but the explicit clear here removes any
-    // observability hazard for a same-id re-create).
     this.reconcilingWorkspaces.delete(workspaceId);
+    // Persisted sync record is GC'd by the workspace-delete
+    // chain in [stores/workspaces.svelte.ts] too; firing here
+    // covers a forget-without-delete (e.g. a test teardown).
+    void deleteWorkspaceSync(workspaceId).catch(() => undefined);
   }
 }
 

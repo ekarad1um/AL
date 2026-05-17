@@ -24,6 +24,13 @@
   // an end-to-end PUT-new + DELETE-old + revision-bump dance).
   interface Props {
     workspaceId: Uuid;
+    // The daemon's current `workspace_revision.id` for this
+    // workspace, threaded through from the page's loaded detail
+    // (and updated by the poller's `onDetail` callback).
+    // The slices store's Tier 1 short-circuit compares this
+    // against the persisted `workspace_sync` record on bulk
+    // mount; equality skips every per-category dataset GET.
+    workspaceRevision: number;
     // Operator-facing workspace name, threaded through to the
     // Input Module's export filename.  Defaults to a generic
     // 'workspace' so the list can render even before the detail
@@ -31,7 +38,7 @@
     // current ws name when it's available.
     workspaceName?: string;
   }
-  let { workspaceId, workspaceName = 'workspace' }: Props = $props();
+  let { workspaceId, workspaceRevision, workspaceName = 'workspace' }: Props = $props();
 
   // Trigger a refresh on mount + whenever `workspaceId` changes.
   // The refresh call is wrapped in `untrack` so the reactive reads
@@ -74,10 +81,11 @@
   $effect(() => {
     const id = workspaceId;
     const cats = slice.entries;
+    const rev = workspaceRevision;
     if (cats.length === 0) return;
     const names = cats.map((c) => c.name);
     untrack(() => {
-      void slices.refreshForWorkspace(id, names);
+      void slices.refreshForWorkspace(id, names, rev);
     });
   });
 

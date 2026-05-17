@@ -385,9 +385,17 @@
          the store and re-renders reactively on every mutation.
          Per-category sync state surfaces in each row's badge;
          CategoryList also auto-resumes any pending uploads on mount
-         so a tab reload mid-batch picks up where it left off. -->
+         so a tab reload mid-batch picks up where it left off.
+         `workspaceRevision` is threaded so the slices store's
+         Tier 1 short-circuit can skip every per-category dataset
+         GET when the persisted `workspace_sync` row already
+         matches the daemon's current revision. -->
     <div class="mb-6">
-      <CategoryList workspaceId={detail.id} workspaceName={detail.name} />
+      <CategoryList
+        workspaceId={detail.id}
+        workspaceRevision={detail.workspace_revision.id}
+        workspaceName={detail.name}
+      />
     </div>
 
     <!-- Training surface: submit + live progress + smart

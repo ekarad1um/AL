@@ -102,6 +102,16 @@
   }
   let { workspaceId, categoryName }: Props = $props();
 
+  // Per-(workspace, category) "is this slice mid-delete?"
+  // helper.  The slices store keys its in-flight set by the
+  // composite tuple `(workspace_id, category_name, id)` because
+  // slice ids are content-addressed and the same hash can land
+  // in two categories.  SlicePane is scoped to one
+  // (workspace, category) so a one-arg helper reads naturally
+  // at the callsites that gate playback / selection / retry.
+  const isDeleting = (id: string): boolean =>
+    slices.isDeleting(workspaceId, categoryName, id);
+
   // Per-category refresh on mount.  Wrapped in `untrack` for the
   // same reactive-loop reason documented in NOTES.md §"$effect +
   // refresh() reactive-loop trap" -- the store's refresh reads
@@ -160,7 +170,7 @@
     // pipeline that's about to read from a row that's about to
     // be gone.  Bailing here is the defence-in-depth gate; the
     // visual + store-level gates handle the rest.
-    if (slices.deletingIds.has(slice.id)) return;
+    if (isDeleting(slice.id)) return;
     audioCtx ??= new AudioContext();
     if (audioCtx.state === 'suspended') {
       await audioCtx.resume();
@@ -245,8 +255,8 @@
     // PUT to a row IDB is about to drop.  `runUpload`'s
     // `findSliceById` re-check is the last line of defence; this
     // gate stops the race from happening in the first place.
-    if (slices.deletingIds.has(record.id)) return;
-    void slices.enqueueUpload(record.id);
+    if (isDeleting(record.id)) return;
+    void slices.enqueueUpload(record);
   }
 
   // ── Multi-selection ──────────────────────────────────────────
@@ -281,7 +291,7 @@
   // label would stay stuck on "Select all" because the deleting
   // row is necessarily absent from the selection.
   const allSelected = $derived.by(() => {
-    const eligible = list.entries.filter((s) => !slices.deletingIds.has(s.id));
+    const eligible = list.entries.filter((s) => !isDeleting(s.id));
     return eligible.length > 0 && eligible.every((s) => selectedIds.has(s.id));
   });
 
@@ -411,7 +421,7 @@
     // shift-click extends from a real, interactable card.
     let anchor: string | null = null;
     for (const s of list.entries) {
-      if (slices.deletingIds.has(s.id)) continue;
+      if (isDeleting(s.id)) continue;
       selectedIds.add(s.id);
       anchor ??= s.id;
     }
@@ -439,7 +449,7 @@
     // (the menu's "Select" item bypasses the card's pointer block)
     // and any keyboard / shortcut path that might reach this fn
     // with a stale id.
-    if (slices.deletingIds.has(id)) return;
+    if (isDeleting(id)) return;
     // Auto-enter mode on the *add* branch so a Ctrl/Cmd-click on a
     // card in normal mode flips the pane into selecting (mirrors
     // workspaces' "Select workspaces…" right-click entry).  The
@@ -483,7 +493,7 @@
     const [lo, hi] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
     for (let i = lo; i <= hi; i++) {
       // Skip mid-delete rows in the range, same as `selectAll`.
-      if (slices.deletingIds.has(entries[i].id)) continue;
+      if (isDeleting(entries[i].id)) continue;
       selectedIds.add(entries[i].id);
     }
     selectionAnchor = toId;
@@ -526,7 +536,7 @@
     // the gate above and this read (window measured in microseconds,
     // but the filter is a no-cost SvelteSet lookup).
     const targets = list.entries.filter(
-      (s) => selectedIds.has(s.id) && !slices.deletingIds.has(s.id)
+      (s) => selectedIds.has(s.id) && !isDeleting(s.id)
     );
     if (targets.length === 0) return;
     // Stop playback only if the currently-playing slice is targeted.
@@ -594,6 +604,97 @@
   //                      immediate path -- this shortcut is the
   //                      multi-select trigger.
   let gridEl = $state<HTMLDivElement | undefined>();
+
+  // ── Viewport-gated spectrogram loading ──────────────────────
+  //
+  // The SlicePane's grid can hold up to MAX_SLICES_PER_CATEGORY
+  // = 200 cards; rendering spectrograms for all of them on
+  // every expand would burn ~200 × (network GET + FFT) per
+  // visit.  IntersectionObserver lets us postpone each card's
+  // fetch until it actually enters (or is about to enter) the
+  // grid's viewport.  The observer's root is `gridEl` so the
+  // grid's own `overflow-y-auto` scroll drives intersection,
+  // not the page viewport -- the grid is the scroll container.
+  //
+  // `visibleIds` is the single source of truth for "which
+  // cards should be fetching their spectrogram right now".
+  // Each SliceCard reads `visible={visibleIds.has(slice.id)}`
+  // (SvelteSet membership is reactive) and uses a 150 ms
+  // debounce before firing the fetch so fast-scroll transits
+  // don't trigger doomed-to-be-discarded work.
+  //
+  // A MutationObserver re-observes new card DOM nodes when
+  // the slice list mutates (e.g. an upload completes and the
+  // card swaps from `local` to `committed`; or a server-
+  // synthesised row arrives via reconcile).  IntersectionObserver
+  // `observe(el)` is idempotent, so the
+  // re-observe-everything-on-each-mutation pass is safe.
+  const visibleIds = new SvelteSet<string>();
+  $effect(() => {
+    const root = gridEl;
+    if (!root) return;
+    // IntersectionObserver is required.  Targets that ship
+    // AudioWorklet (already required across the recorder) also
+    // ship IntersectionObserver, so we accept the runtime
+    // dependency rather than carrying a fallback branch whose
+    // dependency tracking is subtly wrong (fallback reads
+    // `list.entries`, observer branch doesn't, so subsequent
+    // list mutations would silently leave the fallback set
+    // stale).  On a browser missing IO, visibleIds stays empty
+    // and cards render without spectrograms -- graceful
+    // degradation, same outcome as IO never firing.
+    const obs = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const id = (entry.target as HTMLElement).dataset.sliceId;
+          if (!id) continue;
+          if (entry.isIntersecting) visibleIds.add(id);
+          else visibleIds.delete(id);
+        }
+      },
+      {
+        root,
+        // Pre-fetch margin: start loading cards roughly one
+        // row above + below the viewport so an operator's
+        // smooth scroll lands on cards that are already
+        // resolving.  64 px is ~ one card height at the
+        // grid's `aspect-3/2` minmax(96px, 1fr) tracks.
+        rootMargin: '64px 0px',
+        threshold: 0.01
+      }
+    );
+    // Observe new card nodes precisely via the MutationObserver's
+    // `addedNodes` list (cheaper than re-querySelectorAll'ing
+    // the entire grid on every mutation).  Removed nodes are
+    // auto-handled by IntersectionObserver -- it silently drops
+    // disconnected elements from its target set.
+    for (const card of root.querySelectorAll<HTMLElement>('[data-slice-id]')) {
+      obs.observe(card);
+    }
+    const mo = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const node of m.addedNodes) {
+          if (node instanceof HTMLElement && node.dataset.sliceId) {
+            obs.observe(node);
+          } else if (node instanceof HTMLElement) {
+            // Descendant of a wrapper -- query for any cards
+            // inside.  Svelte's `{#each}` blocks usually
+            // append direct children, but a future wrapping
+            // change would land here.
+            for (const card of node.querySelectorAll<HTMLElement>('[data-slice-id]')) {
+              obs.observe(card);
+            }
+          }
+        }
+      }
+    });
+    mo.observe(root, { childList: true });
+    return () => {
+      obs.disconnect();
+      mo.disconnect();
+      visibleIds.clear();
+    };
+  });
   function onGridKey(e: KeyboardEvent): void {
     // Don't fire if the operator is mid-edit in a text field.
     const t = e.target as HTMLElement | null;
@@ -641,7 +742,7 @@
     // a different element (e.g. via keyboard chord), so a literal
     // gate sits here too -- we never want to open a per-card
     // menu over a row the operator can't act on anyway.
-    if (slices.deletingIds.has(slice.id)) return;
+    if (isDeleting(slice.id)) return;
     e.preventDefault();
     // Stop here so the event doesn't bubble to the enclosing
     // CategoryList wrapper (which would otherwise open the
@@ -981,7 +1082,8 @@
           playing={playingId === slice.id}
           selected={selectedIds.has(slice.id)}
           multiSelectActive={mode === 'selecting'}
-          deleting={slices.deletingIds.has(slice.id)}
+          deleting={isDeleting(slice.id)}
+          visible={visibleIds.has(slice.id)}
           onPlay={() => void play(slice)}
           onPick={(mods: { toggle: boolean; range: boolean }) => onPick(slice, mods)}
           onDelete={() => void deleteSlice(slice)}
