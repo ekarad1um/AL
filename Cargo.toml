@@ -46,8 +46,13 @@ clap = { version = "=4.6.1", features = ["derive"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 tracing-appender = "=0.2.5"
 anyhow = "=1.0.102"
-# Optional global allocator for the binary; gated by the `mimalloc` feature.
-mimalloc = { version = "=0.1.50", default-features = false, optional = true }
+# Optional global allocator (binary only; lib tests use the system
+# allocator).  `extended` exposes `mi_collect` for `crate::allocator`.
+# Pinned to **mimalloc v3** -- do NOT add the `v2` feature.
+mimalloc = { version = "=0.1.50", default-features = false, features = ["extended"], optional = true }
+# Direct dep for the extended C API (`mi_collect`); Cargo unifies with
+# the transitive copy `mimalloc` pulls.  v3 is selected via absent `v2`.
+libmimalloc-sys = { version = "=0.1.47", default-features = false, features = ["extended"], optional = true }
 
 opus = "=0.3.1"
 rubato = { workspace = true }
@@ -162,7 +167,7 @@ name = "regen_fixtures"
 
 [features]
 default = ["autodiff", "mimalloc"]
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 alsa-real = ["dep:alsa"]
 autodiff = ["burn/autodiff", "burn-ndarray/multi-threads"]
 rknpu = ["dep:libloading"]

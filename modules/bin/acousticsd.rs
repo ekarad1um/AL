@@ -19,20 +19,19 @@
 //! harness depends on is the cargo-supplied path used to
 //! spawn the binary as a child process.
 
-// `mimalloc` is an optional dep of `acoustics_lab` gated
-// by the `mimalloc` feature (default-on).  Test builds
-// that disable default features pick the system allocator
-// instead.
+// `mimalloc` is an optional dep, default-on; test builds use
+// the system allocator (no `#[global_allocator]` on the lib).
+// This build links mimalloc **v3** (`v2` feature unset).
 //
-// RSS plateaus above the pre-training baseline after a
-// training run: mimalloc returns the ~256 MiB feature
-// buffer ([`crate::training::finetune::extract_features`])
-// to its arena on drop but does not eagerly munmap the
-// pages.  This is documented behaviour, not a leak; the
-// arena is reused on the next run.  Deployments needing
-// tighter bounds export `MIMALLOC_PURGE_DELAY=1000` (ms)
-// before exec'ing `acousticsd`; see mimalloc's
-// `mi_option_*` docs for the full surface.
+// Training-job RSS hygiene has three pieces:
+//   1. `finetune::run_inner` drops backbone weights right after
+//      `extract_features`, not at function return.
+//   2. `training::run_job` calls `allocator::release_to_os`
+//      after every job terminates -- `mi_collect(true)`, the
+//      mimalloc analogue of `malloc_trim(0)`.
+//   3. `scripts/run_acousticsd.sh` exports
+//      `MIMALLOC_PURGE_DELAY=50` to tighten v3's 1000 ms
+//      default for transient steady-state spikes.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

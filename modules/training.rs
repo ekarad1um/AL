@@ -1181,6 +1181,24 @@ async fn run_job(
         }
     }
 
+    // Force mimalloc to release the just-freed training-job
+    // pages.  Without this, the lazy purge timer is
+    // allocation-driven and can keep the 256 MiB feature buffer
+    // resident on an idle daemon for many minutes.
+    // `spawn_blocking` insulates the runtime from a slow
+    // collect; failures are non-fatal (RSS hygiene, not
+    // correctness).  No-op without `mimalloc`.
+    if let Err(err) =
+        tokio::task::spawn_blocking(crate::allocator::release_to_os).await
+    {
+        tracing::debug!(
+            target: "training",
+            job_id = %job_id,
+            err = %err,
+            "post-training allocator release_to_os did not complete",
+        );
+    }
+
     result
 }
 

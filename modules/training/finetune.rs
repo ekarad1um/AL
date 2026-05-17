@@ -607,6 +607,11 @@ fn run_inner(
     assert_eq!(feats.len(), labels.len());
     check_cancel(cancel)?;
 
+    // Free backbone weights + preproc FFT plan now; the head
+    // fine-tune loop below only reads `feats` / `labels`.
+    drop(backbone);
+    drop(preproc);
+
     // Post-extract per-class accounting + drop-ratio gate.
     // Extracted into `validate_post_extract_quality` so the unit
     // tests can exercise the rejection paths without standing up

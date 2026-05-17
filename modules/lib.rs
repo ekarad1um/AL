@@ -22,6 +22,10 @@ pub mod audio_buffer;
 // helpers via direct libc syscalls; non-Linux gets no-op shims.
 pub mod sched;
 
+// Allocator hint: `mi_collect` after the training-job tail; no-op
+// without the `mimalloc` feature.
+pub mod allocator;
+
 // Workspace + asset management: atomic upload pipeline (tempfile +
 // rename + parent-dir fsync), sha256-checked file ingestion,
 // `metadata.json` schema versioning, per-workspace registry.

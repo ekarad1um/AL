@@ -47,6 +47,12 @@ ACOUSTICSD_BIN="${ACOUSTICSD_BIN:-/usr/local/bin/acousticsd}"
 backoff="${RUN_ACOUSTICSD_BACKOFF_INITIAL:-2}"
 backoff_max="${RUN_ACOUSTICSD_BACKOFF_MAX:-60}"
 
+# Mimalloc v3 tuning.  v3's default `purge_delay` is 1000 ms (v2
+# was 10 ms); 50 ms shortens steady-state response 20x without
+# measurable syscall overhead at this daemon's allocation rate.
+# Operators with abundant RAM can override per-host.
+export MIMALLOC_PURGE_DELAY="${MIMALLOC_PURGE_DELAY:-50}"
+
 if [[ ! -x "$ACOUSTICSD_BIN" ]]; then
     echo "run_acousticsd: $ACOUSTICSD_BIN is not executable" >&2
     exit 127
