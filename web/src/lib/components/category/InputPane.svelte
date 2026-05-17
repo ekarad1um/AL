@@ -1167,6 +1167,15 @@
   const isBusy = $derived(isRecording || isStreaming || isFinalizing || isImporting);
   const canStream = $derived(streams.audioStatus === 'open');
 
+  // Whether the trim-selection `<p>` row is rendered between the
+  // waveform area and the action row.  Mirrored on the `{#if}`
+  // below; also gates the action row's `mt-1.5` so the gap above
+  // the buttons stays visually balanced with the gap below the
+  // header.  See the action-row comment for the geometry rationale.
+  const showSelectionStatus = $derived(
+    !!draft && !!draftPcm && !isRecording && !isFinalizing && !isImporting
+  );
+
   // Record-button gating + copy.  The button is disabled whenever
   // anything is in flight, and additionally when the selected
   // source is the daemon stream but its socket isn't currently
@@ -1440,7 +1449,7 @@
        When `sliceNote` is set (post-click), it overrides the
        trim hint with the brief silent-skip summary; cleared by
        the next drag / draft change. -->
-  {#if draft && draftPcm && !isRecording && !isFinalizing && !isImporting}
+  {#if showSelectionStatus}
     <p
       class="text-[11px] tabular-nums"
       class:text-zinc-500={!!sliceNote ||
@@ -1474,8 +1483,22 @@
   {/if}
 
   <!-- Action row.  Layout is state-dependent; `flex-wrap` keeps
-       long button rows tidy on narrow pane widths. -->
-  <div class="flex flex-wrap items-center gap-2">
+       long button rows tidy on narrow pane widths.
+       `mt-1.5` (additive to the outer `gap-1.5`) kicks in only
+       when the selection-status `<p>` row is NOT rendered above
+       this one — i.e. the action row sits flush under the
+       waveform.  Pure box-gap (6 px) reads ~5.5 px tighter
+       than the header→waveform gap, because the 11 px header
+       text carries ~5.5 px of natural line-box padding below
+       its caps while a Button's visible edge IS its border
+       (no intrinsic top whitespace).  Adding 6 px lifts the
+       perceived gap to ~12 px, matching the header side and
+       restoring vertical symmetry around the waveform.  When
+       the selection `<p>` IS rendered, its own ~2.75 px line-
+       box padding on each side already balances both spans
+       into ~8.75 px — so we skip the bump there and keep the
+       text reading as part of the same tight chrome column. -->
+  <div class="flex flex-wrap items-center gap-2" class:mt-1.5={!showSelectionStatus}>
     {#if isRecording || isStreaming}
       <!-- One Stop + one Discard for both capture paths.  The
            aria-label flips with the active op so screen readers

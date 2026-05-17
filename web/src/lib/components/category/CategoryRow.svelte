@@ -411,8 +411,32 @@
            / draft state change.  320 px gives ~180 px of waveform
            in empty mode and ~250 px of slice grid (3 rows of 64 px
            cards + gaps); deeper cuts compress either past
-           readability. -->
-      <div class="grid min-h-80 grid-cols-1 gap-3 md:grid-cols-2">
+           readability.
+           Below md the panes stack and `min-h-80` alone would
+           split between two `auto` rows -- both panes carry
+           `contain: size` (intrinsic height zeroed to defeat the
+           canvas's 2:1 lift), so grid sees 0-content rows and
+           `align-content: normal` stretches the 320 px floor
+           into ~154 px per pane after the `gap-3`.  That drops
+           the waveform under the finger-trim threshold (handles
+           stop landing reliably) and the slice grid down to ~1
+           card row above the action chrome.  Pin each stacked
+           row to a `minmax(16rem, 1fr)` floor instead: 256 px
+           per pane (+66 % vs. the broken ~154 px, 80 % of the
+           desktop 320 px).  Sized for one-thumb-scroll mobile
+           ergonomics over maximum drag area: both panes fit on
+           a typical 600-700 px phone viewport at once (524 px
+           total inc. `gap-3`), so the operator can trim →
+           slice → eyeball the slice grid without paging up and
+           down between the two halves of the workflow.  ~166 px
+           of waveform after chrome stays inside the finger-trim
+           band, and the slice grid still shows ~2 card rows.
+           `md:grid-rows-1` collapses back to a single row at
+           md+, where the original `min-h-80` floor takes over
+           for the side-by-side track. -->
+      <div
+        class="grid min-h-80 grid-cols-1 grid-rows-[minmax(16rem,1fr)_minmax(16rem,1fr)] gap-3 md:grid-cols-2 md:grid-rows-1"
+      >
         <InputPane {workspaceId} {workspaceName} categoryName={category.name} />
         <SlicePane {workspaceId} categoryName={category.name} />
       </div>
