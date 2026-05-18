@@ -82,10 +82,10 @@
     // the "Re-train" button-label morph: when a head already
     // matches this revision, `currentHead` is non-null, the
     // button state becomes `idle_trained`, and the label flips
-    // from "Train head" to "Re-train".  Activation lives in the
-    // Heads section below; no per-row Activate affordance is
+    // from "Train head" to "Re-train".  Deploy actions live in
+    // the deploy module below; no per-row deploy affordance is
     // exposed inside the train history.  Named `liveRevision`
-    // to match the sibling HeadsList / HeadCard prop -- both
+    // to match the sibling DeployPane / HeadRow prop -- both
     // refer to the same upload-receipt-promoted number so a
     // uniform name avoids re-aligning the mental model at each
     // call site.

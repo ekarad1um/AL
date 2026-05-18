@@ -1400,7 +1400,7 @@ async fn run_job_inner(
         manifest,
     };
 
-    // Publish into the 2-slot rotation.  The primitive holds the
+    // Publish into the sliding-window rotation.  The primitive holds the
     // per-workspace mutation mutex internally and the cell lookup
     // goes through `WorkspaceMgr::caches` so the cache installed at
     // workspace-create time is the one that observes the new head.

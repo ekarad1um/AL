@@ -356,14 +356,14 @@ pub trait FsService: Send + Sync + 'static {
     ) -> Result<JobId, FsError>;
 
     /// Synchronously remove a single trained head from the
-    /// workspace's 2-slot index.  Holds the per-workspace
+    /// workspace's head index.  Holds the per-workspace
     /// mutation mutex; rewrites `heads.json` and `workspace.json`
     /// atomically, then unlinks `heads/<head_id>.{mpk,json}`
     /// best-effort.
     fn delete_head(&self, ws: &WorkspaceId, head_id: HeadId) -> Result<(), FsError>;
 
     /// Publish a freshly produced trained head into the
-    /// workspace's 2-slot index.  Routes through the
+    /// workspace's head index.  Routes through the
     /// per-workspace mutation mutex + cache cell so the rotation
     /// primitive runs against the live `WorkspaceCacheCell`.
     fn publish_trained_head(

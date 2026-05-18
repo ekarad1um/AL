@@ -11,7 +11,7 @@
 //!         workspace.json             -- core (id, name, tags,
 //!                                       created_at, workspace_revision,
 //!                                       head_count)
-//!         heads.json                 -- 2-slot sliding head index
+//!         heads.json                 -- sliding-window head index (<= MAX_HEADS_PER_WORKSPACE entries)
 //!         heads/<head_id>.{mpk,json} -- bytes + per-head manifest
 //!         datasets/<class>/<...>.wav -- per-class samples (recursive)
 //!         converters/<sub>/...       -- operator-uploaded convert inputs
@@ -101,7 +101,7 @@ mod registry;
 // `POST .../convert`: typed `TrainingCfg`, `ConvertRequest`,
 // bounded numeric validators, canonical SHA-256 helper.
 pub mod request_payload;
-// Trained-head 2-slot rotation primitive: index-atomic publish
+// Trained-head sliding-window rotation primitive: index-atomic publish
 // of `<head_id>.{mpk,json}` + `heads.json` +
 // `workspace.json.head_count` under the per-workspace mutation
 // mutex held by the caller.

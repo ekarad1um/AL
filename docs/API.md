@@ -10,7 +10,7 @@ admission policies live in `[stream.tcp_policy]` /
 
 Workspaces own a daemon-only `datasets/` tree (path-validated
 through [`AssetPath`](#assetpath)); trained heads are bounded
-to a 2-slot per workspace; the active classifier head lives
+to a 3-slot sliding window per workspace; the active classifier head lives
 under `<root>/active/` as an independent generation tree,
 decoupled from any source workspace.  See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the lifecycle model and
@@ -535,7 +535,7 @@ or stream `GET /jobs/{job_id}/events` for terminal state.
 
 ## Trained heads
 
-Per-workspace head storage is bounded to **2 entries** (sliding
+Per-workspace head storage is bounded to **3 entries** (sliding
 window by completion time, most-recent-first).  Producers
 (`/train`, `/convert`) commit a head record only after the
 on-disk bytes + manifest are durable and `heads.json` rewrites.

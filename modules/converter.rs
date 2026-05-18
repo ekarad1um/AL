@@ -1185,7 +1185,7 @@ pub struct ConvertJob {
 /// manifest, stream shards into staging, build [`HeadWeights`],
 /// resolve labels, stage the ACSTHEAD-wrapped `.mpk`, and call
 /// `FsService::publish_trained_head` to land the head into the
-/// workspace's 2-slot rotation.  On failure no head record is
+/// workspace's sliding-window rotation.  On failure no head record is
 /// committed; the staged `.mpk` is best-effort cleaned up and the
 /// JSONL log records the terminal error.  The caller holds the
 /// convert permit + workspace job-reference until this returns.
@@ -2448,8 +2448,8 @@ mod tests {
     }
 
     /// `run_convert_job` on a minimal synthetic TFJS bundle
-    /// publishes the head into the workspace's 2-slot rotation
-    /// and the `heads.json` index reflects it.  Single-class
+    /// publishes the head into the workspace's sliding-window
+    /// rotation and the `heads.json` index reflects it.  Single-class
     /// head keeps the bundle small (~24 KB vs the multi-MB
     /// upstream Speech-Commands fixture).
     #[test]

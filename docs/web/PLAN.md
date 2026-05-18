@@ -4,7 +4,7 @@
 
 ## Context
 
-The acoustics_lab daemon (`acousticsd`) is mature: REST at `/api/v1/*`, two binary-protobuf WebSocket streams (`/stream/audio`, `/stream/infer`), SSE for job events, async job model, revision-tracked workspaces, 2-slot head storage with atomic hot-swap. Backend serves no static files. `web/` is a clean slate.
+The acoustics_lab daemon (`acousticsd`) is mature: REST at `/api/v1/*`, two binary-protobuf WebSocket streams (`/stream/audio`, `/stream/infer`), SSE for job events, async job model, revision-tracked workspaces, sliding-window head storage with atomic hot-swap. Backend serves no static files. `web/` is a clean slate.
 
 The frontend spec defines eight modules across three tabs (Dashboard, Workspace, Converter) plus a persistent Health Badge and floating Tiny Dashboard. The job is to build a slim SPA that lets a single operator record/edit audio clips, fine-tune classification heads, hot-swap weights, and observe live inference — all locally, with zero-latency dataset playback and no backend changes.
 

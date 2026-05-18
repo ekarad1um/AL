@@ -89,7 +89,7 @@ Module-level docs:
    a daemon-owned dataset tree class-by-class, opening files
    lazily per batch (FD ceiling = `batch_size *
    parallel_loaders`).  Output is published into the source
-   workspace's 2-slot via the
+   workspace's head index via the
    [trained-head publish helper](../modules/file_mgr/head_rotation.rs);
    reuses the inference preproc verbatim so training-time
    features match runtime byte-for-byte.
@@ -239,7 +239,7 @@ only) augments the response with `source_workspace_alive`
 (cheap stat of the source workspace dir).  Wait-free; never
 takes the active mutex.
 
-## Trained-head publication (2-slot rotation)
+## Trained-head publication (sliding-window rotation)
 
 `POST /train` and `POST /convert` both publish through the
 same primitive in [`file_mgr::head_rotation`](../modules/file_mgr/head_rotation.rs).

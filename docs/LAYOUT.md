@@ -147,12 +147,12 @@ once needed.
     config.toml                                   -- mutable user-pref config; auto-created if missing
     workspaces/<workspace_id>/                    -- created on workspace create
         workspace.json                            -- hot core metadata (WorkspaceCore)
-        heads.json                                -- compact 2-slot head index (HeadIndex)
+        heads.json                                -- compact 3-slot head index (HeadIndex)
         datasets/                                 -- lazy: created on first dataset upload
             <path>/<file>
         converters/                               -- lazy: created on first converter run
             <path>/<file>
-        heads/                                    -- lazy: created on first head publish (max 2)
+        heads/                                    -- lazy: created on first head publish (max 3)
             <head_id>.mpk                         -- raw weights (Burn .mpk)
             <head_id>.json                        -- per-head manifest (HeadManifest)
         training_logs/<job_id>.jsonl              -- lazy: created on first train job; keep last N=10 per workspace
@@ -247,7 +247,7 @@ managed independently.
 |---|---|---|---|
 | `config.toml` | Hot-reloadable user-preference TOML | [`Config`](../modules/config.rs) | Atomic rewrite (tempfile + fsync + rename); auto-created on first boot if missing |
 | `workspaces/<id>/workspace.json` | Hot core metadata; eagerly loaded into `ArcSwap<WorkspaceCore>` | [`WorkspaceCore`](#workspacecore) | Atomic rewrite via `put_atomic` (tempfile + fsync + rename + parent fsync); revision-bump precedes dataset byte mutation |
-| `workspaces/<id>/heads.json` | Compact head index (<=2 entries); eagerly loaded into `ArcSwap<HeadIndex>` | [`HeadIndex`](#headindex) | The publish point for trained heads — committed AFTER `<head_id>.{mpk,json}` are renamed |
+| `workspaces/<id>/heads.json` | Compact head index (<=3 entries); eagerly loaded into `ArcSwap<HeadIndex>` | [`HeadIndex`](#headindex) | The publish point for trained heads — committed AFTER `<head_id>.{mpk,json}` are renamed |
 | `workspaces/<id>/datasets/<path>/<file>` | Daemon-owned dataset tree | raw bytes | Each accepted mutation advances `workspace.json.workspace_revision` BEFORE bytes change |
 | `workspaces/<id>/converters/<path>/<file>` | Daemon-owned converter input tree | raw bytes | Same revision-before-bytes invariant as the dataset tree |
 | `workspaces/<id>/heads/<head_id>.mpk` | Raw trained-head weights | Burn `.mpk` | Index-atomic publish: staged in `.tmp/`, fsynced, renamed BEFORE `heads.json` references it |
@@ -324,7 +324,7 @@ Hard size cap: `MAX_WORKSPACE_CORE_BYTES = 64 KiB`.
 
 ### `HeadIndex`
 
-`<workspace>/heads.json` — compact head index.  Hard cap at 2
+`<workspace>/heads.json` — compact head index.  Hard cap at 3
 entries (sliding window, most-recent-first).  Each record is 6
 fields; trainer/converter input metadata (dataset path,
 training-cfg payload) lives in the per-head manifest.

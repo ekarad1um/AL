@@ -1,0 +1,458 @@
+<script lang="ts">
+  import { fade } from 'svelte/transition';
+  import { cubicOut } from 'svelte/easing';
+  import Button from '$lib/components/ui/Button.svelte';
+  import { config as configStore } from '$lib/stores/config.svelte';
+  import { errorCopy } from '$lib/utils/error-copy';
+  import HeadRow from './HeadRow.svelte';
+  import DeleteHeadDialog from './DeleteHeadDialog.svelte';
+  import type { ActiveResp, HeadRecord, Uuid } from '$lib/api/types';
+
+  // Heads listing for one workspace.  Surfaces every trained head
+  // with a Deploy / Delete action cluster per row; a daemon-default
+  // fallback row sits at the end so the operator always has an
+  // escape hatch when every workspace head is stale, broken, or
+  // not relevant.  Revert-to-prior is handled here too -- a small
+  // affordance above the list re-deploys whatever was running
+  // before the most recent deploy click landed.
+  //
+  // Mutation coordination: this component owns the deploy / delete
+  // ack flow.  The parent supplies `onchanged` so it can refresh
+  // the workspace detail after either lands (the daemon-side
+  // mutation doesn't bump `workspace_revision` for head ops, so
+  // the page's `liveRevision` derivation is correct as-is; the
+  // parent just needs a fresh `heads[]` pull).
+  //
+  // `onchanged` contract: MUST NOT throw.  `deployHead`,
+  // `deployDefault`, and `revert` each wrap `activateHead +
+  // onchanged` in a single try/catch that clears `previousActive`
+  // on any throw -- treating any failure as "deploy didn't land,
+  // nothing to revert to".  If `onchanged` ever started throwing,
+  // a successful daemon-side deploy followed by a refresh failure
+  // would erroneously clear the revert target (the daemon state
+  // DID change; the prior is still meaningful).  The workspace
+  // page's `refreshDetail` honours this contract by wrapping its
+  // fetch in try/catch and only console-warning on failure.
+
+  interface Props {
+    workspaceId: Uuid;
+    heads: readonly HeadRecord[];
+    liveRevision: number;
+    onchanged: () => Promise<void> | void;
+  }
+  let { workspaceId, heads, liveRevision, onchanged }: Props = $props();
+
+  const active = $derived(configStore.active);
+  // Active head id when origin = 'head' AND the source workspace is
+  // *this* workspace.  Drives the row's blue tint + the row's button-
+  // label morph ("Deploy" → "Deployed" when isDeployed).  When the
+  // active head belongs to a different workspace, no row in this
+  // table is highlighted; the operator sees a "Standby" badge in
+  // the parent DeployPane's header pill instead.
+  const deployedHeadId = $derived<Uuid | null>(
+    active?.origin === 'head' && active.source_workspace_id === workspaceId
+      ? active.source_head_id
+      : null
+  );
+  const defaultDeployed = $derived(active?.origin === 'default');
+
+  // Newest-first display order.  Strict-weak-order comparator so
+  // the rendered row order stays stable across reactive re-fires
+  // when two heads share a `created_at`.
+  const ordered = $derived(
+    heads
+      .slice()
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0))
+  );
+
+  // The single head-id that should wear the "Latest" pill.  Among
+  // heads at the live workspace revision, only the most recently
+  // created one qualifies -- so a workspace where the operator
+  // trained twice without intermediate slice changes (both heads
+  // at the same revision) shows the pill only on the newer head.
+  // Heads at older revisions never qualify regardless of
+  // created_at.  Iterates `ordered` (sorted newest-first) and
+  // returns the first match: the newest-first sort means the
+  // first matching head IS the newest at the live revision, so
+  // the linear scan resolves correctly in one pass and tie-breaks
+  // to the sort's stable order.
+  const latestHeadId = $derived.by<Uuid | null>(() => {
+    for (const h of ordered) {
+      if (h.workspace_revision.id === liveRevision) return h.head_id;
+    }
+    return null;
+  });
+
+  // Per-list busy id: serialise deploy / delete across rows so the
+  // operator can't fire two destructive actions in parallel during
+  // a slow network blip.
+  let busyHeadId = $state<Uuid | null>(null);
+  // True while the daemon-default fallback row is mid-deploy.  The
+  // workspace-head rows have a per-row spinner; the default row
+  // gets a separate flag because it doesn't carry a `head_id`.
+  let deployingDefault = $state(false);
+
+  let deleteOpen = $state(false);
+  let deleteHead = $state<HeadRecord | null>(null);
+
+  // Last failed deploy attempt, surfaced inline below the list.
+  // `kind` distinguishes a head deploy (carries the head id for
+  // copy) from a default deploy (no id) so the message can name
+  // the failed target.  Cleared on the next deploy click so a
+  // retry's pending UI isn't shadowed by a stale red banner.
+  let deployError = $state<
+    { kind: 'head'; headId: Uuid; message: string } | { kind: 'default'; message: string } | null
+  >(null);
+
+  // Revert-to-prior: stash the runtime active record from before
+  // the most recent successful deploy so the operator can roll
+  // back without scrolling.  Two-element history is enough -- a
+  // longer trail would invite "undo three steps" expectations the
+  // current API doesn't support (active is single-slot at the
+  // daemon).  Lives in component state; clears on workspace swap
+  // because the parent keys this component by `workspaceId`.
+  //
+  // Stored as the wire shape (`ActiveResp`) so the re-deploy
+  // dispatch reads `origin`, `source_workspace_id`, and
+  // `source_head_id` directly without re-resolving against the
+  // current `heads[]` array (which may have shifted since).
+  let previousActive = $state<ActiveResp | null>(null);
+
+  // Snapshot the *current* active record before the operator's
+  // requested deploy lands, but only if the deploy will actually
+  // change the runtime state -- a redundant deploy on the already-
+  // deployed head shouldn't be recorded as the "previous".  The
+  // caller passes its intent so this guard runs without consulting
+  // the (already-updated) store after the call.
+  function recordPrevious(intent: { kind: 'head'; headId: Uuid } | { kind: 'default' }): void {
+    const cur = configStore.active;
+    if (cur === null) return;
+    if (intent.kind === 'head') {
+      if (cur.origin === 'head' && cur.source_head_id === intent.headId) return;
+    } else if (cur.origin === 'default') {
+      return;
+    }
+    previousActive = cur;
+  }
+
+  async function deployHead(headId: Uuid): Promise<void> {
+    if (busyHeadId !== null || deployingDefault) return;
+    busyHeadId = headId;
+    deployError = null;
+    try {
+      recordPrevious({ kind: 'head', headId });
+      await configStore.activateHead(workspaceId, headId);
+      await onchanged();
+    } catch (e) {
+      previousActive = null;
+      deployError = { kind: 'head', headId, message: errorCopy(e) };
+    } finally {
+      if (busyHeadId === headId) busyHeadId = null;
+    }
+  }
+
+  async function deployDefault(): Promise<void> {
+    if (deployingDefault || busyHeadId !== null) return;
+    deployingDefault = true;
+    deployError = null;
+    try {
+      recordPrevious({ kind: 'default' });
+      await configStore.activateDefault();
+      await onchanged();
+    } catch (e) {
+      previousActive = null;
+      deployError = { kind: 'default', message: errorCopy(e) };
+    } finally {
+      deployingDefault = false;
+    }
+  }
+
+  // Revert dispatches against the stashed prior active.  When the
+  // prior was a workspace head, re-resolve the workspace id from
+  // the record itself (not from this component's `workspaceId`)
+  // because a stashed prior could in principle reference a
+  // different workspace -- today it always matches because the
+  // history is wiped on workspace swap, but reading from the
+  // record keeps the dispatch correct if the lifecycle ever
+  // changes.
+  async function revert(): Promise<void> {
+    const prev = previousActive;
+    if (prev === null) return;
+    if (busyHeadId !== null || deployingDefault) return;
+    if (prev.origin === 'head') {
+      const headId = prev.source_head_id;
+      const wsId = prev.source_workspace_id;
+      busyHeadId = headId;
+      deployError = null;
+      try {
+        previousActive = configStore.active;
+        await configStore.activateHead(wsId, headId);
+        await onchanged();
+      } catch (e) {
+        previousActive = prev;
+        deployError = { kind: 'head', headId, message: errorCopy(e) };
+      } finally {
+        if (busyHeadId === headId) busyHeadId = null;
+      }
+    } else {
+      deployingDefault = true;
+      deployError = null;
+      try {
+        previousActive = configStore.active;
+        await configStore.activateDefault();
+        await onchanged();
+      } catch (e) {
+        previousActive = prev;
+        deployError = { kind: 'default', message: errorCopy(e) };
+      } finally {
+        deployingDefault = false;
+      }
+    }
+  }
+
+  // Human label for the revert button.  The previous state was
+  // either a specific workspace head (name it by short id +
+  // classes count) or the default head.
+  const revertLabel = $derived<string | null>(
+    previousActive === null
+      ? null
+      : previousActive.origin === 'default'
+        ? 'Revert to default'
+        : `Revert to ${previousActive.source_head_id.slice(0, 8)}…`
+  );
+
+  // Hide the revert affordance when it would re-deploy the
+  // currently active record (nothing to roll back to).  Mirrors
+  // `recordPrevious`'s no-op guard.
+  const showRevert = $derived.by(() => {
+    if (previousActive === null) return false;
+    const cur = configStore.active;
+    if (cur === null) return true;
+    if (previousActive.origin === 'default') return cur.origin !== 'default';
+    return !(
+      cur.origin === 'head' &&
+      cur.source_head_id === previousActive.source_head_id &&
+      cur.source_workspace_id === previousActive.source_workspace_id
+    );
+  });
+
+  function dismissDeployError(): void {
+    deployError = null;
+  }
+
+  function requestDelete(head: HeadRecord): void {
+    if (busyHeadId !== null || deployingDefault) return;
+    deleteHead = head;
+    deleteOpen = true;
+  }
+
+  function onDeleteClose(): void {
+    deleteOpen = false;
+  }
+
+  async function onDeleted(deletedId: Uuid): Promise<void> {
+    // If the deleted head was the stashed revert target, clear it
+    // so the affordance can't suggest a head that no longer
+    // exists.  The daemon-side guard already forbids deleting the
+    // currently deployed head (the row's Delete button is
+    // disabled when `isDeployed`), so the active record itself
+    // never references a missing head.
+    if (
+      previousActive !== null &&
+      previousActive.origin === 'head' &&
+      previousActive.source_head_id === deletedId
+    ) {
+      previousActive = null;
+    }
+    await onchanged();
+  }
+
+  const interactionBlocked = $derived(busyHeadId !== null || deployingDefault);
+</script>
+
+<!-- Compact pane card matching the dataset module's InputPane /
+     SlicePane chrome: `rounded-md` (not -xl), no `shadow-sm`,
+     `px-3 pt-1.5 pb-3` outer padding.  `flex h-full min-h-0
+     flex-col` so the section fills the parent's `h-80` budget
+     (320 px) and the internal list scroller can absorb a long
+     heads list without pushing the action chrome below the fold.
+     `overflow-hidden` clips the scroller's rounded inner edge to
+     the section's rounded outer edge.  The pane is its own
+     <section> so DeployPane only has to set width / row height on
+     the grid cell -- identical contract to how CategoryRow slots
+     InputPane + SlicePane into its accordion body. -->
+<section
+  class="flex h-full min-h-0 flex-col overflow-hidden rounded-md border border-zinc-200 bg-white px-3 pt-1.5 pb-3"
+>
+  <!-- Header rhythm matches InputPane / SlicePane: `min-h-4.75`
+       (19 px) locks the heading-row height even when the revert
+       button is absent so the heads card and the preview card
+       carry the same heading-bottom strip across the side-by-side
+       row.  `mb-1.5` is the standard pane-header → body gap. -->
+  <header class="mb-1.5 flex min-h-4.75 items-center justify-between gap-1.5">
+    <div class="flex items-baseline gap-1.5">
+      <h4 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">Heads</h4>
+      <!-- Count reading in the dashboard meta-text idiom: plain
+           muted text, no chip chrome.  Borders + bg are reserved
+           for actions and status indicators; data readouts like
+           a head count read more clearly as a flat phrase next
+           to the heading.  The label includes the noun ("5 heads"
+           / "1 head") so the value carries its own unit even when
+           detached from the heading by a baseline shift on a
+           wrapping viewport.  `tabular-nums` keeps the digit
+           column stable as the count ticks. -->
+      <span class="text-[10px] text-zinc-400 tabular-nums">
+        {heads.length}
+        {heads.length === 1 ? 'head' : 'heads'}
+      </span>
+    </div>
+    {#if showRevert && revertLabel}
+      <!-- Revert affordance in the SlicePane toolbar-button idiom
+           (px-1.5 py-0.5 text-[10px]) so the header chrome sits
+           inside the 19 px min-height without forcing the row
+           taller. -->
+      <button
+        type="button"
+        onclick={revert}
+        disabled={interactionBlocked}
+        class="inline-flex shrink-0 items-center rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 transition duration-200 ease-out hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-60"
+        title="Re-deploy the previously running head"
+      >
+        {revertLabel}
+      </button>
+    {/if}
+  </header>
+
+  <!-- Internal scroller absorbs over-long heads lists so a 20-head
+       workspace doesn't push the default fallback row off the
+       bottom of the card.  `pr-1` keeps the scrollbar from
+       landing on the right edge of the row borders; `-mr-1`
+       reclaims the space so the visual right inset still matches
+       `px-3`.  No empty-state notice: when `heads.length === 0`
+       the default fallback row below is the only deploy target,
+       and the row's own copy plus its Deploy button already
+       answer "what can I do here". -->
+  <div class="-mr-1 min-h-0 flex-1 overflow-y-auto pr-1">
+    <ul class="flex flex-col gap-2">
+      {#each ordered as head (head.head_id)}
+        <HeadRow
+          {head}
+          isLatest={head.head_id === latestHeadId}
+          isDeployed={deployedHeadId === head.head_id}
+          busy={interactionBlocked && busyHeadId !== head.head_id}
+          ondeploy={deployHead}
+          ondelete={requestDelete}
+        />
+      {/each}
+
+      <!-- Daemon-default fallback row.  Always present so the
+           operator has an unconditional escape hatch when every
+           workspace head is missing, stale, or doesn't fit the
+           current dataset.  Sits below the workspace heads
+           (visually separated by a dashed border + faded
+           backdrop) so it never competes with a freshly trained
+           head for attention.  When the default is the runtime
+           active record we tint this row the same blue as a
+           deployed workspace head -- the visual vocabulary is
+           consistent across both origins. -->
+      <li
+        class="flex flex-wrap items-center justify-between gap-3 rounded-md border border-dashed px-3 py-2.5 transition-colors"
+        class:border-blue-300={defaultDeployed}
+        class:bg-blue-50={defaultDeployed}
+        class:border-zinc-300={!defaultDeployed}
+        class:bg-zinc-50={!defaultDeployed}
+      >
+        <div class="min-w-0 flex-1">
+          <!-- "Default" alone is the headline -- the surrounding
+               context (the Heads section, the fallback row's
+               dashed border + zinc-50 backdrop) already says
+               "this is a head"; the redundant "head" suffix was
+               chrome.  Also aligns the headline with the
+               DeployPane's header pill "Default" token so the
+               surface speaks one vocabulary for the daemon-
+               bundled state. -->
+          <p class="text-sm font-semibold text-zinc-900">Default</p>
+          <p class="mt-1 text-[11px] text-zinc-500">Daemon-bundled fallback, always available.</p>
+        </div>
+        <!-- Button-label morph mirrors HeadRow's "Deploy" ↔
+             "Deployed" so the workspace-head rows above and the
+             fallback row below read as one action vocabulary.
+             No standalone "Deployed" pill on the row: the
+             dashed-blue border + bg + the disabled "Deployed"
+             button label are the active-state signals, identical
+             in spirit to the workspace-head rows above. -->
+        <span
+          class="inline-flex shrink-0"
+          title={defaultDeployed
+            ? 'The default head is already deployed'
+            : 'Revert to the daemon-bundled default head'}
+        >
+          <Button
+            size="sm"
+            variant="secondary"
+            onclick={deployDefault}
+            disabled={defaultDeployed || interactionBlocked}
+            loading={deployingDefault}
+          >
+            {#if defaultDeployed}Deployed{:else}Deploy{/if}
+          </Button>
+        </span>
+      </li>
+    </ul>
+  </div>
+
+  <!-- Deploy-failure banner.  Mirrors TrainPane's start-error
+       slim alert so the destructive-adjacent failure surfaces
+       feel like one family.  Pinned to the bottom of the card
+       (below the scroller, above the section's bottom padding)
+       so a slow-network failure doesn't shove still-correct
+       heads down and stays visible regardless of scroll position.
+       Names the target (head short id or "default") so the
+       operator can correlate the message with the row they
+       clicked. -->
+  {#if deployError}
+    <div
+      in:fade={{ duration: 200, easing: cubicOut }}
+      out:fade={{ duration: 160, easing: cubicOut }}
+      class="mt-1.5 flex items-start justify-between gap-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs"
+      role="alert"
+    >
+      <div class="min-w-0">
+        <p class="font-medium text-rose-900">
+          Could not deploy
+          {#if deployError.kind === 'head'}
+            head
+            <span class="font-mono text-[10px] text-rose-700" title={deployError.headId}>
+              {deployError.headId.slice(0, 8)}…
+            </span>
+          {:else}
+            default head
+          {/if}
+        </p>
+        <p class="mt-0.5 wrap-break-word text-rose-800">{deployError.message}</p>
+      </div>
+      <button
+        type="button"
+        onclick={dismissDeployError}
+        aria-label="Dismiss"
+        class="-mt-1 -mr-2 shrink-0 rounded-md p-1 text-rose-500 transition hover:bg-white/60 hover:text-rose-900"
+      >
+        <svg viewBox="0 0 16 16" fill="currentColor" class="h-3.5 w-3.5" aria-hidden="true">
+          <path
+            fill-rule="evenodd"
+            d="M4.293 4.293a1 1 0 011.414 0L8 6.586l2.293-2.293a1 1 0 111.414 1.414L9.414 8l2.293 2.293a1 1 0 01-1.414 1.414L8 9.414l-2.293 2.293a1 1 0 01-1.414-1.414L6.586 8 4.293 5.707a1 1 0 010-1.414z"
+            clip-rule="evenodd"
+          />
+        </svg>
+      </button>
+    </div>
+  {/if}
+</section>
+
+<DeleteHeadDialog
+  open={deleteOpen}
+  {workspaceId}
+  head={deleteHead}
+  onclose={onDeleteClose}
+  ondeleted={onDeleted}
+/>

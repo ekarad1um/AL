@@ -77,7 +77,7 @@ pub struct WorkspaceCore {
 // MARK: HeadIndex (heads.json) + HeadRecord
 
 /// On-disk head index persisted at
-/// `workspaces/<workspace_id>/heads.json`.  Hard cap at 2 entries
+/// `workspaces/<workspace_id>/heads.json`.  Hard cap at 3 entries
 /// (sliding window by completion time, most-recent-first).
 /// Failed jobs never appear here -- only successful publishes.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -88,9 +88,9 @@ pub struct HeadIndex {
 }
 
 /// Hard cap on the number of heads retained per workspace.
-/// Sliding window -- the third successful train / convert
-/// displaces the oldest.
-pub const MAX_HEADS_PER_WORKSPACE: usize = 2;
+/// Sliding window -- the fourth successful train / convert
+/// displaces the oldest non-pinned slot.
+pub const MAX_HEADS_PER_WORKSPACE: usize = 3;
 
 /// Compact head index entry.  Trainer/converter input metadata
 /// (dataset path, training-cfg payload, etc.) and labels are
@@ -926,10 +926,13 @@ mod tests {
     }
 
     #[test]
-    fn max_heads_per_workspace_is_two() {
-        // Pinned: the storage contract caps heads at 2 (sliding
-        // window).  Bumping this value requires touching the
-        // 2-slot rotation contract in `head_rotation`.
-        assert_eq!(MAX_HEADS_PER_WORKSPACE, 2);
+    fn max_heads_per_workspace_is_three() {
+        // Pinned: the storage contract caps heads at 3 (sliding
+        // window).  Bumping this value requires re-reading the
+        // rotation contract in `head_rotation` -- the eviction
+        // logic uses the constant directly, but adjacent tests
+        // hard-code the cap+1 head fixture, so the bump cascades
+        // through schema + rotation tests too.
+        assert_eq!(MAX_HEADS_PER_WORKSPACE, 3);
     }
 }

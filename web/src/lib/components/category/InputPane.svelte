@@ -1922,7 +1922,7 @@
        padding so the visible gap from the X to BOTH the top
        and right edges is the same 4 px (px-3 − mr-2 = 4 and
        py-2 − mt-1 = 4).  Same geometry rule as the
-       training-area dismisses in TrainPane / HeadsList; a
+       training-area dismisses in TrainPane / HeadsTable; a
        symmetric `-m-1` would leave the right gap at 8 px
        while the top sat at 4 px, which reads as the button
        hugging the top more than the side. -->

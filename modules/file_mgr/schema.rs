@@ -14,7 +14,7 @@
 //! ```text
 //! <workspace_dir>/
 //!     workspace.json                        -- WorkspaceCore
-//!     heads.json                            -- HeadIndex (<= 2 entries)
+//!     heads.json                            -- HeadIndex (<= MAX_HEADS_PER_WORKSPACE entries)
 //!     heads/
 //!         <head_id>.mpk                     -- raw weights
 //!         <head_id>.json                    -- HeadManifest
@@ -336,10 +336,9 @@ pub fn write_workspace_core(workspace_dir: &Path, core: &WorkspaceCore) -> Resul
 // MARK: heads.json
 
 /// Read and parse `<workspace_dir>/heads.json`.  Enforces the
-/// 2-entry sliding-window cap (`MAX_HEADS_PER_WORKSPACE`) on
-/// read so a hand-edited or corrupt file with extra entries
-/// fails closed rather than feeding stale heads into the
-/// activation path.  A `deny_unknown_fields` parse failure
+/// sliding-window cap (`MAX_HEADS_PER_WORKSPACE`) on read so a
+/// hand-edited or corrupt file with extra entries fails closed
+/// rather than feeding stale heads into the activation path.  A `deny_unknown_fields` parse failure
 /// surfaces as `FileError::MetadataParse`; an over-cap entry
 /// count surfaces as `FileError::MetadataParse` with a
 /// synthesized parse error so callers can treat the two
@@ -634,15 +633,23 @@ mod tests {
     // MARK: HeadIndex round-trip
 
     #[test]
-    fn head_index_round_trip_with_capped_two_entries() {
+    fn head_index_round_trip_at_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let mut index = HeadIndex::default();
-        index.heads.push(sample_head_record());
-        let mut second = sample_head_record();
-        second.head_id = HeadId::parse("11111111-2222-4333-8444-555555555557").unwrap();
-        second.workspace_revision = rev(4);
-        index.heads.push(second);
-        // Two-entry sliding window matches MAX_HEADS_PER_WORKSPACE.
+        // Fill the index exactly to `MAX_HEADS_PER_WORKSPACE` so
+        // the round-trip exercises the maximum supported size.
+        // Two-hex-digit suffix (`{:02x}` on `i + 1`) gives distinct
+        // UUIDs while the suffix stays within 2 hex chars; cap up
+        // to 255 fits.  Each test owns its own tempdir, so the
+        // overlap with the over-cap tests' `{:x}` on `i + 1` is
+        // benign (filesystem isolation).
+        for i in 0..MAX_HEADS_PER_WORKSPACE {
+            let mut rec = sample_head_record();
+            rec.head_id =
+                HeadId::parse(&format!("11111111-2222-4333-8444-5555555555{:02x}", i + 1)).unwrap();
+            rec.workspace_revision = rev((i + 3) as u64);
+            index.heads.push(rec);
+        }
         assert_eq!(index.heads.len(), MAX_HEADS_PER_WORKSPACE);
         write_head_index(tmp.path(), &index).unwrap();
         let read = read_head_index(tmp.path()).unwrap();
@@ -670,20 +677,25 @@ mod tests {
         assert!(read.heads.is_empty());
     }
 
-    /// Reader rejects > 2 entries even though `Vec` itself has no
-    /// schema-level cap.  Defends against hand-edited
-    /// `heads.json`; production never produces this shape because
-    /// the rotation primitive enforces the cap on writes.
+    /// Reader rejects more than `MAX_HEADS_PER_WORKSPACE` entries
+    /// even though `Vec` itself has no schema-level cap.  Defends
+    /// against hand-edited `heads.json`; production never produces
+    /// this shape because the rotation primitive enforces the cap
+    /// on writes.
     #[test]
     fn head_index_read_rejects_over_cap_entries() {
         let tmp = tempfile::tempdir().unwrap();
-        // Hand-craft a 3-entry index and write it directly,
-        // bypassing `write_head_index`'s symmetric cap.
+        // Hand-craft a (cap + 1)-entry index and write it directly,
+        // bypassing `write_head_index`'s symmetric cap.  Two-hex-digit
+        // suffix (`{:02x}` on `i + 1`) keeps the UUID's last segment
+        // at 12 hex chars for any cap up to 254 -- symmetric with
+        // `head_index_round_trip_at_cap` above so a future cap bump
+        // past 14 doesn't silently break this test's UUID parses.
         let mut over = HeadIndex::default();
         for i in 0..(MAX_HEADS_PER_WORKSPACE + 1) {
             let mut rec = sample_head_record();
             rec.head_id =
-                HeadId::parse(&format!("11111111-2222-4333-8444-55555555555{:x}", i + 1)).unwrap();
+                HeadId::parse(&format!("11111111-2222-4333-8444-5555555555{:02x}", i + 1)).unwrap();
             over.heads.push(rec);
         }
         let bytes = serde_json::to_vec(&over).unwrap();
@@ -692,16 +704,20 @@ mod tests {
         assert!(matches!(res, Err(FileError::MetadataParse { .. })));
     }
 
-    /// Writer-side symmetric cap: refuses to publish > 2
-    /// entries even if a buggy caller hands in too many.
+    /// Writer-side symmetric cap: refuses to publish more than
+    /// `MAX_HEADS_PER_WORKSPACE` entries even if a buggy caller
+    /// hands in too many.
     #[test]
     fn head_index_write_rejects_over_cap_entries() {
         let tmp = tempfile::tempdir().unwrap();
+        // Two-hex-digit suffix matches the round-trip + over-cap-reader
+        // tests so a future cap bump past 14 doesn't silently break
+        // this test's UUID parses.
         let mut over = HeadIndex::default();
         for i in 0..(MAX_HEADS_PER_WORKSPACE + 1) {
             let mut rec = sample_head_record();
             rec.head_id =
-                HeadId::parse(&format!("11111111-2222-4333-8444-55555555555{:x}", i + 1)).unwrap();
+                HeadId::parse(&format!("11111111-2222-4333-8444-5555555555{:02x}", i + 1)).unwrap();
             over.heads.push(rec);
         }
         let res = write_head_index(tmp.path(), &over);

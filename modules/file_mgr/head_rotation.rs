@@ -1,4 +1,4 @@
-//! Trained-head 2-slot rotation: index-atomic 10-step publish
+//! Trained-head sliding-window rotation: index-atomic 10-step publish
 //! sequence.  The caller (a train or convert pipeline) has
 //! already allocated `head_id`, produced the weights, streamed the
 //! ACSTHEAD-wrapped `.mpk` to a tempfile under
@@ -18,7 +18,7 @@
 //! ```text
 //! <workspace_dir>/
 //!     workspace.json                 -- core (head_count derived)
-//!     heads.json                     -- index (<= 2 entries)
+//!     heads.json                     -- index (<= MAX_HEADS_PER_WORKSPACE entries)
 //!     heads/
 //!         <head_id>.mpk              -- caller-provided ACSTHEAD blob
 //!         <head_id>.json             -- HeadManifest
@@ -70,16 +70,18 @@ pub struct PendingHead {
 
 /// Outcome of a successful [`publish_trained_head`] call.
 /// `displaced_head_id` is `Some(_)` exactly when the published
-/// head pushed a previous-generation head out of the 2-slot
-/// sliding window.
+/// head pushed a previous-generation head out of the
+/// sliding-window index (i.e. the prior count was already at
+/// `MAX_HEADS_PER_WORKSPACE`).
 #[derive(Clone, Copy, Debug)]
 pub struct HeadRotationResult {
     /// Head id that the rotation displaced from the index, or
-    /// `None` if the workspace had < 2 heads before the publish.
+    /// `None` if the workspace was below the cap before the
+    /// publish.
     pub displaced_head_id: Option<HeadId>,
 }
 
-/// Publish a trained head into the workspace's 2-slot index.  The
+/// Publish a trained head into the workspace's head index.  The
 /// caller MUST hold the per-workspace mutation mutex for the full
 /// duration of this call.  The rotation is sync; never `.await`
 /// inside.
@@ -456,7 +458,7 @@ impl WorkspaceMgr {
     }
 
     /// Index-atomic publish of a freshly trained or converted head
-    /// into the workspace's 2-slot rotation.  Routes the producer
+    /// into the workspace's sliding-window rotation.  Routes the producer
     /// through the same per-workspace mutex + cache cell that
     /// `delete_head` and the asset surface use, so the rotation
     /// primitive executes against the live `WorkspaceCacheCell`.
@@ -603,78 +605,80 @@ mod tests {
         assert_eq!(cache.core().head_count, 1);
     }
 
-    /// Test 2 (sliding window): publish 3 heads; only the most-
-    /// recent 2 stay in `heads.json`; the displaced head's files
-    /// are removed from `heads/`.
+    /// Test 2 (sliding window): publish `cap + 1` heads; only the
+    /// most-recent `cap` stay in `heads.json`; the displaced head's
+    /// files are removed from `heads/`.  Cap-agnostic via the
+    /// `MAX_HEADS_PER_WORKSPACE` constant so future cap bumps
+    /// don't require rewriting the assertion bodies.
     #[test]
-    fn publish_three_heads_keeps_only_two_most_recent() {
+    fn publish_overflowing_cap_displaces_oldest() {
         let (tmp, cache) = fresh_workspace();
-        let h1 = HeadId::new();
-        let h2 = HeadId::new();
-        let h3 = HeadId::new();
+        let cap = MAX_HEADS_PER_WORKSPACE;
+        // Build cap + 1 head ids; the trailing one is the publish
+        // that triggers displacement.  `ids[0]` is the oldest.
+        let ids: Vec<HeadId> = (0..(cap + 1)).map(|_| HeadId::new()).collect();
 
-        // Publish h1.
-        let mpk = stage_mpk_tempfile(tmp.path(), h1);
-        publish_trained_head(
-            tmp.path(),
-            &cache,
-            PendingHead {
-                head_id: h1,
-                mpk_tempfile: mpk,
-                manifest: sample_manifest(h1, 1),
-            },
-            None,
-        )
-        .unwrap();
-        // Publish h2.
-        let mpk = stage_mpk_tempfile(tmp.path(), h2);
-        publish_trained_head(
-            tmp.path(),
-            &cache,
-            PendingHead {
-                head_id: h2,
-                mpk_tempfile: mpk,
-                manifest: sample_manifest(h2, 2),
-            },
-            None,
-        )
-        .unwrap();
-        assert_eq!(cache.heads().heads.len(), 2);
-        assert_eq!(cache.core().head_count, 2);
+        // Publish the first `cap` heads -- the cap is exactly
+        // filled, no displacement yet.
+        for (i, &h) in ids[..cap].iter().enumerate() {
+            let mpk = stage_mpk_tempfile(tmp.path(), h);
+            publish_trained_head(
+                tmp.path(),
+                &cache,
+                PendingHead {
+                    head_id: h,
+                    mpk_tempfile: mpk,
+                    manifest: sample_manifest(h, (i + 1) as u64),
+                },
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(cache.heads().heads.len(), cap);
+        assert_eq!(cache.core().head_count, cap as u8);
 
-        // Publish h3 -- displaces h1.
-        let mpk = stage_mpk_tempfile(tmp.path(), h3);
+        // Publish the (cap + 1)th head -- displaces ids[0] (oldest).
+        let h_last = ids[cap];
+        let mpk = stage_mpk_tempfile(tmp.path(), h_last);
         let result = publish_trained_head(
             tmp.path(),
             &cache,
             PendingHead {
-                head_id: h3,
+                head_id: h_last,
                 mpk_tempfile: mpk,
-                manifest: sample_manifest(h3, 3),
+                manifest: sample_manifest(h_last, (cap + 1) as u64),
             },
             None,
         )
         .unwrap();
         assert_eq!(
             result.displaced_head_id,
-            Some(h1),
-            "h1 was the oldest, so it gets displaced",
+            Some(ids[0]),
+            "ids[0] was the oldest, so it gets displaced",
         );
         let on_disk = crate::file_mgr::schema::read_head_index(tmp.path()).unwrap();
-        assert_eq!(on_disk.heads.len(), 2);
-        assert_eq!(on_disk.heads[0].head_id, h3, "newest first");
-        assert_eq!(on_disk.heads[1].head_id, h2);
-        // h1's files were removed.
-        assert!(!head_artifact_path(tmp.path(), h1).exists());
-        assert!(!head_manifest_path(tmp.path(), h1).exists());
-        // h2's + h3's files remain.
-        assert!(head_artifact_path(tmp.path(), h2).is_file());
-        assert!(head_manifest_path(tmp.path(), h2).is_file());
-        assert!(head_artifact_path(tmp.path(), h3).is_file());
-        assert!(head_manifest_path(tmp.path(), h3).is_file());
-        // Core's head_count is still 2 (cap, not 3).
+        assert_eq!(on_disk.heads.len(), cap);
+        // Newest-first ordering: index[0] is the just-published
+        // head; index[i] for i in 1..cap is ids[cap - i].
+        assert_eq!(on_disk.heads[0].head_id, h_last, "newest first");
+        for i in 1..cap {
+            assert_eq!(
+                on_disk.heads[i].head_id,
+                ids[cap - i],
+                "newest-first ordering at index {i}",
+            );
+        }
+        // ids[0]'s files were removed.
+        assert!(!head_artifact_path(tmp.path(), ids[0]).exists());
+        assert!(!head_manifest_path(tmp.path(), ids[0]).exists());
+        // Surviving heads' files remain.
+        for &h in &ids[1..=cap] {
+            assert!(head_artifact_path(tmp.path(), h).is_file());
+            assert!(head_manifest_path(tmp.path(), h).is_file());
+        }
+        // Core's head_count is the cap (not cap + 1).
         let core = crate::file_mgr::schema::read_workspace_core(tmp.path()).unwrap();
-        assert_eq!(core.head_count, 2);
+        assert_eq!(core.head_count, cap as u8);
     }
 
     /// Orphan tolerance: a `<random>.mpk` under `heads/` not in
@@ -750,16 +754,16 @@ mod tests {
     /// (e.g. file already removed because of a filesystem race
     /// or the orphan-sweep fired), the rotation as a whole still
     /// succeeds because the index commit in step 7 is the source
-    /// of truth.  Simulate by manually unlinking the displaced
-    /// head's files between publishing slot 2 and slot 3.
+    /// of truth.  Simulate by manually unlinking the about-to-be-
+    /// displaced head's files between filling the cap and
+    /// publishing one more.
     #[test]
     fn publish_succeeds_when_displaced_files_are_already_gone() {
         let (tmp, cache) = fresh_workspace();
-        let h1 = HeadId::new();
-        let h2 = HeadId::new();
-        let h3 = HeadId::new();
-        // Publish h1 + h2 normally.
-        for &h in &[h1, h2] {
+        let cap = MAX_HEADS_PER_WORKSPACE;
+        let ids: Vec<HeadId> = (0..(cap + 1)).map(|_| HeadId::new()).collect();
+        // Publish the first `cap` heads normally.
+        for (i, &h) in ids[..cap].iter().enumerate() {
             let mpk = stage_mpk_tempfile(tmp.path(), h);
             publish_trained_head(
                 tmp.path(),
@@ -767,36 +771,41 @@ mod tests {
                 PendingHead {
                     head_id: h,
                     mpk_tempfile: mpk,
-                    manifest: sample_manifest(h, 1),
+                    manifest: sample_manifest(h, (i + 1) as u64),
                 },
                 None,
             )
             .unwrap();
         }
-        // Race: manually remove h1's files (simulate a
-        // concurrent orphan sweep or filesystem error).
-        std::fs::remove_file(head_artifact_path(tmp.path(), h1)).unwrap();
-        std::fs::remove_file(head_manifest_path(tmp.path(), h1)).unwrap();
-        // h3 publish still succeeds; the best-effort cleanup
-        // observes the missing files and logs a warning but does
-        // not propagate the error.
-        let mpk = stage_mpk_tempfile(tmp.path(), h3);
+        // Race: manually remove ids[0]'s files (simulate a
+        // concurrent orphan sweep or filesystem error) BEFORE
+        // the next publish would have displaced them.
+        std::fs::remove_file(head_artifact_path(tmp.path(), ids[0])).unwrap();
+        std::fs::remove_file(head_manifest_path(tmp.path(), ids[0])).unwrap();
+        // Publishing the (cap + 1)th head still succeeds; the
+        // best-effort cleanup observes the missing files and logs
+        // a warning but does not propagate the error.
+        let h_last = ids[cap];
+        let mpk = stage_mpk_tempfile(tmp.path(), h_last);
         let result = publish_trained_head(
             tmp.path(),
             &cache,
             PendingHead {
-                head_id: h3,
+                head_id: h_last,
                 mpk_tempfile: mpk,
-                manifest: sample_manifest(h3, 3),
+                manifest: sample_manifest(h_last, (cap + 1) as u64),
             },
             None,
         )
         .unwrap();
-        assert_eq!(result.displaced_head_id, Some(h1));
+        assert_eq!(result.displaced_head_id, Some(ids[0]));
         let on_disk = crate::file_mgr::schema::read_head_index(tmp.path()).unwrap();
-        assert_eq!(on_disk.heads.len(), 2);
-        assert_eq!(on_disk.heads[0].head_id, h3);
-        assert_eq!(on_disk.heads[1].head_id, h2);
+        assert_eq!(on_disk.heads.len(), cap);
+        assert_eq!(on_disk.heads[0].head_id, h_last);
+        // Surviving heads at index 1..cap are ids[cap - i] (newest-first).
+        for i in 1..cap {
+            assert_eq!(on_disk.heads[i].head_id, ids[cap - i]);
+        }
     }
 
     /// Reject publishing when the manifest's head_id disagrees
@@ -850,20 +859,21 @@ mod tests {
         assert!(!head_artifact_path(tmp.path(), h1).exists());
     }
 
-    /// Pinned head survives eviction: with H1 marked as the
-    /// active source on the H3 publish, the rotation displaces
-    /// H2 (next-oldest non-pinned) rather than H1.  Pins the
-    /// operator-visible contract that an active source is never
-    /// auto-removed.
+    /// Pinned head survives eviction: with the OLDEST head pinned
+    /// when the (cap + 1)th publish lands, the rotation displaces
+    /// the NEXT-oldest non-pinned head rather than the pinned one.
+    /// Pins the operator-visible contract that an active source is
+    /// never auto-removed.
     #[test]
     fn publish_skips_pinned_head_during_eviction() {
         let (tmp, cache) = fresh_workspace();
-        let h1 = HeadId::new();
-        let h2 = HeadId::new();
-        let h3 = HeadId::new();
+        let cap = MAX_HEADS_PER_WORKSPACE;
+        let ids: Vec<HeadId> = (0..(cap + 1)).map(|_| HeadId::new()).collect();
 
-        // Publish h1 + h2 without a pin (heads = [h2, h1]).
-        for &h in &[h1, h2] {
+        // Publish the first `cap` heads without a pin.  After this
+        // loop, the on-disk index is [ids[cap-1], ..., ids[0]]
+        // (newest-first), and ids[0] is the LRU tail.
+        for (i, &h) in ids[..cap].iter().enumerate() {
             let mpk = stage_mpk_tempfile(tmp.path(), h);
             publish_trained_head(
                 tmp.path(),
@@ -871,45 +881,65 @@ mod tests {
                 PendingHead {
                     head_id: h,
                     mpk_tempfile: mpk,
-                    manifest: sample_manifest(h, 1),
+                    manifest: sample_manifest(h, (i + 1) as u64),
                 },
                 None,
             )
             .unwrap();
         }
-        assert_eq!(cache.heads().heads.len(), 2);
+        assert_eq!(cache.heads().heads.len(), cap);
 
-        // Publish h3 with h1 pinned (the active-source case).
-        // Eviction must drop h2 (the next-oldest non-pinned tail)
-        // rather than h1.
-        let mpk = stage_mpk_tempfile(tmp.path(), h3);
+        // Publish the (cap + 1)th head with ids[0] pinned (the
+        // active-source case).  Eviction must drop ids[1] (the
+        // next-oldest non-pinned tail) rather than ids[0].
+        let h_last = ids[cap];
+        let mpk = stage_mpk_tempfile(tmp.path(), h_last);
         let result = publish_trained_head(
             tmp.path(),
             &cache,
             PendingHead {
-                head_id: h3,
+                head_id: h_last,
                 mpk_tempfile: mpk,
-                manifest: sample_manifest(h3, 3),
+                manifest: sample_manifest(h_last, (cap + 1) as u64),
             },
-            Some(h1),
+            Some(ids[0]),
         )
         .unwrap();
         assert_eq!(
             result.displaced_head_id,
-            Some(h2),
-            "pinned h1 must survive; h2 (next-oldest non-pinned) gets evicted",
+            Some(ids[1]),
+            "pinned ids[0] must survive; ids[1] (next-oldest non-pinned) gets evicted",
         );
         let on_disk = crate::file_mgr::schema::read_head_index(tmp.path()).unwrap();
-        assert_eq!(on_disk.heads.len(), 2);
-        assert_eq!(on_disk.heads[0].head_id, h3, "newest first");
-        assert_eq!(on_disk.heads[1].head_id, h1, "pinned survivor at tail");
-        // h2's files were removed; h1's + h3's remain.
-        assert!(!head_artifact_path(tmp.path(), h2).exists());
-        assert!(!head_manifest_path(tmp.path(), h2).exists());
-        assert!(head_artifact_path(tmp.path(), h1).is_file());
-        assert!(head_manifest_path(tmp.path(), h1).is_file());
-        assert!(head_artifact_path(tmp.path(), h3).is_file());
-        assert!(head_manifest_path(tmp.path(), h3).is_file());
+        assert_eq!(on_disk.heads.len(), cap);
+        assert_eq!(on_disk.heads[0].head_id, h_last, "newest first");
+        // Pinned ids[0] survives at the tail; mid-index slots hold
+        // the survivors ids[cap-1], ..., ids[2] in newest-first
+        // order.
+        assert_eq!(
+            on_disk.heads[cap - 1].head_id,
+            ids[0],
+            "pinned survivor at tail",
+        );
+        for i in 1..(cap - 1) {
+            assert_eq!(
+                on_disk.heads[i].head_id,
+                ids[cap - i],
+                "newest-first ordering at index {i}",
+            );
+        }
+        // ids[1]'s files were removed; pinned + new + intermediate
+        // survivors remain.
+        assert!(!head_artifact_path(tmp.path(), ids[1]).exists());
+        assert!(!head_manifest_path(tmp.path(), ids[1]).exists());
+        assert!(head_artifact_path(tmp.path(), ids[0]).is_file());
+        assert!(head_manifest_path(tmp.path(), ids[0]).is_file());
+        assert!(head_artifact_path(tmp.path(), h_last).is_file());
+        assert!(head_manifest_path(tmp.path(), h_last).is_file());
+        for &h in &ids[2..cap] {
+            assert!(head_artifact_path(tmp.path(), h).is_file());
+            assert!(head_manifest_path(tmp.path(), h).is_file());
+        }
     }
 
     /// Stale-pin fallback: a pin id absent from the prior index
@@ -919,12 +949,11 @@ mod tests {
     #[test]
     fn publish_falls_through_when_pinned_id_not_in_index() {
         let (tmp, cache) = fresh_workspace();
-        let h1 = HeadId::new();
-        let h2 = HeadId::new();
-        let h3 = HeadId::new();
+        let cap = MAX_HEADS_PER_WORKSPACE;
+        let ids: Vec<HeadId> = (0..(cap + 1)).map(|_| HeadId::new()).collect();
         let phantom = HeadId::new(); // never published
 
-        for &h in &[h1, h2] {
+        for (i, &h) in ids[..cap].iter().enumerate() {
             let mpk = stage_mpk_tempfile(tmp.path(), h);
             publish_trained_head(
                 tmp.path(),
@@ -932,28 +961,29 @@ mod tests {
                 PendingHead {
                     head_id: h,
                     mpk_tempfile: mpk,
-                    manifest: sample_manifest(h, 1),
+                    manifest: sample_manifest(h, (i + 1) as u64),
                 },
                 None,
             )
             .unwrap();
         }
 
-        let mpk = stage_mpk_tempfile(tmp.path(), h3);
+        let h_last = ids[cap];
+        let mpk = stage_mpk_tempfile(tmp.path(), h_last);
         let result = publish_trained_head(
             tmp.path(),
             &cache,
             PendingHead {
-                head_id: h3,
+                head_id: h_last,
                 mpk_tempfile: mpk,
-                manifest: sample_manifest(h3, 3),
+                manifest: sample_manifest(h_last, (cap + 1) as u64),
             },
             Some(phantom),
         )
         .unwrap();
         assert_eq!(
             result.displaced_head_id,
-            Some(h1),
+            Some(ids[0]),
             "stale pin must not protect anyone; chronological tail evicted",
         );
     }

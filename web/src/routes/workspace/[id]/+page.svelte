@@ -25,7 +25,7 @@
   // operator's eye flows top-to-bottom through the typical
   // workflow: record clips → trim + slice → train → activate.
   import TrainPane from '$lib/components/training/TrainPane.svelte';
-  import HeadsList from '$lib/components/training/HeadsList.svelte';
+  import DeployPane from '$lib/components/deploy/DeployPane.svelte';
   import { training as trainingStore } from '$lib/stores/training.svelte';
 
   // Local state.  No dedicated store yet -- B.1 has a single
@@ -394,11 +394,12 @@
       <TrainPane workspaceId={detail.id} {liveRevision} heads={detail.heads} />
     </div>
 
-    <!-- Heads section: per-head card with Activate + Delete
-         actions.  `liveRevision` is the upload-receipt-promoted
-         revision so a head trained at the previous rev flips
-         to "stale" without waiting for the page poller. -->
-    <HeadsList
+    <!-- Deploy module: heads list + opt-in live preview + collapsed
+         input/inference config disclosure.  `liveRevision` is the
+         upload-receipt-promoted revision so the head matching the
+         freshest revision wears the "Latest" pill without waiting
+         for the page poller. -->
+    <DeployPane
       workspaceId={detail.id}
       heads={detail.heads}
       {liveRevision}
