@@ -100,13 +100,27 @@ interface ActiveBase {
 // throw the moment a workspace head was activated (the
 // undefined-`.id` read froze Svelte's effect flush and dropped
 // the Configuration panel back to "loading…").
+//
+// `source_workspace_alive` is also load-bearing: the daemon's
+// `POST /active` returns it as `None` (the activation just succeeded
+// against `workspaces.json`, so the workspace must exist at post-
+// time) and serde `skip_serializing_if = "Option::is_none"` drops
+// the field from the wire; `GET /active` then re-derives it from a
+// live `is_dir()` check.  Consumers must treat `undefined` as alive
+// and compare to `=== false` to detect the detached / orphaned
+// case -- a truthy negation (`!alive`) would flip every just-
+// activated workspace head into the "deleted" branch until the next
+// `GET` lands, which is exactly the bug the optional annotation
+// here prevents from re-occurring.
 export type ActiveResp =
   | (ActiveBase & {
       origin: 'head';
       source_workspace_id: Uuid;
       workspace_revision: WorkspaceRevision;
       source_head_id: Uuid;
-      source_workspace_alive: boolean;
+      // GET-only.  Absent on `POST /active` responses; see comment
+      // block above for the consumer contract.
+      source_workspace_alive?: boolean;
     })
   | (ActiveBase & { origin: 'default' });
 
