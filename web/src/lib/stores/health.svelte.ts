@@ -1,7 +1,7 @@
 import { status as statusApi } from '$lib/api/endpoints';
 import type { StatusSnapshot } from '$lib/api/types';
 
-const POLL_INTERVAL_MS = 500;
+const POLL_INTERVAL_MS = 2_000;
 
 class HealthStore {
   snapshot = $state<StatusSnapshot | null>(null);

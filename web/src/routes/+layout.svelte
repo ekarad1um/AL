@@ -103,7 +103,7 @@
   });
 
   // Auto-reconnect REST config when the daemon comes back up.  Health
-  // already polls /api/v1/status every 500 ms; we piggyback on its
+  // already polls /api/v1/status every 2 s; we piggyback on its
   // transitions rather than run a separate retry timer.  The
   // `config.error !== null` guard keeps the effect inert on the steady-
   // state path -- only a failed config + reachable backend triggers a
