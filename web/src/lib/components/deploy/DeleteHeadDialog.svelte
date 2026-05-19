@@ -56,7 +56,7 @@
   <!-- Identity strip mirrors the HeadRow's identity exactly so the
        confirmation reads as "yes, this is the row you just clicked":
        mono short head id as the headline (with full UUID on hover via
-       `title`), and the row's meta line below (size · rev · classes).
+       `title`), and the row's meta line below (size · classes · rev).
        Mirrors the workspace-delete dialog's identity strip so the
        two destructive surfaces feel like a family. -->
   {#if head}
@@ -67,8 +67,8 @@
         {head.head_id.slice(0, 8)}…
       </p>
       <p class="mt-0.5 text-[11px] text-zinc-500">
-        {formatBytes(head.size_bytes)} · rev {head.workspace_revision.id} · {head.n_classes}
-        {head.n_classes === 1 ? 'class' : 'classes'}
+        {formatBytes(head.size_bytes)} · {head.n_classes}
+        {head.n_classes === 1 ? 'class' : 'classes'} · rev {head.workspace_revision.id}
       </p>
     </div>
   {/if}

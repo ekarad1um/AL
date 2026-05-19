@@ -13,12 +13,7 @@
   } from '$lib/components/category/labels';
   import TrainForm from './TrainForm.svelte';
   import TrainHistory from './TrainHistory.svelte';
-  import {
-    DEFAULT_BATCH_SIZE,
-    DEFAULT_EPOCHS,
-    DEFAULT_LEARNING_RATE,
-    DEFAULT_VALIDATION_SPLIT
-  } from './labels';
+  import { DEFAULT_EPOCHS, DEFAULT_VALIDATION_SPLIT } from './labels';
   import type { HeadRecord, TrainingCfg, Uuid } from '$lib/api/types';
 
   // Workspace-detail-scoped training surface.  Lays out as
@@ -197,29 +192,20 @@
     if (hasFieldErrors) settingsOpen = true;
   });
 
-  // Format `lr` for the at-a-glance chip.  We render with one
-  // mantissa digit so 1.5e-3 doesn't get rounded into 2e-3 (a
-  // 33 % misrepresentation that the prior `toExponential(0)`
-  // produced).  The ".0e" → "e" replace strips a no-op decimal
-  // for round powers of 10 so the default 1e-3 still reads as
-  // "1e-3" rather than "1.0e-3"; the "e+0" → "" strip collapses
-  // a literal-`1` lr to "1" rather than "1e+0".
-  function formatLR(lr: number): string {
-    return lr.toExponential(1).replace('.0e', 'e').replace('e+0', '');
-  }
-
+  // Collapsed-header summary.  Limited to epochs + validation
+  // split: the two parameters whose effect on a run is most
+  // legible at a glance (epoch count sets training duration;
+  // validation fraction tells the operator whether they'll get
+  // a holdout score back).  `batch_size` and `learning_rate`
+  // were previously chipped here too but read as noise -- both
+  // are knobs the operator rarely tunes per-run, and "lr 1e-3"
+  // in a 10 px monospace pill is hard to scan at speed.  Anyone
+  // who wants to see them can expand the disclosure.
   const summaryChips = $derived.by(() => {
     const c = cfg;
     const epochs = c?.epochs ?? DEFAULT_EPOCHS;
-    const batch = c?.batch_size ?? DEFAULT_BATCH_SIZE;
-    const lr = c?.learning_rate ?? DEFAULT_LEARNING_RATE;
     const vs = c?.validation_split ?? DEFAULT_VALIDATION_SPLIT;
-    return [
-      `${epochs} epochs`,
-      `batch ${batch}`,
-      `lr ${formatLR(lr)}`,
-      vs === 0 ? 'no holdout' : `val ${Math.round(vs * 100)}%`
-    ];
+    return [`${epochs} epochs`, vs === 0 ? 'no holdout' : `val ${Math.round(vs * 100)}%`];
   });
 
   // ── Primary action state machine ─────────────────────────────
@@ -457,38 +443,66 @@
        next submit or on operator dismiss.  Fade-only so the
        one-row appearance/disappearance is visually quiet.
        Above the disclosure so the operator's eye lands on it
-       coming back from the form's submit button. -->
+       coming back from the form's submit button.
+       Style mirrors HeadsTable's deploy-failure banner and
+       InputPane's recorder/generic error chips so the three
+       dismissible alert surfaces read as one family (rose-200
+       border on rose-50, single `text-rose-900` on the outer,
+       `text-rose-700` stroke-X dismiss with `hover:bg-rose-100`).
+       Two layout modes by message presence:
+         * MULTI-LINE (typed daemon error, the realistic path):
+           `items-start` + `px-3 py-2` chrome + `-mt-1 -mr-2`
+           on the X pins it to the top-right corner with 4 px to
+           top and 4 px to right edges.
+         * SINGLE-LINE (defensive: error string came back empty):
+           `items-center` + `py-1 pr-1 pl-2.5` (asymmetric 4 px
+           top/right/bottom, 10 px left) + no negative margins on
+           the X.  Collapses from 52 px (ML) to 32 px (SL); the
+           extra 6 px on the left compensates for items-center +
+           half-leading offsets so the visible cap-left ≈ cap-top
+           ≈ visible bottom and the chip reads with balanced
+           left/top/bottom whitespace.  See HeadsTable's deploy-
+           failure comment for the full geometry; this banner
+           mirrors that mode contract. -->
   {#if trainingStore.startError}
+    {@const hasMessage = trainingStore.startError.trim().length > 0}
     <div
       in:fade={{ duration: 200, easing: cubicOut }}
       out:fade={{ duration: 160, easing: cubicOut }}
-      class="mb-3 flex items-start justify-between gap-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs"
+      class="mb-3 flex justify-between gap-2 rounded-md border border-rose-200 bg-rose-50 text-xs text-rose-900"
+      class:items-start={hasMessage}
+      class:items-center={!hasMessage}
+      class:px-3={hasMessage}
+      class:py-2={hasMessage}
+      class:py-1={!hasMessage}
+      class:pr-1={!hasMessage}
+      class:pl-2.5={!hasMessage}
       role="alert"
     >
       <div class="min-w-0">
-        <p class="font-medium text-rose-900">Could not start training</p>
-        <p class="mt-0.5 wrap-break-word text-rose-800">{trainingStore.startError}</p>
+        <p class="font-medium">Could not start training</p>
+        {#if hasMessage}
+          <p class="mt-0.5 wrap-break-word">{trainingStore.startError}</p>
+        {/if}
       </div>
-      <!-- Dismiss button.  `-mt-1 -mr-2` is sized to compensate
-           for the alert's asymmetric `px-3 py-2` padding so the
-           visible gap from the button to BOTH the alert's top
-           and right edges is the same 4 px (px-3 − mr-2 = 4 and
-           py-2 − mt-1 = 4).  A symmetric pair like `-m-1` would
-           leave the right gap at 8 px while the top sat at 4 px,
-           which read as the button hugging the top more tightly
-           than the side -- visible asymmetry on a small chip. -->
       <button
         type="button"
         onclick={dismissStartError}
         aria-label="Dismiss"
-        class="-mt-1 -mr-2 shrink-0 rounded-md p-1 text-rose-500 transition hover:bg-white/60 hover:text-rose-900"
+        class="shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
+        class:-mt-1={hasMessage}
+        class:-mr-2={hasMessage}
       >
-        <svg viewBox="0 0 16 16" fill="currentColor" class="h-3.5 w-3.5" aria-hidden="true">
-          <path
-            fill-rule="evenodd"
-            d="M4.293 4.293a1 1 0 011.414 0L8 6.586l2.293-2.293a1 1 0 111.414 1.414L9.414 8l2.293 2.293a1 1 0 01-1.414 1.414L8 9.414l-2.293 2.293a1 1 0 01-1.414-1.414L6.586 8 4.293 5.707a1 1 0 010-1.414z"
-            clip-rule="evenodd"
-          />
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          class="h-3.5 w-3.5"
+          aria-hidden="true"
+        >
+          <path d="M6 6l12 12M6 18L18 6" />
         </svg>
       </button>
     </div>

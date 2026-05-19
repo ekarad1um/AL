@@ -86,7 +86,7 @@
   }
 </script>
 
-<div class="flex flex-col gap-3">
+<div class="flex flex-col gap-2">
   {#if isTerminal && view !== null}
     <!-- Terminal layout.  Drop the progress bar (its 100% / 0%
          frozen state is pure noise on a finished card) and the

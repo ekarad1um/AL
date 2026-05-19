@@ -1971,25 +1971,40 @@
   {/if}
 
   <!-- Recorder / generic error chips.  Both share the same
-       alert chrome (`px-3 py-2`, rose-50 on rose-200) and the
-       same dismiss button with `-mt-1 -mr-2`: the asymmetric
-       negative margins compensate for the alert's asymmetric
-       padding so the visible gap from the X to BOTH the top
-       and right edges is the same 4 px (px-3 − mr-2 = 4 and
-       py-2 − mt-1 = 4).  Same geometry rule as the
-       training-area dismisses in TrainPane / HeadsTable; a
-       symmetric `-m-1` would leave the right gap at 8 px
-       while the top sat at 4 px, which reads as the button
-       hugging the top more than the side. -->
+       chrome and dismiss button as TrainPane's start-error and
+       HeadsTable's deploy-failure banner so the three dismissible
+       alert surfaces read as one family (rose-200 border on
+       rose-50, single `text-rose-900` on the outer, `text-rose-
+       700` stroke-X dismiss with `hover:bg-rose-100`).  These
+       chips are structurally single-line (just one `<span>
+       {error}`), so they always use the SINGLE-LINE layout from
+       the family contract: `items-center` + `py-1 pr-1 pl-2.5`
+       (asymmetric 4 px top/right/bottom, 10 px left) + no
+       negative margins on the X.  The 6 px extra on `pl-` over
+       `py-` compensates for two text-positioning offsets the
+       horizontal axis lacks: (a) items-center adds 3 px above /
+       below the 16 px text line-box (centring it inside the
+       22 px button-driven content area), and (b) the text-xs
+       font's half-leading + ascender-cap delta puts the visible
+       cap top ~3.2 px below the line-box top.  At the visible-
+       cap level the inner content reads with balanced left /
+       top / bottom whitespace (~10 px each, within ~1.2 px
+       across descender variation) -- same rule the HeadsTable
+       banner switches into when its message body is empty.  If
+       the error string is long enough to wrap, the X stays
+       centred against the wrapped block; acceptable for the
+       rare wrap case (the SL→ML conditional used by the
+       title+message banners would require runtime line-count
+       detection here since the structure is single-element). -->
   {#if recorderError}
     <div
-      class="flex items-start justify-between gap-2 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-900"
+      class="flex items-center justify-between gap-2 rounded-md border border-rose-200 bg-rose-50 py-1 pr-1 pl-2.5 text-xs text-rose-900"
       role="alert"
     >
       <span class="min-w-0 flex-1">{recorderError}</span>
       <button
         type="button"
-        class="-mt-1 -mr-2 shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
+        class="shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
         onclick={dismissError}
         aria-label="Dismiss"
       >
@@ -2009,13 +2024,13 @@
   {/if}
   {#if error}
     <div
-      class="flex items-start justify-between gap-2 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-900"
+      class="flex items-center justify-between gap-2 rounded-md border border-rose-200 bg-rose-50 py-1 pr-1 pl-2.5 text-xs text-rose-900"
       role="alert"
     >
       <span class="min-w-0 flex-1">{error}</span>
       <button
         type="button"
-        class="-mt-1 -mr-2 shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
+        class="shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
         onclick={() => (error = null)}
         aria-label="Dismiss"
       >

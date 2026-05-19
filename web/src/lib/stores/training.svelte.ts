@@ -1734,9 +1734,25 @@ function renderEvent(event: TrainLogLine): { phase: Stage; message: string } | n
       };
     }
     case 'head_published':
+      // Full head id is part of the message string (not a separate
+      // styled sub-row) so it reads as one continuous dot-separated
+      // verdict line, matches the surrounding log typography, and
+      // is selectable as part of the same text run for copy.  The
+      // 8-char prefix shown in the TrainHistoryItem header is a
+      // lookup tag; the log is where the full id lives for anyone
+      // who needs to grab it.  Ordering puts the head id first
+      // (the operator's primary "what just landed?" question),
+      // then the metadata in HeadRow's `size · classes · rev`
+      // order so the artifact-fact triple reads identically
+      // across the deploy table, the delete-confirmation dialog,
+      // and the training log: artifact-intrinsic facts (size +
+      // classes) lead, workspace-version (rev) trails.  `rev N`
+      // matches the DeployPane / HeadRow / ActiveHeadCard
+      // convention so the workspace-revision token reads
+      // identically across surfaces.
       return {
         phase: 'publish',
-        message: `Head published · ${event.n_classes} ${event.n_classes === 1 ? 'class' : 'classes'} · ${formatBytes(event.size_bytes)}`
+        message: `Head published · ${event.head_id} · ${formatBytes(event.size_bytes)} · ${event.n_classes} ${event.n_classes === 1 ? 'class' : 'classes'} · rev ${event.workspace_revision.id}`
       };
     case 'job_completed':
       return { phase: 'publish', message: 'Job completed' };

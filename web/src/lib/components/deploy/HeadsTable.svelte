@@ -361,31 +361,29 @@
            (px-1.5 py-0.5 text-[10px]).  `leading-tight`
            (line-height 1.25) tightens the line-box from 15 →
            12.5 px and the button height from natural 21 → 18.5 px.
-           In the 21 px header, items-center then yields ~1.25 px
-           of whitespace on the button's top + bottom -- the prior
-           21 px button was edge-to-edge in the header (0 px each
-           side) while the heading floated in the middle with
-           uneven whitespace above / below its glyph, so the
-           button read as pinned to the section card's vertical
-           edges.  Symmetric outside spacing now matches the
-           heading's centered feel.
-           No translate-y on the label: the natural line-box
-           descender allocation puts the cap glyph ~0.5 px above
-           the button's centre with ~1 px more whitespace below
-           than above the glyph -- the reader's eye reads this
-           asymmetry as "how text always renders" because it's
-           the universal text-rendering bias, not a defect.  A 1 px
-           shift down would land the glyph ~0.5 px below centre
-           (more whitespace above), which reads as unnaturally
-           "low in the button" -- the cure was worse than the
-           disease.  A sub-pixel translate-y-[0.5px] would
-           technically optical-centre the glyph but renders soft
-           on 1× DPI without a perceptible win on Retina. -->
+           In the 21 px header, items-center yields ~1.25 px of
+           whitespace on the button's top + bottom -- locally
+           symmetric.  But the SECTION CARD'S vertical rhythm is
+           asymmetric: `pt-1.5` (6 px) above the header and `mb-1`
+           (4 px) below it (the +2 px on top is load-bearing for
+           the scroller-capacity math noted on the section's
+           header rhythm comment above and cannot move).  Stacked,
+           the button sat with 7.25 px of empty card-chrome above
+           (pt-1.5 + 1.25) but only 5.25 px below (1.25 + mb-1),
+           a 2 px top-heavy bias that the eye reads as "button
+           sits 1-2 px low in the card".  `-translate-y-px` lifts
+           the visible button by exactly 1 px so the contextual
+           whitespace lands at 6.25 / 6.25 -- visually symmetric
+           in the card-level frame the reader actually scans.
+           Transform (not margin) so the layout pass still
+           positions the button at items-center: the scroller's
+           277 px budget below the header is computed from the
+           layout-flow position, not the visual one. -->
       <button
         type="button"
         onclick={revert}
         disabled={interactionBlocked}
-        class="inline-flex shrink-0 items-center rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[10px] leading-tight font-medium text-zinc-700 transition duration-200 ease-out hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-60"
+        class="inline-flex shrink-0 -translate-y-px items-center rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[10px] leading-tight font-medium text-zinc-700 transition duration-200 ease-out hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-60"
         title="Re-deploy the previously running head"
       >
         {revertLabel}
@@ -471,48 +469,116 @@
     </ul>
   </div>
 
-  <!-- Deploy-failure banner.  Mirrors TrainPane's start-error
-       slim alert so the destructive-adjacent failure surfaces
-       feel like one family.  Pinned to the bottom of the card
+  <!-- Deploy-failure banner.  Pinned to the bottom of the card
        (below the scroller, above the section's bottom padding)
        so a slow-network failure doesn't shove still-correct
        heads down and stays visible regardless of scroll position.
        Names the target (head short id or "default") so the
        operator can correlate the message with the row they
-       clicked. -->
+       clicked.
+       Shared style with TrainPane's start-error and InputPane's
+       recorder/generic error chips so the three dismissible
+       alert surfaces read as one family:
+         * Chrome: rose-200 border on rose-50 fill, px-3 py-2,
+           rounded-md, text-xs.
+         * Text colour: a single `text-rose-900` declared on the
+           outer flex container; the title, the head-id chip, and
+           the message row all inherit it.  Weight + size (the
+           `font-medium` title vs the lighter message) carries the
+           hierarchy on its own without a second rose shade.
+         * Dismiss button: `-mr-2` corner offset + `text-rose-700`
+           with `hover:bg-rose-100` (in-family hover wash, not the
+           prior `bg-white/60` which broke the rose-on-rose
+           palette).  Stroke X glyph (24x24 viewBox, stroke-width
+           2) for a thinner, more modern silhouette than the prior
+           filled-path glyph -- matches InputPane's icon, and at
+           h-3.5 w-3.5 reads identically across the family.
+       Two layout modes, driven by whether `deployError.message`
+       carries any text:
+         * MULTI-LINE (default for real failures -- the daemon
+           returns a typed string explanation): `items-start` +
+           `px-3 py-2` chrome + `-mt-1 -mr-2` on the dismiss
+           pins the X to the top-right corner with 4 px to the
+           top edge and 4 px to the right edge (px-3 − mr-2 = 4,
+           py-2 − mt-1 = 4).  Below-button whitespace is
+           *intentional* -- the corner pattern reads as "dismiss
+           this whole error block", letting the eye flow
+           vertically through title + wrapped message without
+           the button competing for the visual centre.
+         * SINGLE-LINE (defensive: message comes back blank or
+           the typed error has no detail to surface): `items-
+           center` + `py-1 pr-1 pl-2.5` (asymmetric padding: 4 px
+           top/right/bottom, 10 px left) + no negative margins on
+           the dismiss.  The asymmetric left compensates for two
+           text-positioning offsets that don't apply on the
+           horizontal axis: (a) `items-center` adds 3 px above /
+           below the 16 px text line-box (centring it inside the
+           22 px button-driven content area), and (b) the
+           text-xs font's half-leading + ascender-cap delta puts
+           the visible cap top ~3.2 px below the line-box top.
+           At the visible-cap level the text otherwise reads as
+           4 px left vs ~10 px top -- a 6 px asymmetry the eye
+           reads as "title hugs the left wall".  Lifting padding-
+           left to 10 px lands cap-left ≈ cap-top ≈ visible
+           bottom (within ~1.2 px across descender variation), so
+           the inner content sits with visually balanced left /
+           top / bottom whitespace.  Right stays at 4 px because
+           the button has its own internal `p-1` -- icon-to-
+           chrome-edge already measures 8 px (4 chrome + 4
+           button) without needing an extra chrome offset.
+           Alert collapses from 40 px tall (ML) to 32 px (SL)
+           for a more compact, glanceable chip when there's no
+           message body to anchor. -->
+
   {#if deployError}
+    {@const hasMessage = deployError.message.trim().length > 0}
     <div
       in:fade={{ duration: 200, easing: cubicOut }}
       out:fade={{ duration: 160, easing: cubicOut }}
-      class="mt-1.5 flex items-start justify-between gap-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs"
+      class="mt-1.5 flex justify-between gap-2 rounded-md border border-rose-200 bg-rose-50 text-xs text-rose-900"
+      class:items-start={hasMessage}
+      class:items-center={!hasMessage}
+      class:px-3={hasMessage}
+      class:py-2={hasMessage}
+      class:py-1={!hasMessage}
+      class:pr-1={!hasMessage}
+      class:pl-2.5={!hasMessage}
       role="alert"
     >
       <div class="min-w-0">
-        <p class="font-medium text-rose-900">
+        <p class="font-medium">
           Could not deploy
           {#if deployError.kind === 'head'}
             head
-            <span class="font-mono text-[10px] text-rose-700" title={deployError.headId}>
+            <span class="font-mono text-[10px]" title={deployError.headId}>
               {deployError.headId.slice(0, 8)}…
             </span>
           {:else}
             default head
           {/if}
         </p>
-        <p class="mt-0.5 wrap-break-word text-rose-800">{deployError.message}</p>
+        {#if hasMessage}
+          <p class="mt-0.5 wrap-break-word">{deployError.message}</p>
+        {/if}
       </div>
       <button
         type="button"
         onclick={dismissDeployError}
         aria-label="Dismiss"
-        class="-mt-1 -mr-2 shrink-0 rounded-md p-1 text-rose-500 transition hover:bg-white/60 hover:text-rose-900"
+        class="shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
+        class:-mt-1={hasMessage}
+        class:-mr-2={hasMessage}
       >
-        <svg viewBox="0 0 16 16" fill="currentColor" class="h-3.5 w-3.5" aria-hidden="true">
-          <path
-            fill-rule="evenodd"
-            d="M4.293 4.293a1 1 0 011.414 0L8 6.586l2.293-2.293a1 1 0 111.414 1.414L9.414 8l2.293 2.293a1 1 0 01-1.414 1.414L8 9.414l-2.293 2.293a1 1 0 01-1.414-1.414L6.586 8 4.293 5.707a1 1 0 010-1.414z"
-            clip-rule="evenodd"
-          />
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          class="h-3.5 w-3.5"
+          aria-hidden="true"
+        >
+          <path d="M6 6l12 12M6 18L18 6" />
         </svg>
       </button>
     </div>

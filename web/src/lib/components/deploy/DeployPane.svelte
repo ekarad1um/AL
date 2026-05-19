@@ -148,20 +148,52 @@
 </script>
 
 <section class="rounded-xl border border-zinc-200 bg-white px-5 pt-3.5 pb-5 shadow-sm">
-  <!-- `items-center` (NOT `items-start`) anchors the right-side
-       StatusBadge to the title block's vertical centroid.  Matches
-       the workspace + dashboard section-header convention used by
-       TrainPane (see its comment for the load-bearing two-line
-       subtitle case), ActiveHeadCard, InferencePanel, and
-       VisualizationPanel; deploy was the lone `items-start`
-       outlier.  The fix matters because `items-start` pinned the
-       badge to y=0 of the header while the heading's cap glyph
-       sits ~4.4 px below the line-box top at text-sm (descender
-       allocation reserved in the line-box).  Visually the badge
-       had ~4 px less whitespace above it than the heading text
-       did, reading as "badge floats high" against the title block.
-       items-center also keeps the badge centred when the
-       description wraps to two lines on narrow viewports. -->
+  <!-- `items-center` anchors the right-side StatusBadge to the
+       title block's geometric centroid (measured ~8.75 px above
+       and below the badge in the 38 px header at text-sm +
+       text-xs + mt-0.5).  Matches the workspace + dashboard
+       section-header convention used by TrainPane, InferencePanel,
+       and VisualizationPanel.  Three prior regressions to avoid:
+         1. `items-start` pinned the badge to y=0 of the header
+            while the h2's cap glyph sits ~5 px below the line-box
+            top (text-sm reserves descender allocation at the top
+            of its line-box but the badge does not), so the badge
+            chrome poked above the title's visible top and read as
+            "floats high".
+         2. A bare `<span>` wrapper around the badge is
+            `display: inline`, but as a flex item of the header
+            it gets blockified to `block` -- inheriting the
+            section's 24 px line-height and growing a ~4 px
+            baseline strut from the line-box it allocates for
+            the inline-flex badge child.  `items-center` then
+            centres the STRUT (24.5 px) inside the header, but
+            the inner badge sits at the strut's baseline --
+            pushing the visible badge ~2 px below true centre
+            and reading as "a bit downward".  Setting
+            `inline-flex` on the wrapper (which itself blockifies
+            to `flex` in the header's flex context) swaps it
+            from a line-box host into a flex container that
+            shrink-wraps to the badge's intrinsic ~20.5 px
+            height; no strut, so `items-center` lands the chrome
+            on true centre.
+         3. True geometric centring still reads as ~1 px low
+            because the header's *perceptual* centroid is above
+            its geometric centre: the h2 carries ~3x the visual
+            weight per character of the description (font-semibold
+            14 px zinc-900 vs font-normal 12 px zinc-500, contrast
+            ratios ~16:1 vs ~4.5:1) so the eye anchors near the
+            title cap-line.  Compounding this, the badge's text
+            ink sits in the upper ~60% of its 20.5 px chrome (cap +
+            x-height region at y=4.75-12.45; the descender region
+            below the baseline is sparse -- only ~25% of letters
+            in the four labels carry descenders).  Both biases
+            point up, so `-translate-y-px` on the badge wrapper
+            applies a 1 px optical correction.  Transform (not
+            margin) so the surrounding layout flow is untouched:
+            the next row still measures the badge wrapper as if
+            it sat at the geometric centre.  `items-center` also
+            keeps the badge balanced when the description wraps
+            to two lines on narrow viewports. -->
   <header class="mb-3 flex items-center justify-between gap-3">
     <div class="min-w-0">
       <h2 class="text-sm font-semibold text-zinc-900">Deploy</h2>
@@ -170,10 +202,19 @@
     {#if pillCopy}
       <!-- StatusBadge orchestrates the slot-machine word flip +
            colour morph internally; the parent only feeds it new
-           props on state change.  The wrapper carries `shrink-0`
-           so the badge never gets squeezed against the header
-           description when the viewport narrows. -->
-      <span class="shrink-0">
+           props on state change.  `inline-flex` on the wrapper is
+           load-bearing (see the header comment above): without it
+           the wrapper blockifies to `display: block` in the
+           header's flex context and hosts a 24 px line-box strut
+           for the inline-flex badge child, sinking the visible
+           glyph ~2 px below the header's true vertical centre.
+           `-translate-y-px` is the 1 px optical correction
+           explained in the header comment (text ink concentrates
+           in the badge's upper half + the header's perceptual
+           centroid is above its geometric one).  `shrink-0` keeps
+           the badge at its measured width when the viewport
+           narrows. -->
+      <span class="inline-flex shrink-0 -translate-y-px">
         <StatusBadge label={pillCopy.label} tone={pillCopy.tone} title={pillCopy.title} />
       </span>
     {/if}

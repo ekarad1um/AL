@@ -62,14 +62,17 @@
      row's freshness.
 
      The description line below carries the head's metadata in
-     reading order: size · rev · classes · age.  Size + rev lead
-     with the artifact-on-disk facts; classes count sits adjacent
-     to age so the pair reads as a single phrase ("learned N
-     categories, X ago") at the right edge of the row, where the
-     eye naturally lands after the headline.  Deployed rows tint
-     blue to match the dashboard's Active Head card. -->
+     reading order: size · classes · rev · age.  Size + class
+     count lead as the artifact's intrinsic facts -- the
+     operator's first triage question is "does this head cover
+     what I need?", which the class count answers most directly,
+     so it sits adjacent to size at the head of the chain rather
+     than tucked behind the rev token.  Rev then anchors the
+     artifact to a specific workspace version, with age trailing
+     as the recency signal.  Deployed rows tint blue to match
+     the dashboard's Active Head card. -->
 <li
-  class="flex flex-wrap items-center justify-between gap-3 rounded-md border px-3 py-2.5 transition-colors"
+  class="group/row flex flex-wrap items-center justify-between gap-3 rounded-md border px-3 py-2.5 transition-colors"
   class:border-blue-200={isDeployed}
   class:bg-blue-50={isDeployed}
   class:border-zinc-200={!isDeployed}
@@ -106,20 +109,52 @@
       {/if}
     </div>
     <p class="mt-1 text-[11px] text-zinc-500">
-      {formatBytes(head.size_bytes)} · rev {head.workspace_revision.id} · {head.n_classes}
-      {head.n_classes === 1 ? 'class' : 'classes'} ·
+      {formatBytes(head.size_bytes)} · {head.n_classes}
+      {head.n_classes === 1 ? 'class' : 'classes'} · rev {head.workspace_revision.id} ·
       <span class="text-zinc-400" title={head.created_at}>{formatRelative(head.created_at)}</span>
     </p>
   </div>
 
+  <!-- Actions cluster.  Delete LEFT of Deploy, hover-revealed only;
+       at rest the row's right edge reads as "Deploy CTA + nothing
+       else" so the operator's eye lands on the primary action
+       without competing chrome.  Same idiom as CategoryRow's
+       per-row delete (see CategoryRow.svelte:251-303): the button
+       is in flow (so the layout doesn't reflow on hover and the
+       Deploy CTA holds a stable position) but visually hidden via
+       `opacity-0 pointer-events-none`; `group-hover/row`,
+       `focus-visible`, and `pointer-coarse` selectors restore
+       opacity + interactivity for hover, keyboard, and touch
+       respectively.  Border-less to match CategoryRow's chrome-
+       free affordance -- the row already has its own border, and
+       a second nested border around a hover-revealed icon would
+       read as visual repetition.  Tooltips live on the wrapper
+       spans so the explanation surfaces in Firefox too: a
+       disabled <button> doesn't fire pointer events in Firefox,
+       so its native `title` stays hidden -- visible only in
+       Chrome / Safari.  The span receives the hover and shows its
+       own title cross-browser; the operator hovering the inactive
+       "Deployed" or "Can't delete" affordance sees the same hint
+       on every engine. -->
   <div class="flex shrink-0 items-center gap-2">
-    <!-- Tooltip on a wrapper span so the explanation surfaces in
-         Firefox as well: a disabled <button> doesn't fire pointer
-         events in Firefox, so its native `title` tooltip stays
-         hidden -- visible only in Chrome / Safari.  The span
-         receives the hover, shows its own title, and the operator
-         hovering the inactive "Deployed" or "Can't delete" button
-         sees the same hint cross-browser. -->
+    <span
+      class="inline-flex shrink-0"
+      title={isDeployed
+        ? "Can't delete the deployed head. Deploy another head or revert to default first."
+        : 'Delete this head'}
+    >
+      <button
+        type="button"
+        onclick={() => ondelete(head)}
+        disabled={isDeployed || interactionDisabled}
+        aria-label={isDeployed
+          ? 'The deployed head cannot be deleted'
+          : `Delete head ${head.head_id.slice(0, 8)}…`}
+        class="pointer-events-none inline-flex shrink-0 items-center justify-center rounded-md p-1.5 text-zinc-300 opacity-0 transition duration-200 ease-out group-hover/row:pointer-events-auto group-hover/row:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-rose-200 focus-visible:outline-none enabled:hover:bg-rose-50 enabled:hover:text-rose-600 disabled:cursor-not-allowed disabled:text-zinc-200 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+      >
+        <TrashIcon />
+      </button>
+    </span>
     <span
       class="inline-flex shrink-0"
       title={isDeployed
@@ -135,22 +170,6 @@
       >
         {#if isDeployed}Deployed{:else}Deploy{/if}
       </Button>
-    </span>
-    <span
-      class="inline-flex shrink-0"
-      title={isDeployed
-        ? "Can't delete the deployed head. Deploy another head or revert to default first."
-        : 'Delete this head'}
-    >
-      <button
-        type="button"
-        onclick={() => ondelete(head)}
-        disabled={isDeployed || interactionDisabled}
-        aria-label="Delete head"
-        class="inline-flex shrink-0 items-center justify-center gap-1 rounded-md border border-zinc-200 bg-white p-1.5 text-zinc-500 transition disabled:cursor-not-allowed disabled:bg-zinc-50 disabled:text-zinc-300 enabled:hover:border-rose-200 enabled:hover:bg-rose-50 enabled:hover:text-rose-700"
-      >
-        <TrashIcon />
-      </button>
     </span>
   </div>
 </li>
