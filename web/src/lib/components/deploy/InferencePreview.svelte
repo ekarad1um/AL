@@ -110,6 +110,36 @@
     }
   });
 
+  // Hold a streams refcount only while the preview is actively
+  // ON.  Toggling `preview = false` (manual click, IntersectionObserver
+  // auto-stop, or route exit) runs the effect's cleanup, which
+  // disposes the acquire and -- if no other consumer is holding
+  // a refcount -- tears down the worker + both WebSockets.  This
+  // is what makes "deploy module on, preview off" cost nothing
+  // beyond the placeholder DOM: the SpectrogramCanvas + TopKMeter
+  // children are gated on `{#if preview}` separately, so they
+  // unmount alongside the acquire release.
+  //
+  // `$effect.pre` (not plain `$effect`): the status pill below
+  // reads `streams.inferStatus` synchronously when `{#if preview}`
+  // first renders.  With post-DOM `$effect`, the sequence on
+  // preview false→true would be:
+  //   1. preview = true
+  //   2. DOM commits → pill mounts → reads inferStatus ('closed') →
+  //      paints red "disconnected"
+  //   3. $effect runs → acquire → connectClient sets 'connecting'
+  //      → pill re-renders amber
+  // -- one visible frame of "disconnected" before "connecting,"
+  // which is the regression the operator notices.  $effect.pre
+  // runs BEFORE the DOM commit, so connectClient's optimistic
+  // `'connecting'` write lands first and the pill's first paint
+  // is already amber.  Same dependency tracking + cleanup contract
+  // as plain `$effect`; the only difference is when the body and
+  // cleanup run in the flush cycle.
+  $effect.pre(() => {
+    if (preview) return streams.acquire();
+  });
+
   // IntersectionObserver auto-stop.  Only observes while the
   // preview is ON; toggling off (manual or auto) tears the
   // observer down via the effect's cleanup return.  Toggling
@@ -242,7 +272,12 @@
        via the `config.active.activation_id` watcher and exposed
        manually via the big CTA in the off-state below. -->
   <header class="mb-1.5 flex min-h-4.75 items-center justify-between gap-1.5">
-    <div class="flex items-baseline gap-1.5">
+    <!-- `translate-y-px` optical-centre correction; full rationale
+         lives in HeadsTable.svelte's header comment.  Same shift
+         applied uniformly across all four pane-level headings
+         (this pane + HeadsTable + InputPane + SlicePane) preserves
+         the cross-pane h4-baseline weld. -->
+    <div class="flex translate-y-px items-baseline gap-1.5">
       <h4 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">Preview</h4>
       {#if preview}
         <!-- FPS reading in the dashboard meta-text idiom: plain

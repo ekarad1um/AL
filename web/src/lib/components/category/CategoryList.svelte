@@ -159,11 +159,11 @@
        columns regardless of how the description wraps, and the
        `gap-3` keeps the CTA from crowding the description text
        on narrow viewports. -->
-  <header class="mb-4 flex items-center justify-between gap-3">
+  <header class="mb-3 flex items-center justify-between gap-3">
     <div class="min-w-0">
       <h2 class="text-sm font-semibold text-zinc-900">Dataset</h2>
       <p class="mt-0.5 text-xs text-zinc-500">
-        Each category becomes a class label the trainer learns. Background Noise is required.
+        Each category becomes a class label the trainer learns — Background Noise is required.
       </p>
     </div>
     <Button onclick={() => (addOpen = true)} ariaLabel="Add category">

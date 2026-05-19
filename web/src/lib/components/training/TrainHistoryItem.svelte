@@ -143,30 +143,32 @@
   // both live in the expanded RunSummary tiles for operators
   // who need them.  Showing them inline-AND-expanded was
   // duplication; the header is for the *verdict* ("which run
-  // produced the head shape I want to activate, and how good
-  // was it?"), and the operator's typical scanning question is
-  // about head identity (class count) and accuracy, not about
-  // training mechanics.  Failed runs drop the inline error
-  // copy too: the row's rose left-border signals failure at a
-  // glance and the full diagnostic lives in the expanded
-  // RunSummary + log scrollback.
+  // produced the head I want to activate, and how good was
+  // it?"), and the operator's typical scanning question is
+  // about head identity (which head + class count) and
+  // accuracy, not about training mechanics.  Failed runs drop
+  // the inline error copy too: the row's rose left-border
+  // signals failure at a glance and the full diagnostic lives
+  // in the expanded RunSummary + log scrollback.
   //
   //   running:    epoch 5/30
   //   submitting: (no tokens; left-border + state word carry
   //                the "in flight" signal)
-  //   completed:  N classes · val Y.Y%   (or train acc
-  //                fallback when valDisabled)
+  //   completed:  3 classes · val 95.2%        abcd1234…
+  //                (or train acc fallback when valDisabled;
+  //                head-id is right-aligned via `ml-auto`,
+  //                rendered outside this array -- see
+  //                `completedHeadId` below)
   //   failed:     stopped at <stage>
   //   cancelled:  stopped at <stage>
   //
-  // Class count comes from `view.result.n_classes`, which is
-  // populated only on `completed`.  Failed / cancelled rows
-  // have no head to surface, so no class token is rendered --
-  // the dataset's class count at submit time isn't a useful
-  // verdict ("the run we attempted would have produced N
-  // classes if it hadn't died") and threading it through the
-  // store would add a code path with no operator question
-  // behind it.
+  // Class count comes from `view.result.n_classes`, populated
+  // only on `completed`.  Failed / cancelled rows have no head
+  // to surface, so no class token is rendered -- the dataset's
+  // class count at submit time isn't a useful verdict ("the
+  // run we attempted would have produced N classes if it
+  // hadn't died") and threading it through the store would add
+  // a code path with no operator question behind it.
   const trailingDetail = $derived.by<readonly string[]>(() => {
     const v = job.view;
     if (!v) return [];
@@ -196,6 +198,27 @@
     // operator-cancel colour is carried by the row's
     // left-border accent, so the header copy is identical.
     return [`stopped at ${STAGE_LABEL[v.progress.phase].toLowerCase()}`];
+  });
+
+  // Full head_id when the run is `completed`, else null.
+  // Rendered as a right-aligned token at the end of the header
+  // line (via `ml-auto`) rather than as an inline trailing-
+  // detail entry: the head-id is a lookup tag the operator
+  // reaches for AFTER scanning the verdict ("how good?"), so
+  // separating it spatially -- right-aligned, not inline -- lets
+  // the eye triage left-side facts first and then jump to the
+  // identity tag.  Drops the `·` separator that would otherwise
+  // precede it because the right-alignment whitespace IS the
+  // separator.  Short 8-char prefix + ellipsis on render matches
+  // HeadsTable's row identity idiom; the full UUID lives on the
+  // `title` for hover.  Failed / cancelled rows carry a pre-
+  // allocated head_id from `job_submitted` but no head actually
+  // landed, so showing it would mislead the operator into
+  // thinking an artefact exists to deploy.
+  const completedHeadId = $derived.by<string | null>(() => {
+    const v = job.view;
+    if (v?.state !== 'completed') return null;
+    return v.result?.head_id ?? null;
   });
 </script>
 
@@ -271,17 +294,26 @@
       />
     </svg>
 
-    <!-- Inline header line.  Three slots:
-             {state}  {time} · {trailing detail tokens}
+    <!-- Inline header line.  Four slots:
+             {state}  {time} · {trailing tokens, dot-split}   {head-id, right-aligned}
            A faint zinc-300 middot separates the trailing detail
-           cluster from the {state, time} pair so the eye reads
-           "what + when" first, then "how much".  Inside the
-           trailing cluster the gap-2 wrapper handles spacing
-           without further separators.  The state word is the
-           only coloured element; the timestamp + trailing
-           detail stay neutral so a row never reads as a colour
-           stripe.  `animate-pulse` rides on the state word for
-           live entries (no separate dot element). -->
+           cluster from the {state, time} pair, AND splits the
+           cluster's tokens from each other -- the trailing
+           strip reads as one continuous dot-separated meta
+           line, matching the HeadRow / workspace-page header
+           idiom ("16 KiB · rev 542 · 3 classes · 3 h ago").
+           Per-token middots make the strip self-parsing at a
+           glance: each segment is a separate fact, not a
+           run-on phrase.  The completed-run head-id sits as a
+           separate right-aligned token (via `ml-auto`): right-
+           alignment whitespace is its own separator (no
+           leading `·`) and the spatial split lets the eye
+           triage left-side facts first ("how good?") then jump
+           to the identity tag.  The state word is the only
+           coloured element; timestamp + trailing detail +
+           head-id stay neutral so a row never reads as a
+           colour stripe.  `animate-pulse` rides on the state
+           word for live entries (no separate dot element). -->
     <span class="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs">
       <span
         class="shrink-0 font-medium capitalize"
@@ -296,14 +328,20 @@
       <span class="shrink-0 text-zinc-500" title={timeTitle}>
         {timeLabel}
       </span>
-      {#if trailingDetail.length > 0}
-        <span aria-hidden="true" class="shrink-0 text-zinc-300">·</span>
-      {/if}
       {#each trailingDetail as token (token)}
+        <span aria-hidden="true" class="shrink-0 text-zinc-300">·</span>
         <span class="shrink-0 font-mono text-[11px] tabular-nums text-zinc-500">
           {token}
         </span>
       {/each}
+      {#if completedHeadId}
+        <span
+          class="ml-auto shrink-0 font-mono text-[11px] tabular-nums text-zinc-500"
+          title={completedHeadId}
+        >
+          {completedHeadId.slice(0, 8)}…
+        </span>
+      {/if}
     </span>
   </button>
 

@@ -369,22 +369,29 @@
                  neutral on hover.
                - Lets the rules extend visually beyond what
                  the click target should ever include.
-             `-mb-3` lives on the WRAPPER (not the button)
-             because the wrapper is the flex-column child now.
-             It applies ONLY when the disclosure is collapsed:
-             in that branch the wrapper is the last visible
-             element of the Train section, so the same y-axis
-             imbalance the pager fixes (8 px gap-2 above, 20
-             px section `p-5` below) would otherwise show up
-             here on hover.  Pulling the section's bottom
-             inward by 12 px gives a symmetric 8 / 8 around the
-             hover bg pill.  When the disclosure is OPEN the
-             wrapper is followed by the expanded content
-             (gap-2 below), so applying `-mb-3` unconditionally
-             would overlap the toggle with the first older
-             card -- the class:directive gates it on
-             `!olderExpanded`. -->
-        <div class="flex items-center justify-center gap-2.5" class:-mb-3={!olderExpanded}>
+             `-mt-1` and the conditional `-mb-X` margins on the
+             wrapper tighten the spacing around the toggle to
+             4 / 4 around the hover bg pill (was 8 / 8 -- this
+             pager is a navigation hint, not an action that
+             warrants its own breathing room).  The top is
+             uniform: `-mt-1` pulls 4 px out of the parent
+             flex-col's `gap-2` (8 px), leaving 4 px above the
+             bg pill.  The bottom branches:
+               - Collapsed (`-mb-4`): wrapper is the last visible
+                 element of the Train section, so the 16 px pull
+                 combines with the section's 20 px bottom padding
+                 (`p-5`) to leave 4 px visible below the bg pill.
+               - Expanded (`-mb-1`): wrapper is followed by the
+                 older-runs container, so a 4 px pull reduces
+                 the parent's 8 px `gap-2` to 4 px visible.
+             Unconditional `-mb-4` would overlap the toggle with
+             the first older card when expanded, hence the
+             class:directive split. -->
+        <div
+          class="-mt-1 flex items-center justify-center gap-2.5"
+          class:-mb-4={!olderExpanded}
+          class:-mb-1={olderExpanded}
+        >
           <span class="h-px w-6 bg-zinc-200" aria-hidden="true"></span>
           <button
             type="button"
@@ -450,19 +457,15 @@
                    → auxiliary by colour alone; matching
                    footprint (px-2 py-1, text-[11px], same
                    hairline framing) keeps the two siblings.
-                   `-mb-3` on the wrapper balances the y-axis
-                   on hover without sacrificing compactness:
-                   the wrapper keeps its tight 8 px gap-2
-                   above and pulls the section's 20 px `p-5`
-                   bottom inward by 12 px, so the visible gap
-                   below the bg pill collapses to 8 px too.
-                   Symmetric 8 / 8 in the hovered state, and
-                   the section is 12 px shorter overall
-                   (compactness preserved) -- the earlier
-                   `mt-3` fix balanced by ADDING 12 px above,
-                   which got us to 20 / 20 at the cost of
-                   vertical bloat. -->
-              <div class="-mb-3 flex items-center justify-center gap-2.5">
+                   `-mt-1` + `-mb-4` on the wrapper balance the
+                   y-axis on hover at the tighter 4 / 4 budget
+                   (matching the parent "Show N older runs"
+                   toggle above): top pulls 4 px out of the
+                   parent flex-col's 8 px `gap-2`, and bottom
+                   pulls 16 px out of the section's 20 px `p-5`
+                   bottom padding -- both leaving 4 px visible
+                   around the hover bg pill. -->
+              <div class="-mt-1 -mb-4 flex items-center justify-center gap-2.5">
                 <span class="h-px w-6 bg-zinc-200" aria-hidden="true"></span>
                 <button
                   type="button"

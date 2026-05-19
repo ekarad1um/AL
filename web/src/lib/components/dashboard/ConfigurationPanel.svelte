@@ -12,7 +12,7 @@
 </script>
 
 <section class="rounded-xl border border-zinc-200 bg-white px-5 pt-3.5 pb-5 shadow-sm">
-  <header class="mb-4 flex items-baseline justify-between">
+  <header class="mb-3 flex items-baseline justify-between">
     <h2 class="text-sm font-semibold text-zinc-900">Configuration</h2>
     {#if config.error && !unavailable}
       <span class="truncate text-xs text-rose-700">{config.error}</span>

@@ -9,6 +9,49 @@ import { envelopeFromRing, pushToRing } from '$lib/audio/ring-buffer';
 // change).  The PCM ring buffer is intentionally NON-reactive: at 50 Hz +
 // 960 samples per frame, marking it $state would thrash every consumer.
 // Renderers poll snapshot() at RAF instead.
+//
+// ## On-demand lifecycle (`acquire` / refcount)
+//
+// The worker -- and therefore the daemon's two WebSocket subscriptions
+// (`/stream/audio`, `/stream/infer`) -- is gated on a refcount of
+// active consumers.  Every UI surface that reads from the streams
+// (dashboard panels, deploy-preview, InputPane stream capture)
+// calls `streams.acquire()` on mount and disposes on unmount.  The
+// store opens the worker on 0→1 and tears it down on 1→0; nothing
+// runs while no one's watching.
+//
+// Why refcount instead of always-on:
+//   - The Opus decode loop runs at ~50 Hz, each frame transferring
+//     a Float32Array via worker postMessage.  On the workspace list
+//     / detail (preview OFF, no stream-input capture) and the
+//     converter route this is pure waste -- main-thread CPU,
+//     allocator churn, and ~16 KB/s daemon-side bandwidth burnt
+//     for surfaces that never read the ring.
+//   - The 4-Hz inference stream is lighter but still pins a WS,
+//     keeps the daemon's classifier pipeline awake, and posts
+//     reactive `latestTopK` writes that re-trigger downstream
+//     $derived chains even when no panel consumes them.
+//
+// Refcount + dispose-closure form keeps the consumer side trivial:
+// `$effect(() => streams.acquire())` for unconditional mounts, or
+// `$effect(() => { if (cond) return streams.acquire(); })` for
+// gated lifetimes.  Svelte 5 runs the returned closure as the
+// effect's cleanup, so route transitions and conditional toggles
+// just work.
+//
+// Reset discipline on 1→0:
+//   - Status fields snap back to `'closed'` -- the worker is gone,
+//     anything else is misleading.
+//   - `latestTopK`, `inferenceFps`, `head`, and the FPS rolling
+//     window reset so a re-acquire doesn't surface stale numbers
+//     from a prior session.
+//   - The PCM ring is zeroed and `totalSamplesWritten` resets.
+//     The smoother auto-resets after `resetAfterMs` (250 ms) of
+//     no new samples, so its internal cursor untangles on its own
+//     -- no explicit reset call needed.
+//   - `unsupportedReason` is kept: WebCodecs availability is a
+//     browser-capability fact that doesn't change between
+//     acquires.
 
 const PCM_SAMPLE_RATE = 48_000;
 const PCM_BUFFER_SECONDS = 10;
@@ -69,7 +112,11 @@ class StreamsStore implements PcmSource {
   });
 
   private client: StreamClient | null = null;
-  private started = false;
+  // Count of live `acquire()` holders.  Worker runs while > 0.
+  // Plain field (not `$state`): consumers don't render based on
+  // refcount; they read the reactive status/topK fields, which
+  // are driven by the worker's posted messages on the live edge.
+  private refcount = 0;
   private inferenceTimes: number[] = [];
   // PCM taps fired AFTER each frame lands in the ring (so a tap can
   // read `latestSample` and see the just-pushed packet included).
@@ -79,35 +126,155 @@ class StreamsStore implements PcmSource {
   // capture.
   private readonly pcmTaps = new Set<(pcm: Float32Array) => void>();
 
-  start(): void {
-    if (this.started) return;
-    this.started = true;
-    this.client = createStreamClient();
-    this.client.audio.on(({ pcm }) => {
+  // Increment the consumer refcount.  Opens the worker (and both
+  // WebSockets) on 0→1.  Returns a dispose closure that decrements;
+  // the worker stops on 1→0.  Dispose is idempotent so callers can
+  // safely return it directly from a Svelte `$effect`:
+  //
+  //   $effect(() => streams.acquire());                          // page-scoped
+  //   $effect(() => { if (active) return streams.acquire(); });  // gated
+  //
+  // Multiple acquirers coexist: each gets its own dispose, and the
+  // worker stays alive until every one of them runs.  See the
+  // module-level docblock for the why and the reset discipline.
+  acquire(): () => void {
+    this.refcount += 1;
+    if (this.refcount === 1) this.connectClient();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.refcount -= 1;
+      if (this.refcount === 0) this.disconnectClient();
+    };
+  }
+
+  private connectClient(): void {
+    if (this.client) return;
+    // Optimistically reflect the impending connection attempt
+    // synchronously, BEFORE constructing the client.  The
+    // alternative is to let consumers paint one frame of the
+    // construction-time `'closed'` sentinel: the dashboard's
+    // panel pills, the deploy-preview pill, and InputPane's
+    // dropdown suffix would all flash a red "disconnected"
+    // for the gap between this acquire and the worker's first
+    // status post (`worker.postMessage('start')` resolves on
+    // a microtask, then the worker's `openChannel` posts back
+    // 'connecting' on another microtask).  Setting the field
+    // here makes the very same render frame that triggered
+    // acquire see the truthful "we are trying" state instead
+    // of "we gave up."
+    //
+    // Idempotent against the worker's authoritative path: the
+    // worker's first message for each channel is also
+    // `state: 'connecting'`, which is a no-op against this
+    // optimistic write.  Subsequent transitions to 'open' /
+    // 'error' / 'closed' land normally.
+    //
+    // Caveat: the WebCodecs-unsupported branch of the worker
+    // never calls `openChannel('audio')`, so without
+    // compensation the audio half would hang at our optimistic
+    // 'connecting' forever.  See `web/src/lib/stream/worker.ts`
+    // -- it now posts `state: 'closed'` for audio after the
+    // 'unsupported' message in that branch so the field flips
+    // to 'closed' the moment the worker decides not to try.
+    this.audioStatus = 'connecting';
+    this.inferStatus = 'connecting';
+    // Capture the freshly-constructed client in a local so each
+    // listener closure can verify, on every fire, that the store's
+    // `this.client` still points at the one whose Topics it
+    // registered on.  Why: `Worker.terminate()` (called inside
+    // `client.stop()` during `disconnectClient`) per the HTML
+    // spec only discards tasks queued on the WORKER's event loop;
+    // messages the worker already posted to the MAIN thread's
+    // queue still fire after terminate.  Without this gate, those
+    // stale messages emit on the old Topics, run the old listeners,
+    // and overwrite the just-reset state (ring writes from
+    // `pushPcm`, `audioStatus` flips, `latestTopK` updates, etc.).
+    // A subsequent re-acquire would then inherit stale ring data
+    // and a wrong status transition.  Comparing against the
+    // captured `client` (and not, say, against `null`) also handles
+    // the rapid disconnect → reconnect case correctly: the new
+    // session's `this.client` differs from every prior captured
+    // client, so old listeners no-op while the new ones proceed.
+    const client = createStreamClient();
+    this.client = client;
+    client.audio.on(({ pcm }) => {
+      if (this.client !== client) return;
       this.pushPcm(pcm);
     });
-    this.client.inference.on(({ top_k, head_id, head_version }) => {
+    client.inference.on(({ top_k, head_id, head_version }) => {
+      if (this.client !== client) return;
       this.latestTopK = top_k;
       if (head_id !== this.head.head_id || head_version !== this.head.head_version) {
         this.head = { head_id, head_version };
       }
       this.trackInferenceFps();
     });
-    this.client.status.on(({ channel, state }) => {
+    client.status.on(({ channel, state }) => {
+      if (this.client !== client) return;
       if (channel === 'audio') this.audioStatus = state;
       else this.inferStatus = state;
     });
-    this.client.unsupported.on((reason) => {
+    client.unsupported.on((reason) => {
+      if (this.client !== client) return;
       this.unsupportedReason = reason;
     });
-    this.client.start();
+    client.start();
   }
 
-  stop(): void {
-    if (!this.started) return;
-    this.client?.stop();
-    this.client = null;
-    this.started = false;
+  private disconnectClient(): void {
+    // Tear the worker down first when one exists.  The early-return
+    // sat at the top of this method before; moving it INSIDE so the
+    // reactive-state reset below always runs even when `client` is
+    // already null.  Two scenarios benefit:
+    //
+    //   1. A connectClient that threw between the optimistic
+    //      `audioStatus = 'connecting'` writes above and the
+    //      `client.start()` call would leave the store with status
+    //      'connecting' and `client === null`.  An unconditional
+    //      reset on the eventual dispose snaps the visible state
+    //      back to 'closed' instead of stranding consumers on the
+    //      optimistic flag.
+    //   2. A double-call defends against a refactor where this
+    //      method might be invoked from a new path (e.g., a
+    //      hypothetical `forget()` analog).  Idempotent resets
+    //      cost nothing -- the `$state` setter is a Object.is no-op
+    //      when the value already matches.
+    if (this.client) {
+      this.client.stop();
+      this.client = null;
+    }
+    // Snap reactive state back to "no live stream".  Leaving the
+    // last-observed values would be misleading: a "Top-K" list
+    // rendered without a worker behind it implies "this is what's
+    // firing right now," and an `audioStatus = 'open'` suggests
+    // a live WS that no longer exists.  Resetting also means a
+    // subsequent re-acquire starts fresh -- no first-frame ghost
+    // of pre-disconnect numbers.  Status fields land at the same
+    // sentinel they hold on first construction so consumers can't
+    // tell "never acquired" from "released" -- both legitimately
+    // mean "no stream behind this surface right now."
+    this.audioStatus = 'closed';
+    this.inferStatus = 'closed';
+    this.latestTopK = [];
+    this.inferenceFps = 0;
+    this.head = { head_id: null, head_version: null };
+    this.inferenceTimes.length = 0;
+    // Zero the PCM ring + counters so a visualizer mounting after
+    // re-acquire (`renderCursor` reads `totalSamplesWritten`)
+    // doesn't paint the pre-disconnect tail before the worker's
+    // first new packet lands.  The smoother auto-resets after
+    // `resetAfterMs` (250 ms) of no fresh samples so its internal
+    // cursor settles on its own.
+    this.ring.fill(0);
+    this.writeIdx = 0;
+    this.totalSamplesWritten = 0;
+    // `unsupportedReason` deliberately persists: WebCodecs
+    // availability is a browser-capability fact that doesn't
+    // change across acquire cycles, and the dashboard's banner
+    // should still surface it on the next mount without waiting
+    // for the worker to re-announce.
   }
 
   // Most-recent `samples` PCM values.  Pass `out` to write in-place and

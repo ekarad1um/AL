@@ -10,7 +10,17 @@ import { decodeEnvelope, type TopK } from './proto';
 // (the daemon disconnects clients that lag > 64 frames).
 
 const SUBPROTOCOL = 'acoustics';
-const RECONNECT_MIN_MS = 200;
+// Initial reconnect delay after a WS close.  Doubles on each successive
+// failure up to RECONNECT_MAX_MS; resets to MIN on a successful onopen.
+// MIN was 200 ms originally -- too aggressive: under a steady WS reject
+// (daemon up but `/stream/audio` failing) the first ~5 retries fire in
+// well under 10 s, each posting a `status` message to the main thread
+// that re-renders the deploy preview's pill.  1 s gives the daemon a
+// realistic window to come back without flooding the main thread.
+// Most daemon restarts take ≥ 1 s anyway, so the recovery latency
+// regression is negligible; the cap at 5 s is unchanged so persistent
+// outages settle into the same long-tail cadence.
+const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 5_000;
 const OPUS_SAMPLE_RATE = 48_000;
 
@@ -68,6 +78,15 @@ function start(): void {
       reason:
         'WebCodecs AudioDecoder is unavailable in this browser. Live audio playback will not work.'
     });
+    // The audio channel never gets `openChannel`'d in this branch
+    // (no decoder to feed), so explicitly post `closed` for it so
+    // the main thread's optimistic 'connecting' state -- set
+    // synchronously inside `streams.connectClient` to avoid a
+    // first-frame "disconnected" flash -- flips back to the
+    // truthful "we won't try" sentinel.  Without this, audioStatus
+    // would hang at 'connecting' forever and the dashboard's
+    // VisualizationPanel pill would read amber indefinitely.
+    post({ type: 'status', channel: 'audio', state: 'closed' });
     // Inference still works without the audio decoder.
     openChannel('infer');
     return;

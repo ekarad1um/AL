@@ -3,6 +3,25 @@
   import VisualizationPanel from '$lib/components/dashboard/VisualizationPanel.svelte';
   import InferencePanel from '$lib/components/dashboard/InferencePanel.svelte';
   import ConfigurationPanel from '$lib/components/dashboard/ConfigurationPanel.svelte';
+
+  // The dashboard is the canonical streams consumer: every panel
+  // below reads either the PCM ring (Waveform/Spectrogram) or the
+  // reactive top-k / fps fields (Inference panel).  Acquiring at
+  // the page level (rather than from each panel) keeps the worker
+  // alive across the panels' independent mount cycles and tears it
+  // down on route exit.  Returning the dispose closure directly
+  // from the effect lets Svelte 5 run it as cleanup on destroy.
+  //
+  // `$effect.pre` (not plain `$effect`): the panel pills below
+  // (VisualizationPanel's `audioStatus`, InferencePanel's
+  // `inferStatus`) read the status fields synchronously during
+  // their first render.  With post-DOM `$effect`, the children
+  // would paint one frame of "disconnected" red before this
+  // effect fires `acquire()` → `connectClient()` and the
+  // optimistic `'connecting'` write reaches them on the next
+  // flush.  `$effect.pre` runs BEFORE the children mount, so
+  // status is already `'connecting'` by the time the pills paint.
+  $effect.pre(() => streams.acquire());
 </script>
 
 {#if streams.unsupportedReason}

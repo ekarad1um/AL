@@ -19,6 +19,7 @@
   // Input Module + Slice Management; backend slice sync.
   import CategoryList from '$lib/components/category/CategoryList.svelte';
   import { slices } from '$lib/stores/slices.svelte';
+  import { categories } from '$lib/stores/categories.svelte';
   import { WorkspacePoller } from '$lib/stores/workspace-poller';
   // Training surface (Slice C): submit + live progress + heads
   // management.  Lives below the dataset accordion so the
@@ -60,26 +61,38 @@
     // Stop any prior poller before the await so a stale tick
     // can't land on the new workspace's `detail` mid-swap.
     poller.stop();
+
+    // Fire every workspace-mount read that doesn't depend on
+    // `detail` BEFORE awaiting the detail GET.  The detail only
+    // carries name, revision, and the heads list -- none of these
+    // three reads consumes any of that, so serialising them behind
+    // the await was pure latency.  Running them concurrently
+    // collapses time-to-history-visible and time-to-categories-
+    // visible from sequential-sum into max-of-RTT.
+    //
+    // All three are fire-and-forget into reactive stores:
+    //   - `recover` lists running training jobs; binds the SSE
+    //     subscriber if one is already running.
+    //   - `hydrateHistory` lists training_logs/ and parallel-
+    //     fetches the eager top-2 JSONLs.
+    //   - `categories.refresh` GETs /assets/datasets and merges
+    //     with IDB-resident operator-added rows.  CategoryList's
+    //     own mount $effect still calls refresh too; the store's
+    //     in-flight + loaded guards coalesce the duplicate so no
+    //     extra HTTP round-trip lands.
+    //
+    // Each path swallows its own transport errors (logged to
+    // console / surfaced via store error slots).  Pre-firing
+    // doesn't expand the failure surface here -- the detail catch
+    // below remains the only path that affects the page's
+    // notFound / error states.
+    void trainingStore.recover(id);
+    void trainingStore.hydrateHistory(id);
+    void categories.refresh(id);
+
     try {
       detail = await wsApi.get(id);
       lastId = id;
-      // Training store carries workspace-scoped terminal slots
-      // and may have stale state from a prior visit (e.g. the
-      // operator navigated away after a failed run, then
-      // returned).  Recovery picks up any actively-running job
-      // for this workspace; the terminal slot stays as-is so
-      // the operator sees their last verdict.  `recover` is
-      // a no-op if the active slot is already bound.
-      void trainingStore.recover(id);
-      // Persistent history hydration: list the workspace's
-      // `training_logs/` directory and replay the top
-      // `INITIAL_VISIBLE` (=2) JSONL files into history
-      // cards.  Idempotent across mount cycles; subsequent
-      // calls for the same workspace short-circuit without a
-      // network round-trip.  Fires concurrently with
-      // `recover()`; the store's active-slot guard prevents
-      // double-tracking a still-running job.
-      void trainingStore.hydrateHistory(id);
       // Begin polling for this workspace.  Detail re-binds on
       // every successful tick; `liveRevision` derives from it +
       // the slices store, so the chip updates automatically.

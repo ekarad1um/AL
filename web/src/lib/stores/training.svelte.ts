@@ -414,6 +414,25 @@ class TrainingStore {
   // within the session.  Reset on `forget(ws)`.
   private olderExpandedByWs = new SvelteMap<Uuid, boolean>();
 
+  // In-flight `recover` Promises per workspace.  Plain `Map`
+  // (not SvelteMap): no UI surface tracks this -- it's purely
+  // a concurrency-coalescing handle so two callsites that fire
+  // `recover(id)` at almost the same instant share one
+  // `GET /workspace/{id}/training` round-trip rather than
+  // racing parallel requests.  Practically this fires on
+  // workspace-detail mount: the page's `load()` kicks recover
+  // off in parallel with the workspace detail GET, and
+  // `TrainPane.onMount` then fires its own redundant recover
+  // as a safety net (in case the page surface ever mounts
+  // without going through `load`).  The pre-existing
+  // `this.active !== null` guard only covers the post-await
+  // case; without this Promise dedup both calls enter the
+  // await and the daemon sees two GETs.  Cleared on settle so
+  // a subsequent recover (e.g. a long session that observes
+  // the active slot freeing via terminal) still hits the
+  // network.
+  private recoveringByWs = new Map<Uuid, Promise<void>>();
+
   // Read the entire history list for one workspace, newest-
   // first.  Returns an empty array when no terminal jobs are
   // pinned for the workspace.  The TrainPane renders this
@@ -513,8 +532,30 @@ class TrainingStore {
   // our use case (running = workspace_id present), but the
   // training-specific endpoint is more direct + carries the
   // job's `started_at` snapshot for free.
+  //
+  // Coalesces concurrent callers via `recoveringByWs`: the
+  // workspace-detail page's `load()` fires recover in parallel
+  // with the detail GET, and `TrainPane.onMount` (firing a
+  // tick or two later, once the detail render has resolved)
+  // would otherwise enter the await on a separate
+  // `trainingApi.list` call before the first one's
+  // `this.active = ...` write lands.  The pre-await
+  // `this.active !== null` guard catches the second caller
+  // only if the first has finished -- not if the two are both
+  // mid-await.  An in-flight Promise dedup deduplicates the
+  // HTTP request itself, not just the post-resolve write.
   async recover(workspaceId: Uuid): Promise<void> {
     if (this.active !== null) return;
+    const inflight = this.recoveringByWs.get(workspaceId);
+    if (inflight) return inflight;
+    const p = this.doRecover(workspaceId).finally(() => {
+      this.recoveringByWs.delete(workspaceId);
+    });
+    this.recoveringByWs.set(workspaceId, p);
+    return p;
+  }
+
+  private async doRecover(workspaceId: Uuid): Promise<void> {
     let jobs: TrainingJobView[] = [];
     try {
       jobs = await trainingApi.list(workspaceId);
@@ -1059,6 +1100,17 @@ class TrainingStore {
     this.hydratingByWs.delete(workspaceId);
     this.loadingMoreByWs.delete(workspaceId);
     this.olderExpandedByWs.delete(workspaceId);
+    // Drop any in-flight recover Promise reference.  The Promise
+    // itself can't be aborted (`trainingApi.list` doesn't take a
+    // signal) so the round-trip still resolves -- but its
+    // post-await `this.active = ...` write either no-ops (the
+    // daemon's listing returned empty / 404 because the
+    // workspace is gone) or binds a freshly-orphaned active slot
+    // we'll have to deal with on the next mount.  Removing the
+    // entry from the map at least frees the slot so a re-mount
+    // of the same id can fire a fresh recover without coalescing
+    // onto the orphaned Promise.
+    this.recoveringByWs.delete(workspaceId);
     clearLegacyHiddenStorage(workspaceId);
   }
 

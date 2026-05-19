@@ -3,7 +3,6 @@
   import { onDestroy, type Snippet } from 'svelte';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
-  import { streams } from '$lib/stores/streams.svelte';
   import { health } from '$lib/stores/health.svelte';
   import { config } from '$lib/stores/config.svelte';
   import HealthBadge from '$lib/components/HealthBadge.svelte';
@@ -73,15 +72,34 @@
     };
   });
 
+  // Throttle ref for the auto-reconnect $effect below.  Plain `let`
+  // (not `$state`) so writes don't re-fire the effect -- if this
+  // were reactive, scheduling the timer would itself re-enter the
+  // effect and defeat the whole purpose.  Cleared on recovery,
+  // on health-unreachable transitions, and on component destroy.
+  let pendingRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  const RETRY_THROTTLE_MS = 2_000;
+
   // Bootstrap at script level (not onMount): children's onMount fires
-  // bottom-up so a parent onMount wouldn't have streams ready when the
-  // canvases mount.  ssr=false in +layout.ts keeps this browser-only.
-  streams.start();
+  // bottom-up so a parent onMount wouldn't have these stores ready
+  // when the canvases / poller / etc mount.  ssr=false in +layout.ts
+  // keeps this browser-only.
+  //
+  // Streams are NOT started here.  The opus + inference WebSockets
+  // are gated on `streams.acquire()` refcount; pages that need them
+  // (dashboard, deploy-preview, InputPane stream capture) acquire on
+  // mount and dispose on unmount.  Routes that never read the live
+  // stream (workspace list, converter, workspace-detail with preview
+  // off + no stream-input) no longer burn the worker's ~50 Hz Opus
+  // decode loop + 16 KB/s daemon bandwidth.
   health.start();
   void config.refresh();
   onDestroy(() => {
-    streams.stop();
     health.stop();
+    if (pendingRefreshTimer !== null) {
+      clearTimeout(pendingRefreshTimer);
+      pendingRefreshTimer = null;
+    }
   });
 
   // Auto-reconnect REST config when the daemon comes back up.  Health
@@ -92,12 +110,45 @@
   // refresh.  `unhealthy` is a reachable state (subsystem fault, not
   // transport) so it must also retry config.  WS streams reconnect via
   // the worker's own backoff.
+  //
+  // Throttled to one attempt per RETRY_THROTTLE_MS.  Previously every
+  // failed `config.refresh` mutated `config.error`, which re-triggered
+  // this effect synchronously, which called `refresh` again -- and
+  // when the daemon was failing fast (4xx returns at ~50-200 ms RTT)
+  // the loop spun at network speed, pinning the browser thread with
+  // config-store mutations + Svelte re-renders.  The same loop fires
+  // after any user action that goes through `config.guard` (deploy a
+  // head, set mic policy, set inference cadence) because the guard
+  // also sets `config.error`.  setTimeout-based throttle queues
+  // retries with a 2 s floor and cancels the pending timer when the
+  // error clears (manual recovery) or the daemon becomes unreachable
+  // (no point retrying).  The schedule is idempotent: a re-fire while
+  // a timer is pending no-ops rather than double-scheduling, so a
+  // rapidly-changing error message (e.g. "msg1" → "msg2") still
+  // respects the original wait window.
   $effect(() => {
     const level = health.level;
     const reachable = level === 'ok' || level === 'degraded' || level === 'unhealthy';
-    if (reachable && config.error !== null) {
-      void config.refresh();
+
+    if (!reachable || config.error === null) {
+      // Recovered or unreachable: cancel any pending retry.  A late
+      // timer firing after recovery would run a redundant refresh;
+      // after unreachable, refresh would fail and re-enter the loop.
+      if (pendingRefreshTimer !== null) {
+        clearTimeout(pendingRefreshTimer);
+        pendingRefreshTimer = null;
+      }
+      return;
     }
+
+    // Already throttled — don't double-schedule.  Holds the original
+    // wait window across mid-flight error-message updates.
+    if (pendingRefreshTimer !== null) return;
+
+    pendingRefreshTimer = setTimeout(() => {
+      pendingRefreshTimer = null;
+      void config.refresh();
+    }, RETRY_THROTTLE_MS);
   });
 </script>
 

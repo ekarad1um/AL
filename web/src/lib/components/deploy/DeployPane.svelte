@@ -148,7 +148,21 @@
 </script>
 
 <section class="rounded-xl border border-zinc-200 bg-white px-5 pt-3.5 pb-5 shadow-sm">
-  <header class="mb-4 flex items-start justify-between gap-3">
+  <!-- `items-center` (NOT `items-start`) anchors the right-side
+       StatusBadge to the title block's vertical centroid.  Matches
+       the workspace + dashboard section-header convention used by
+       TrainPane (see its comment for the load-bearing two-line
+       subtitle case), ActiveHeadCard, InferencePanel, and
+       VisualizationPanel; deploy was the lone `items-start`
+       outlier.  The fix matters because `items-start` pinned the
+       badge to y=0 of the header while the heading's cap glyph
+       sits ~4.4 px below the line-box top at text-sm (descender
+       allocation reserved in the line-box).  Visually the badge
+       had ~4 px less whitespace above it than the heading text
+       did, reading as "badge floats high" against the title block.
+       items-center also keeps the badge centred when the
+       description wraps to two lines on narrow viewports. -->
+  <header class="mb-3 flex items-center justify-between gap-3">
     <div class="min-w-0">
       <h2 class="text-sm font-semibold text-zinc-900">Deploy</h2>
       <p class="mt-0.5 text-xs text-zinc-500">Hot-swap a trained head into live inference.</p>
@@ -169,18 +183,22 @@
        narrow viewports keep both surfaces fully usable (the preview
        is opt-in regardless, but its placeholder is still legible
        below the heads table on mobile).  Both cells pin to `h-80`
-       (320 px / 20 rem) -- matches the dataset accordion's
-       `min-h-80` floor so the three workspace sections (dataset,
-       train, deploy) share a single height rhythm.  Deliberately
-       shorter than the dashboard's `--vis-panel-h` (434 px): the
-       deploy pane is an action surface (deploy a head, glance at
-       the result), not a monitoring surface, so the compact
-       budget reflects the lower visual-density need.  HeadsTable
-       + InferencePreview each own a `<section>` inside that uses
-       `h-full` to fill the cell.  Same contract the dataset
-       accordion uses for InputPane + SlicePane: the parent sets
-       row width / height, the panes own their own chrome. -->
-  <div class="mb-4 grid grid-cols-1 gap-4 lg:grid-cols-5">
+       (320 px / 20 rem) -- sized to fit the heads pane's typical
+       operating point (cap=3 heads + 1 default fallback row,
+       ~274 px of list content under line-height 1.5) flush with
+       the scroller body, with ~3 px of sub-pixel headroom.
+       Matches the dataset accordion's `min-h-80` floor so the
+       three workspace sections (dataset, train, deploy) share a
+       single height rhythm.  Deliberately shorter than the
+       dashboard's `--vis-panel-h` (434 px): the deploy pane is an
+       action surface (deploy a head, glance at the result), not a
+       monitoring surface, so the compact budget reflects the
+       lower visual-density need.  HeadsTable + InferencePreview
+       each own a `<section>` inside that uses `h-full` to fill
+       the cell.  Same contract the dataset accordion uses for
+       InputPane + SlicePane: the parent sets row width / height,
+       the panes own their own chrome. -->
+  <div class="mb-3 grid grid-cols-1 gap-3 lg:grid-cols-5">
     <!-- 3/5 width for the heads list at lg+: the headroom matters
          because each row has two trailing buttons (Deploy / Delete)
          that wrap on narrow widths.  Preview is 2/5 -- enough for

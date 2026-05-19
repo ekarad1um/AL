@@ -42,6 +42,14 @@
   }
   let { workspaceId, heads, liveRevision, onchanged }: Props = $props();
 
+  // Frontend mirror of the daemon's `MAX_HEADS_PER_WORKSPACE`
+  // (modules/common/workspace.rs).  Surfaced inline next to the
+  // heads count so the operator sees the sliding-window rotation
+  // cap without diving into docs ("3 heads, latest 3 retained").
+  // No API endpoint exposes this cap today, so it's hard-coded
+  // here -- bump in lockstep if the daemon's cap ever changes.
+  const HEAD_HISTORY_CAP = 3;
+
   const active = $derived(configStore.active);
   // Active head id when origin = 'head' AND the source workspace is
   // *this* workspace.  Drives the row's blue tint + the row's button-
@@ -284,13 +292,50 @@
 <section
   class="flex h-full min-h-0 flex-col overflow-hidden rounded-md border border-zinc-200 bg-white px-3 pt-1.5 pb-3"
 >
-  <!-- Header rhythm matches InputPane / SlicePane: `min-h-4.75`
-       (19 px) locks the heading-row height even when the revert
-       button is absent so the heads card and the preview card
-       carry the same heading-bottom strip across the side-by-side
-       row.  `mb-1.5` is the standard pane-header → body gap. -->
-  <header class="mb-1.5 flex min-h-4.75 items-center justify-between gap-1.5">
-    <div class="flex items-baseline gap-1.5">
+  <!-- Header rhythm: `min-h-5.25` (21 px) + `mb-1` (4 px) -- a
+       deliberate variance from the other panes' `min-h-4.75`
+       (19 px) + `mb-1.5` (6 px) pattern.  The reason: the
+       optional revert button uses `text-[10px] py-0.5 border`
+       which, under Tailwind preflight's inherited unitless
+       `line-height: 1.5`, has a natural height of 21 px
+       (line-box 15 + py 4 + border 2).  At `min-h-4.75` the
+       header was 19 px headless and 21 px with the button,
+       reflowing the scroller by 2 px the moment the button
+       mounted and tipping the cap=3 + default fallback list
+       (~274 px) past the scroller's 275 px capacity.
+       Pinning `min-h-5.25` locks the header at 21 px in both
+       states so the button mount no longer reflows anything.
+       `mb-1` exactly offsets the +2 px in min-h so the section's
+       header+mb total stays at 25 px (was 19+6, now 21+4),
+       which preserves the scroller's original 277 px capacity
+       and the comfortable ~3 px headroom over the list.  The
+       h4 baseline shifts down ~1 px relative to InputPane /
+       SlicePane (cross-pane "welded baseline" comment in
+       InputPane.svelte) but those panes are vertically stacked
+       elsewhere on the page, not side-by-side with this one,
+       so the divergence is imperceptible in practice. -->
+  <header class="mb-1 flex min-h-5.25 items-center justify-between gap-1.5">
+    <!-- `translate-y-px` on the heading cluster: optical-centre
+         correction shared by all four pane-level headings (this
+         pane + InferencePreview + InputPane + SlicePane).
+         `items-center` geometrically centres the ~13.2 px line-box
+         in the 19 px header, but the cap glyph of `text-[11px]
+         uppercase` sits ~0.55 px above line-box centre (descender
+         allocation is reserved in the line-box even for uppercase,
+         so the bottom half of the line-box is ~1.1 px taller than
+         the top half).  Uncorrected, the heading reads as
+         "floating high" with more whitespace below than above;
+         the neighbouring button reads as balanced because its
+         border masks the same internal bias.  Round to integer-px
+         for crispness across DPIs (matches +page.svelte's
+         translate-y-0.5 at text-lg precedent); 1 px overshoots
+         the ideal ~0.7 px by ~0.3 px, but the residual is below
+         the perceptual threshold while the uncorrected bias is
+         the visible defect.  Cross-pane: shifting only the deploy
+         headings would break the "h4 baselines welded cross-pane"
+         contract noted in InputPane.svelte; all four panes carry
+         the same shift to preserve the weld. -->
+    <div class="flex translate-y-px items-baseline gap-1.5">
       <h4 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">Heads</h4>
       <!-- Count reading in the dashboard meta-text idiom: plain
            muted text, no chip chrome.  Borders + bg are reserved
@@ -300,22 +345,47 @@
            / "1 head") so the value carries its own unit even when
            detached from the heading by a baseline shift on a
            wrapping viewport.  `tabular-nums` keeps the digit
-           column stable as the count ticks. -->
+           column stable as the count ticks.  Trailing ", latest
+           N retained" surfaces the daemon's sliding-window
+           rotation cap inline so the operator sees the retention
+           policy without diving into docs -- N is HEAD_HISTORY_CAP
+           (script preamble) which mirrors the daemon's
+           `MAX_HEADS_PER_WORKSPACE`. -->
       <span class="text-[10px] text-zinc-400 tabular-nums">
         {heads.length}
-        {heads.length === 1 ? 'head' : 'heads'}
+        {heads.length === 1 ? 'head' : 'heads'}, latest {HEAD_HISTORY_CAP} retained
       </span>
     </div>
     {#if showRevert && revertLabel}
       <!-- Revert affordance in the SlicePane toolbar-button idiom
-           (px-1.5 py-0.5 text-[10px]) so the header chrome sits
-           inside the 19 px min-height without forcing the row
-           taller. -->
+           (px-1.5 py-0.5 text-[10px]).  `leading-tight`
+           (line-height 1.25) tightens the line-box from 15 →
+           12.5 px and the button height from natural 21 → 18.5 px.
+           In the 21 px header, items-center then yields ~1.25 px
+           of whitespace on the button's top + bottom -- the prior
+           21 px button was edge-to-edge in the header (0 px each
+           side) while the heading floated in the middle with
+           uneven whitespace above / below its glyph, so the
+           button read as pinned to the section card's vertical
+           edges.  Symmetric outside spacing now matches the
+           heading's centered feel.
+           No translate-y on the label: the natural line-box
+           descender allocation puts the cap glyph ~0.5 px above
+           the button's centre with ~1 px more whitespace below
+           than above the glyph -- the reader's eye reads this
+           asymmetry as "how text always renders" because it's
+           the universal text-rendering bias, not a defect.  A 1 px
+           shift down would land the glyph ~0.5 px below centre
+           (more whitespace above), which reads as unnaturally
+           "low in the button" -- the cure was worse than the
+           disease.  A sub-pixel translate-y-[0.5px] would
+           technically optical-centre the glyph but renders soft
+           on 1× DPI without a perceptible win on Retina. -->
       <button
         type="button"
         onclick={revert}
         disabled={interactionBlocked}
-        class="inline-flex shrink-0 items-center rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 transition duration-200 ease-out hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-60"
+        class="inline-flex shrink-0 items-center rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[10px] leading-tight font-medium text-zinc-700 transition duration-200 ease-out hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-60"
         title="Re-deploy the previously running head"
       >
         {revertLabel}

@@ -965,8 +965,15 @@
       <!-- Heading + Tips clustered so the popover trigger reads
            as part of the title.  Tips is hidden in selecting mode
            (where the toolbar replaces the heading) to avoid
-           competing with the Delete / Select buttons. -->
-      <div class="flex items-center gap-1.5">
+           competing with the Delete / Select buttons.
+           `translate-y-px`: optical-centre correction shared by
+           all four pane-level headings (this pane + InputPane +
+           HeadsTable + InferencePreview).  Full rationale lives
+           in HeadsTable.svelte's header comment.  Only applied
+           in normal mode -- selecting-mode's toolbar is composed
+           of bordered buttons that mask their own internal bias,
+           so they're balanced without correction. -->
+      <div class="flex translate-y-px items-center gap-1.5">
         <h4 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">Slices</h4>
         <Tips label="Slice module tips">
           <ul class="space-y-1.5">

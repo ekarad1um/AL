@@ -252,6 +252,41 @@
   let selectedKey = $state<string>(untrack(() => initialSaved?.id ?? ''));
   const selectedSource = $derived<InputSource>(asSource(selectedKey));
 
+  // Acquire a streams refcount whenever the operator has the daemon
+  // opus stream selected as the input source.  Intent-driven, not
+  // mount-driven: an InputPane mounted with `selectedSource.kind ===
+  // 'mic'` does NOT spin up the worker -- the mic-source path
+  // doesn't read from the streams ring at all.  Picking stream from
+  // the dropdown (or restoring it from localStorage on first mount)
+  // flips the effect into the acquire branch; switching back to mic
+  // flips it back, running the dispose closure as cleanup.
+  //
+  // Hold lasts ACROSS the streaming op itself -- `startStream` /
+  // `stopStream` only manage the per-recording tap, not the worker's
+  // lifetime.  This way an operator who picks stream, hovers over
+  // Record without clicking, then waits for the socket to open, sees
+  // the live status flow correctly in the dropdown's option label.
+  //
+  // `selectedSource` is a $derived re-evaluated on every
+  // `selectedKey` change.  The effect tracks `selectedSource.kind`
+  // (a primitive read), so a kind flip ('mic' ↔ 'stream') is the
+  // only thing that re-fires the effect; re-deriving to the same
+  // kind (e.g. operator picks a different mic device) is a no-op.
+  //
+  // `$effect.pre` (not plain `$effect`): the dropdown's
+  // `streamOptionLabel` $derived reads `streams.audioStatus`
+  // synchronously when `selectedSource.kind` flips to 'stream'.
+  // With post-DOM `$effect`, the dropdown's first re-render after
+  // the flip would compute the label against the previous
+  // 'closed' status -- showing "Daemon opus stream · disconnected"
+  // for one frame before this effect fires and the optimistic
+  // 'connecting' write re-derives the label.  $effect.pre runs
+  // before the DOM commits the re-render, so the status is
+  // already 'connecting' when the label is computed.
+  $effect.pre(() => {
+    if (selectedSource.kind === 'stream') return streams.acquire();
+  });
+
   // Persist the current selection, capturing the active device's
   // label + groupId when the enumeration is labeled.  Re-fires on
   // `selectedKey`, `audioInputs`, and `initialSaved` (the last
@@ -1337,7 +1372,7 @@
   // state visually too.  `recordTitle` is `undefined` for the
   // mic source (no useful tooltip to add beyond the aria-label);
   // for the stream source it carries either the auto-stop hint
-  // (open) or a recovery hint (not open).
+  // (open) or a status-aware recovery hint (not open).
   const recordDisabled = $derived(isBusy || (selectedSource.kind === 'stream' && !canStream));
   const recordAriaLabel = $derived(
     selectedSource.kind === 'stream'
@@ -1348,16 +1383,26 @@
     selectedSource.kind === 'stream'
       ? canStream
         ? `Capture the live opus stream (auto-stops at ${formatDurationHuman(streamMaxDurationMs)}).`
-        : 'Stream is not connected. Open the Dashboard or wait for the daemon to come back online.'
+        : streams.audioStatus === 'connecting'
+          ? 'Daemon opus stream is connecting; recording will be available once it opens.'
+          : 'Daemon opus stream is unreachable; check the daemon is running.'
       : undefined
   );
   // Stream option in the source dropdown.  Suffix the label with
-  // the socket status -- but only when non-'open', so the default
-  // "ready" state stays terse.  `SOCKET_LABEL` is the same socket-
-  // pill vocabulary the dashboard uses, kept consistent so the
-  // operator sees the same status words on both surfaces.
+  // the socket status -- but only when this pane is actively
+  // holding the streams refcount (= stream is currently selected
+  // as the source).  When mic is selected the worker isn't
+  // running and `streams.audioStatus` reads its construction-time
+  // 'closed' sentinel, which is NOT a real probe result -- showing
+  // "· Disconnected" in that case would imply the daemon stream
+  // is broken when in fact we simply haven't asked the worker to
+  // try connecting.  Plain label in that branch matches the
+  // on-demand model: the operator picks stream, then sees the
+  // live connection state.
   const streamOptionLabel = $derived(
-    canStream ? 'Daemon opus stream' : `Daemon opus stream · ${SOCKET_LABEL[streams.audioStatus]}`
+    selectedSource.kind !== 'stream' || canStream
+      ? 'Daemon opus stream'
+      : `Daemon opus stream · ${SOCKET_LABEL[streams.audioStatus]}`
   );
 
   const displayName = $derived(prettyCategoryName(categoryName));
@@ -1470,8 +1515,18 @@
          16.5 px line-box.  Outer header `items-center min-h-4.75`
          (19 px) shares its mechanism with SlicePane's pill-driven
          natural height — same layout MODE on both panes keeps the
-         two h4 baselines welded cross-pane. -->
-    <div class="flex items-center gap-1.5">
+         two h4 baselines welded cross-pane.
+         `translate-y-px` on the cluster: optical-centre correction
+         shared by all four pane-level headings (this pane +
+         SlicePane + HeadsTable + InferencePreview).  Full rationale
+         in HeadsTable.svelte; the short version: `items-center`
+         geometrically centres the line-box, but the cap glyph
+         sits ~0.55 px above line-box centre (descender allocation
+         reserved even for uppercase), so heading whitespace below
+         exceeds whitespace above by ~1.1 px.  1 px integer shift
+         is the round-to-device-pixel value; carries identically
+         across the four panes to preserve the welded baseline. -->
+    <div class="flex translate-y-px items-center gap-1.5">
       <h4 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">Input</h4>
       <Tips label="Input module tips">
         <ul class="space-y-1.5">

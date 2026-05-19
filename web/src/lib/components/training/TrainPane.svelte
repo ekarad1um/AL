@@ -419,7 +419,7 @@
        vertical centroid so it remains visually balanced with
        both the title and the subtitle when the subtitle wraps
        to two or more lines. -->
-  <header class="mb-4 flex items-center justify-between gap-3">
+  <header class="mb-3 flex items-center justify-between gap-3">
     <div class="min-w-0">
       <h2 class="text-sm font-semibold text-zinc-900">Train</h2>
       <p
@@ -500,7 +500,7 @@
        override").  Same `grid-template-rows: 0fr ↔ 1fr` trick
        so the form panel mounts once and animates open/close
        without losing operator-typed values. -->
-  <div class="mb-4 rounded-md border border-zinc-200 bg-zinc-50/60">
+  <div class="mb-3 rounded-md border border-zinc-200 bg-zinc-50/60">
     <button
       type="button"
       onclick={() => (settingsOpen = !settingsOpen)}

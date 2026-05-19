@@ -236,66 +236,72 @@
         clip-rule="evenodd"
       />
     </svg>
-    <!-- Name + delete cluster.  Grouping the destructive action
-         next to its target reads as "thing + how to remove it";
-         the badge sits alone at the row's right edge.  `flex-1
-         min-w-0` lets the h3 truncate while the button stays
-         fixed-size. -->
-    <div class="flex min-w-0 flex-1 items-center gap-2">
-      <h3 class="min-w-0 truncate text-sm font-medium text-zinc-900" title={category.name}>
-        {display}
-      </h3>
-      <!-- Hover-revealed delete.  `opacity-0 + pointer-events-none`
-           at rest with a 200 ms fade-in on `group-hover/row` /
-           `focus-visible` keeps the resting row chrome-free without
-           losing the keyboard path; the right-click ContextMenu in
-           CategoryList wires the same DeleteCategoryDialog for the
-           touch/non-hover entry.  Mandatory categories
-           (`_background_noise_`) render a disabled stub with a
-           diagonal slash so the rhythm survives and the tooltip
-           explains why. -->
-      {#if !isDeleting}
-        <button
-          type="button"
-          onclick={onDeleteClick}
-          disabled={isMandatory}
-          aria-disabled={isMandatory}
-          class="pointer-events-none inline-flex shrink-0 items-center justify-center rounded-md p-1 opacity-0 transition duration-200 ease-out group-hover/row:pointer-events-auto group-hover/row:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-rose-200 focus-visible:outline-none"
-          class:cursor-not-allowed={isMandatory}
-          class:text-zinc-200={isMandatory}
-          class:text-zinc-300={!isMandatory}
-          class:hover:bg-rose-50={!isMandatory}
-          class:hover:text-rose-600={!isMandatory}
-          aria-label={isMandatory
-            ? `${display} is required and cannot be deleted`
-            : `Delete category ${display}`}
-          title={isMandatory
-            ? 'Background Noise is required and cannot be deleted'
-            : 'Delete category'}
+    <!-- Name fills the row.  `flex-1 min-w-0` lets it truncate
+         while the delete button + status badge stay shrink-0 at
+         the right edge -- the two together form one
+         actions-and-status cluster, so delete keeps a predictable
+         position relative to the always-visible badge instead of
+         floating mid-row next to a variable-width title. -->
+    <h3
+      class="min-w-0 flex-1 truncate text-sm font-medium text-zinc-900"
+      title={category.name}
+    >
+      {display}
+    </h3>
+    <!-- Hover-revealed delete, right-aligned just left of the
+         status badge.  `opacity-0 + pointer-events-none` at rest
+         with a 200 ms fade-in on `group-hover/row` /
+         `focus-visible` keeps the resting row chrome-free without
+         losing the keyboard path.  On coarse-pointer devices
+         (touch screens) hover never fires and the right-click
+         ContextMenu in CategoryList isn't reachable either, so
+         `pointer-coarse:` pins the button visible + interactive
+         there -- otherwise touch operators have no affordance to
+         delete a category at all.  Mandatory categories
+         (`_background_noise_`) render a disabled stub with a
+         diagonal slash so the rhythm survives and the tooltip
+         explains why. -->
+    {#if !isDeleting}
+      <button
+        type="button"
+        onclick={onDeleteClick}
+        disabled={isMandatory}
+        aria-disabled={isMandatory}
+        class="pointer-events-none inline-flex shrink-0 items-center justify-center rounded-md p-1 opacity-0 transition duration-200 ease-out group-hover/row:pointer-events-auto group-hover/row:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-rose-200 focus-visible:outline-none pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+        class:cursor-not-allowed={isMandatory}
+        class:text-zinc-200={isMandatory}
+        class:text-zinc-300={!isMandatory}
+        class:hover:bg-rose-50={!isMandatory}
+        class:hover:text-rose-600={!isMandatory}
+        aria-label={isMandatory
+          ? `${display} is required and cannot be deleted`
+          : `Delete category ${display}`}
+        title={isMandatory
+          ? 'Background Noise is required and cannot be deleted'
+          : 'Delete category'}
+      >
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          class="h-3.5 w-3.5"
+          aria-hidden="true"
         >
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="h-3.5 w-3.5"
-            aria-hidden="true"
-          >
-            <path d="M3 6h18" />
-            <path d="M8 6V4h8v2" />
-            <path d="M19 6l-1 14H6L5 6" />
-            {#if isMandatory}
-              <!-- Prohibition slash over the trash glyph; the
-                   thicker stroke distinguishes it from the can's
-                   own strokes. -->
-              <line x1="3" y1="3" x2="21" y2="21" stroke-width="2.5" />
-            {/if}
-          </svg>
-        </button>
-      {/if}
-    </div>
+          <path d="M3 6h18" />
+          <path d="M8 6V4h8v2" />
+          <path d="M19 6l-1 14H6L5 6" />
+          {#if isMandatory}
+            <!-- Prohibition slash over the trash glyph; the
+                 thicker stroke distinguishes it from the can's
+                 own strokes. -->
+            <line x1="3" y1="3" x2="21" y2="21" stroke-width="2.5" />
+          {/if}
+        </svg>
+      </button>
+    {/if}
     <!-- Sync badge.  Animation discipline:
            * Icon slot collapses width + right-margin to zero in the
              iconless states, transitioning at 200 ms so the badge

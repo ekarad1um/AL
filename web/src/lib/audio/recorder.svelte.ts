@@ -36,10 +36,11 @@ import { envelopeFromRing, pushToRing } from './ring-buffer';
 //             └─── error ◀────────────┴─── error ◀────────────┘
 //
 // Lifecycle: the consuming component is responsible for calling
-// `dispose()` in its `onDestroy` -- same pattern as `streams.start()
-// / .stop()` in the layout.  Implicit auto-cleanup via Svelte's
-// `onDestroy` would only work inside a component context and would
-// hide the contract from the call site.
+// `dispose()` in its `onDestroy` -- same pattern as the dispose
+// closure returned by `streams.acquire()` (consumed by the
+// dashboard / InferencePreview / InputPane).  Implicit auto-cleanup
+// via Svelte's `onDestroy` would only work inside a component
+// context and would hide the contract from the call site.
 
 export type RecorderState = 'idle' | 'requesting' | 'recording' | 'finalizing' | 'error';
 
