@@ -79,8 +79,20 @@
     // state word.  The active job's view may be null (pre-ack)
     // or `view.state === 'running'` (post-ack, pre-terminal).
     isLive: boolean;
+    // True while the daemon-side training-log delete for this
+    // row is in flight (operator right-clicked → Delete; the
+    // pipeline serialises through the global delete-queue and
+    // waits for SSE terminal).  Drives a quiet `aria-busy` +
+    // `opacity-60` treatment so the operator can see the row
+    // is being torn down without locking out the right-click
+    // re-open (the menu shows a disabled "Deleting…" item so
+    // the in-flight state is visible from either entry point).
+    // The chevron / expansion path stays interactive so the
+    // operator can still inspect the row's body while the
+    // tombstone drains.
+    isDeleting?: boolean;
   }
-  let { job, expanded, ontoggle, isLive }: Props = $props();
+  let { job, expanded, ontoggle, isLive, isDeleting = false }: Props = $props();
 
   // Display state.  `view === null` is the just-submitted, pre-
   // first-poll window -- treat it as 'submitting' rather than
@@ -230,12 +242,20 @@
      also painted a filled state pill in the header; that's
      gone, and the state word inline carries the same colour
      in text form. -->
+<!-- `data-job-id` is the parent TrainHistory's right-click hook
+     (`onListContextMenu` walks `e.target.closest('[data-job-id]')`
+     to find the row).  Single delegated handler on the wrapper
+     keeps menu state in one place -- matches HeadsTable +
+     CategoryList. -->
 <li
-  class="overflow-hidden rounded-md border border-zinc-200 border-l-4 bg-white transition-colors"
+  data-job-id={job.jobId}
+  aria-busy={isDeleting}
+  class="overflow-hidden rounded-md border border-zinc-200 border-l-4 bg-white transition-[opacity,background-color,border-color] duration-200"
   class:border-l-blue-500={displayState === 'running' || displayState === 'submitting'}
   class:border-l-emerald-500={displayState === 'completed'}
   class:border-l-rose-500={displayState === 'failed'}
   class:border-l-zinc-400={displayState === 'cancelled'}
+  class:opacity-60={isDeleting}
 >
   <!-- Header.  A single full-width toggle button: the row's
        entire footprint is the disclosure target, the chevron

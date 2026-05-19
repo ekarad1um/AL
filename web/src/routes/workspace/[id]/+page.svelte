@@ -414,6 +414,7 @@
          for the page poller. -->
     <DeployPane
       workspaceId={detail.id}
+      workspaceName={detail.name}
       heads={detail.heads}
       {liveRevision}
       onchanged={refreshDetail}

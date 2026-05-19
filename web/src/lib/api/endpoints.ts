@@ -211,13 +211,39 @@ export const training = {
     api.delete<CancelResp>(
       `/api/v1/workspace/${encodeURIComponent(workspaceId)}/training/${encodeURIComponent(jobId)}`
     ),
-  // No client-bound `deleteLog` / `deleteAllLogs` -- the daemon
-  // enforces keep-last-N (N=10) per workspace per log tree on
-  // every producer open (see
-  // `modules/file_mgr/log_retention.rs`), so a workspace's
-  // `training_logs/` stays bounded without an explicit-delete
-  // affordance.  The bare-path DELETE endpoints still exist
-  // daemon-side for operational tooling.
+  // Async single-log-file delete.  Targets the durable JSONL
+  // backstop `<workspace>/training_logs/<job_id>.jsonl` via the
+  // generic asset DELETE surface (the same `/assets/{*path}`
+  // family that handles dataset / converter trees).  Daemon-side
+  // admission gates documented in
+  // `modules/file_mgr/dataset.rs:start_async_log_delete`:
+  //
+  //   * 409 `JobConflict` if a train producer is currently
+  //     active on this workspace -- the producer holds the log
+  //     tree and the daemon refuses to delete underneath it.
+  //   * 404 if the JSONL was already pruned by the
+  //     keep-last-N=10 retention reaper
+  //     (`modules/file_mgr/log_retention.rs`).
+  //   * 400 if the `<job_id>.jsonl` shape is malformed (the
+  //     `AssetPath` validator runs first).
+  //
+  // Single-file-only (no whole-tree `clear all`) -- the daemon
+  // also accepts a bare-tree wipe (`DELETE training_logs`), but
+  // exposing that here would re-introduce the "Clear finished"
+  // failure mode an earlier revision hit (N parallel deletes
+  // colliding with the daemon's `max_delete_jobs = 1` slot,
+  // admitting one and 409'ing the rest).  Per-entry deletes
+  // routed through the global [delete-queue](./delete-queue.ts)
+  // serialise correctly; the bare-tree path is left to
+  // operational tooling.
+  //
+  // Resolves to `{ job_id }` (HTTP 202); call sites MUST flow
+  // through `enqueueDelete` and then `awaitJobTerminal` for the
+  // SSE terminal landing before treating the row as gone.
+  deleteLog: (workspaceId: Uuid, jobId: Uuid) =>
+    api.delete<AsyncJobAck>(
+      `/api/v1/workspace/${encodeURIComponent(workspaceId)}/assets/training_logs/${encodeURIComponent(jobId)}.jsonl`
+    ),
   // Path builder for the durable JSONL backstop.  Exposed for
   // tooling; the `LogPageResp` reader below is the typed entry
   // point.  The backstop is sparse (today's training producer
@@ -282,6 +308,16 @@ export const training = {
 // when `labels` is needed.  `delete` is synchronous; the
 // daemon refuses if the head is the active generation's source
 // (409 conflict).
+//
+// `weightsAssetPath` and `manifestAssetPath` route through the
+// daemon's generic asset GET surface (`/assets/heads/<id>.{mpk,
+// json}`) rather than the dedicated `/heads/{id}` route.  The
+// assets surface streams the on-disk bytes verbatim -- byte-
+// identical to what the daemon wrote at publish -- which is what
+// the alpkg export needs for content-addressable hashing of the
+// embedded payloads.  The dedicated route's orphan-index filter
+// is redundant here because the export entry point is the
+// `HeadsTable` row, which iterates the cached index already.
 export const heads = {
   list: (workspaceId: Uuid) =>
     api
@@ -294,5 +330,9 @@ export const heads = {
   delete: (workspaceId: Uuid, headId: Uuid) =>
     api.delete<DeleteHeadResp>(
       `/api/v1/workspace/${encodeURIComponent(workspaceId)}/heads/${encodeURIComponent(headId)}`
-    )
+    ),
+  weightsAssetPath: (workspaceId: Uuid, headId: Uuid): string =>
+    `/api/v1/workspace/${encodeURIComponent(workspaceId)}/assets/heads/${encodeURIComponent(headId)}.mpk`,
+  manifestAssetPath: (workspaceId: Uuid, headId: Uuid): string =>
+    `/api/v1/workspace/${encodeURIComponent(workspaceId)}/assets/heads/${encodeURIComponent(headId)}.json`
 };

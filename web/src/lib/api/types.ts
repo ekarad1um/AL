@@ -63,17 +63,36 @@ export interface AsyncJobAck {
 
 export type HeadStatus = 'current' | 'stale';
 
-export interface HeadRecord {
+// Fields shared between the workspace-detail / `GET /heads`
+// list-row shape and the per-head `GET /heads/{id}` manifest.
+// Lifted into its own interface because the two shapes diverge
+// on what surrounds these fields: list rows carry a derived
+// `status` (computed from the workspace's current revision; not
+// persisted) while the manifest carries the on-disk `workspace_id`
+// + `labels` (`status` is intentionally absent because the route
+// streams the disk file verbatim and a derived-on-read field
+// would lie on a stale read).
+interface HeadCore {
   head_id: Uuid;
   workspace_revision: WorkspaceRevision;
   sha256: string;
   n_classes: number;
   size_bytes: number;
   created_at: Rfc3339;
+}
+
+export interface HeadRecord extends HeadCore {
   status: HeadStatus;
 }
 
-export interface HeadManifest extends HeadRecord {
+// `GET /workspace/{ws}/heads/{id}` -- the per-head manifest the
+// daemon writes to `workspaces/<ws>/heads/<id>.json`.  Mirrors
+// `HeadManifest` in `modules/common/workspace.rs`: carries the
+// `workspace_id` provenance (for cross-workspace integrity checks
+// like the alpkg export's manifest validator) and the `labels`
+// array (omitted from list rows to keep them cheap to enumerate).
+export interface HeadManifest extends HeadCore {
+  workspace_id: Uuid;
   labels: string[];
 }
 

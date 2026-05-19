@@ -106,9 +106,11 @@
 // detail's effect re-fires correctly even on two-back-to-back
 // terminals from the same workspace.
 
-import { SvelteMap } from 'svelte/reactivity';
+import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import { training as trainingApi } from '$lib/api/endpoints';
 import { isApiError } from '$lib/api/http';
+import { enqueueDelete } from '$lib/api/delete-queue';
+import { awaitJobTerminal } from '$lib/api/jobs';
 import { TrainingSubscriber } from '$lib/api/training-subscriber';
 import { TrainingLogTail } from '$lib/api/training-log-tail';
 import { capFirst, errorCopy } from '$lib/utils/error-copy';
@@ -414,6 +416,52 @@ class TrainingStore {
   // within the session.  Reset on `forget(ws)`.
   private olderExpandedByWs = new SvelteMap<Uuid, boolean>();
 
+  // Per-workspace set of jobIds with an in-flight history-row
+  // delete.  Drives the "Deleting…" disabled state on the row's
+  // right-click ContextMenu's Delete item and the `aria-busy`
+  // visual treatment on `TrainHistoryItem` while the daemon's
+  // async delete drains.  Per-workspace (not global) because
+  // `enqueueDelete` already serialises across workspaces;
+  // operator-visible in-flight feedback IS scoped to the row
+  // the operator clicked.
+  private deletingHistoryByWs = new SvelteMap<Uuid, SvelteSet<Uuid>>();
+
+  // Per-workspace inline-banner copy for the most recent
+  // history-delete failure.  Cleared at the start of the next
+  // delete attempt or on explicit operator dismissal.  Per-
+  // workspace because the banner is rendered inside
+  // `TrainHistory` which is mounted under a workspace detail
+  // page; an error from workspace A would be invisible (and
+  // confusing) on workspace B.
+  private historyDeleteErrorByWs = new SvelteMap<Uuid, string | null>();
+
+  // In-flight refcount of `refillEagerAfterDelete` calls per
+  // workspace.  A refcount (not a boolean) so that two rapid
+  // deletes whose refills overlap each report `true` until
+  // BOTH have settled -- the eager-tier skeleton placeholder
+  // stays visible across the whole "shrink → backfill" window
+  // rather than flickering off when the first refill's await
+  // resolves while a second refill is still mid-fetch.  The
+  // refcount also self-converges to zero through the
+  // `finally` block in `refillEagerAfterDelete`, so a thrown
+  // fetch never strands the flag.
+  private autoRefillingByWs = new SvelteMap<Uuid, number>();
+
+  // Snapshotted older-tier batch size for the in-flight load.
+  // Set at click-time on `setOlderExpanded(true)` /
+  // `loadMoreHistory`, derived as `min(loadable, PAGE_SIZE)`
+  // against the cached `discoveredByWs` -- which is the same
+  // arithmetic the visible "Show N older runs" badge uses.
+  // The placeholder count in `TrainHistory` reads exactly this
+  // value so the badge ↔ skeleton ↔ landed-rows progression
+  // is always honest: a click on "Show 3 older runs" paints 3
+  // skeletons, then 3 rows materialise in place.  A click that
+  // resolves to a no-op load (already at-or-above PAGE_SIZE in
+  // the older tier) leaves the slot at 0 so no placeholders
+  // appear.  Cleared in the load chain's `finally` so a
+  // failure path doesn't strand the count.
+  private olderLoadingPendingByWs = new SvelteMap<Uuid, number>();
+
   // In-flight `recover` Promises per workspace.  Plain `Map`
   // (not SvelteMap): no UI surface tracks this -- it's purely
   // a concurrency-coalescing handle so two callsites that fire
@@ -664,19 +712,232 @@ class TrainingStore {
     }
   }
 
-  // Operator-driven log deletion does not live here.  An earlier
-  // revision exposed `deleteAllFinished` / `deleteHistoryEntry`
-  // and a "Clear finished" UI affordance, but both have been
-  // removed: the daemon enforces keep-last-N=10 per workspace
-  // per log tree at every producer open
-  // (`modules/file_mgr/log_retention.rs`), so `training_logs/`
-  // stays bounded without manual intervention.  The clear-all
-  // path also tripped a subtle bug — N parallel per-entry
-  // deletes collided with the daemon's `max_delete_jobs = 1`
-  // slot, admitting one and 409'ing the rest, so a single
-  // click appeared to "clear" the whole list while only one
-  // file actually got removed.  Producer-side retention is the
-  // right layer for the policy.
+  // ── Operator-driven history-row deletion ───────────────────
+  //
+  // Per-entry only -- there is no "Clear finished" / batch
+  // path here.  Two reasons:
+  //   1. The daemon enforces keep-last-N=10 retention at every
+  //      producer open
+  //      (`modules/file_mgr/log_retention.rs`), so the steady-
+  //      state surface stays bounded without manual operator
+  //      action.  Per-entry delete is the *targeted* prune
+  //      ("drop this noisy failed run from the list", "free
+  //      that 100 MB JSONL my pathological cancel cycle
+  //      generated"), not a bulk-management tool.
+  //   2. An earlier revision shipped a "Clear finished" path
+  //      that fanned out N parallel deletes; they collided
+  //      with the daemon's `max_delete_jobs = 1` admission
+  //      slot, admitting one and 409'ing the rest, so the UI
+  //      reported success while only one disk file got
+  //      removed.  Per-entry deletes routed through the
+  //      shared `enqueueDelete` chain serialise correctly and
+  //      give the operator one click → one round-trip → one
+  //      visible result.
+  //
+  // The daemon refuses (`JobConflict`) any log delete while a
+  // Train job for the same workspace is active; the caller is
+  // expected to gate the menu's Delete item on
+  // `activeFor(workspaceId) === null` before firing.  The
+  // backend check is best-effort (a producer can start
+  // between our gate read and the dispatcher's pre-check), so
+  // we still parse the error envelope and surface it inline
+  // via `historyDeleteErrorFor` on any failure rather than
+  // assuming success.
+
+  // True while a history row's daemon-side delete is in
+  // flight.  Drives the row's `isDeleting` chrome and the
+  // menu's "Deleting…" disabled state if the operator
+  // re-right-clicks during the await.
+  historyDeletingForJob(workspaceId: Uuid, jobId: Uuid): boolean {
+    return this.deletingHistoryByWs.get(workspaceId)?.has(jobId) ?? false;
+  }
+
+  // Operator-facing copy for the most recent failed
+  // `deleteHistoryEntry` on this workspace, or null if the
+  // previous attempt landed cleanly.  Source for the inline
+  // rose banner in `TrainHistory`.  Shape matches the
+  // banner-family convention used by TrainPane's `startError`
+  // and HeadsTable's `actionError` so the three surfaces read
+  // as one alert vocabulary.
+  historyDeleteErrorFor(workspaceId: Uuid): string | null {
+    return this.historyDeleteErrorByWs.get(workspaceId) ?? null;
+  }
+
+  // Operator dismiss of the inline banner.  Pure UI state --
+  // the daemon doesn't care.
+  dismissHistoryDeleteError(workspaceId: Uuid): void {
+    this.historyDeleteErrorByWs.set(workspaceId, null);
+  }
+
+  // Delete one terminal history row's JSONL backstop.  Async
+  // pipeline (DELETE → 202 ack → SSE terminal wait) serialised
+  // through the global delete-queue so it can't 409 against a
+  // concurrent dataset / converter / workspace delete.  On
+  // success the row is dropped from `historyByWs` AND from
+  // `discoveredByWs` so a subsequent `hydrateHistory` /
+  // `loadMoreHistory` doesn't bring it back via a directory
+  // re-listing.  On failure the local state is untouched so
+  // the operator can retry from the same row, and the inline
+  // banner surfaces the typed error message.
+  //
+  // No-op when the row is already in flight (idempotent
+  // re-click) or when the jobId belongs to the live active
+  // slot (the daemon would 409; the menu's gating should have
+  // already disabled the entry, but the runtime guard backs
+  // that up).
+  async deleteHistoryEntry(workspaceId: Uuid, jobId: Uuid): Promise<void> {
+    if (this.historyDeletingForJob(workspaceId, jobId)) return;
+    if (this.active?.workspaceId === workspaceId && this.active.jobId === jobId) return;
+    let set = this.deletingHistoryByWs.get(workspaceId);
+    if (!set) {
+      set = new SvelteSet<Uuid>();
+      this.deletingHistoryByWs.set(workspaceId, set);
+    }
+    set.add(jobId);
+    // Clear the previous error so the rose banner doesn't
+    // shadow a pending retry while the new attempt is in
+    // flight.  Mirrors TrainPane's `startError` reset on the
+    // next submit.
+    this.historyDeleteErrorByWs.set(workspaceId, null);
+    try {
+      await enqueueDelete(async () => {
+        const ack = await trainingApi.deleteLog(workspaceId, jobId);
+        await awaitJobTerminal(ack.job_id, 'training-log delete');
+      });
+      // Daemon delete drained.  Drop the row from history (so
+      // it vanishes from the list immediately) AND from
+      // `discoveredByWs` (so a subsequent re-mount /
+      // hydration doesn't observe the now-missing JSONL via
+      // a stale listing and try to replay it).
+      this.removeFromHistory(workspaceId, jobId);
+      // Eager-tier auto-refill.  Deleting an eager row leaves
+      // a visual gap (the operator sees 1 row instead of the
+      // expected `INITIAL_VISIBLE = 2`) AND a stale-looking
+      // `olderTotal` badge: because `removeFromHistory` drops
+      // the jobId from BOTH `historyByWs` and `discoveredByWs`,
+      // the `loadable - loaded` math stays numerically
+      // identical -- the operator's mental "I just removed
+      // one, the count should drop" never appears in the UI.
+      // Pulling the next discovered entry into the eager tier
+      // closes both gaps in one go: the visible row count
+      // returns to budget, and the loadable pool drops by one
+      // (because the just-loaded entry leaves it), so the
+      // badge ticks down by 1 as the operator expects.
+      //
+      // Fire-and-forget so the operator's primary action (the
+      // delete) resolves promptly.  A network failure mid-
+      // refill leaves the eager tier short, which the next
+      // mount / explicit "Show older runs" expand recovers
+      // from; surfacing that case to the operator inline would
+      // be noise.
+      //
+      // When `older` is expanded, this is typically a no-op
+      // (already-loaded older entries shift up via
+      // `eagerHistoryFor`'s slice; `history.length` stays at
+      // or above `INITIAL_VISIBLE` so the gap check
+      // short-circuits).  The fix is observable only on the
+      // "older not expanded" path the operator pointed at, but
+      // the gap-condition is the load-bearing predicate.
+      void this.refillEagerAfterDelete(workspaceId);
+    } catch (e) {
+      const message =
+        e instanceof Error && e.message ? capFirst(e.message, 'Delete failed.') : errorCopy(e);
+      this.historyDeleteErrorByWs.set(workspaceId, message);
+      console.warn('[training] history delete failed', e);
+      throw e;
+    } finally {
+      const cur = this.deletingHistoryByWs.get(workspaceId);
+      if (cur) {
+        cur.delete(jobId);
+        if (cur.size === 0) this.deletingHistoryByWs.delete(workspaceId);
+      }
+    }
+  }
+
+  // Local-only removal: drop a single jobId from `historyByWs`
+  // and `discoveredByWs` for `workspaceId`.  Used by the
+  // terminal-success branch of `deleteHistoryEntry`; not
+  // called elsewhere.  Inlining would be fine but a named
+  // helper documents the two-store invariant: both surfaces
+  // must agree after a delete, otherwise the "Show N older
+  // runs" badge re-counts the just-deleted entry against the
+  // current keep-last-N state.
+  private removeFromHistory(workspaceId: Uuid, jobId: Uuid): void {
+    const hist = this.historyByWs.get(workspaceId);
+    if (hist) {
+      const filtered = hist.filter((j) => j.jobId !== jobId);
+      if (filtered.length !== hist.length) {
+        if (filtered.length === 0) this.historyByWs.delete(workspaceId);
+        else this.historyByWs.set(workspaceId, filtered);
+      }
+    }
+    this.dropFromDiscovered(workspaceId, jobId);
+  }
+
+  // Refill the eager tier after a delete that left it under
+  // budget.  No-op when:
+  //   * History is already at-or-above `INITIAL_VISIBLE` (the
+  //     common "older expanded" path, where the eager slice
+  //     absorbs the gap from already-loaded older entries).
+  //   * `loadableOlderCountFor` is zero (discovery pool is
+  //     exhausted; nothing to fetch).
+  //
+  // Otherwise sets the `autoRefillingByWs` flag (so the eager
+  // `<ul>` paints a single skeleton placeholder in the freshly-
+  // emptied slot — see `eagerSkeletonCountFor`) and calls
+  // `loadBatch` for exactly the gap.  The placeholder is the
+  // load-bearing UX detail: without it the row vanishes the
+  // moment the daemon-delete drains, the eager tier shrinks
+  // by one card-height, then expands back when the fetch
+  // resolves — a perceptible "shrink → re-grow" judder for
+  // the operator.  Setting the flag BEFORE the await and
+  // clearing it in `finally` brackets the loadBatch's await
+  // window precisely, so the placeholder is visible from
+  // (post-`removeFromHistory`) through (`pushHistoryBatch`)
+  // and not a frame longer.
+  //
+  // Routes through the same `fetchAndReplay` substrate the
+  // eager hydration uses, so:
+  //   * `MAX_HISTORY_PER_WS` capacity cap is honored.
+  //   * Active-slot collisions are filtered (we never push the
+  //     live jobId into history).
+  //   * A stale-discovery 404 prunes that entry from
+  //     `discoveredByWs` automatically, converging the
+  //     `loadableOlderCountFor` math without a retry loop.
+  //
+  // Fire-and-forget caller: a network failure here just leaves
+  // the eager tier short and the badge slightly stale; the
+  // next mount or explicit older-expand refresh recovers
+  // from that, and surfacing the failure inline would be more
+  // noise than signal for a background polish-the-list call.
+  //
+  // Gates only on `autoRefillingByWs`, not on the older-tier's
+  // `loadingMoreByWs` flag.  A delete + an immediate "Load N
+  // more" click (or older-disclosure expand) can therefore run
+  // their `loadBatch` calls in parallel and end up fetching the
+  // same newest-discovered jobId twice.  `pushHistoryBatch`'s
+  // `incomingIds` dedup makes the overlap benign (the second
+  // landing is a no-op), so the worst case is one extra JSONL
+  // round-trip in a niche timing window -- not worth a global
+  // serialiser that would also stall the more common
+  // independent-path case.
+  private async refillEagerAfterDelete(workspaceId: Uuid): Promise<void> {
+    const hist = this.historyByWs.get(workspaceId) ?? [];
+    if (hist.length >= INITIAL_VISIBLE) return;
+    const gap = INITIAL_VISIBLE - hist.length;
+    if (this.loadableOlderCountFor(workspaceId) === 0) return;
+    const prev = this.autoRefillingByWs.get(workspaceId) ?? 0;
+    this.autoRefillingByWs.set(workspaceId, prev + 1);
+    try {
+      await this.loadBatch(workspaceId, gap);
+    } catch (e) {
+      console.warn('[training] eager-tier auto-refill after delete failed', e);
+    } finally {
+      const cur = this.autoRefillingByWs.get(workspaceId) ?? 0;
+      if (cur <= 1) this.autoRefillingByWs.delete(workspaceId);
+      else this.autoRefillingByWs.set(workspaceId, cur - 1);
+    }
+  }
 
   // Toggle / explicit-set the "older runs" disclosure for
   // `workspaceId`.  On expand, kicks off a refresh + load
@@ -743,13 +1004,51 @@ class TrainingStore {
   private async handleOlderExpand(workspaceId: Uuid): Promise<void> {
     if (this.loadingMoreByWs.get(workspaceId)) return;
     this.loadingMoreByWs.set(workspaceId, true);
+    // Optimistic pre-refresh skeleton count so the disclosure
+    // mounts with placeholders in the same frame as the click,
+    // instead of opening to empty space for the duration of
+    // the `refreshDiscovery` round-trip (~50-200 ms on a
+    // healthy daemon).  Gated on the pre-refresh older-tier
+    // size against the page budget -- an already-full tier
+    // doesn't fire `loadBatch` below, so painting phantom
+    // skeletons that never resolve to rows would lie to the
+    // operator.  `refreshDiscovery` only mutates the
+    // discovered pool, not history, so the pre-refresh older-
+    // tier check matches the post-refresh load-branch decision
+    // below.  The authoritative post-refresh re-snapshot then
+    // adjusts the count if the producer's retention pruned
+    // (or a sibling SSE terminal pushed) between the click and
+    // the refresh landing -- the post-refresh number always
+    // wins.
+    if (this.olderHistoryFor(workspaceId).length < PAGE_SIZE) {
+      const initial = Math.min(this.loadableOlderCountFor(workspaceId), PAGE_SIZE);
+      if (initial > 0) this.olderLoadingPendingByWs.set(workspaceId, initial);
+    }
     try {
       await this.refreshDiscovery(workspaceId);
       const older = this.olderHistoryFor(workspaceId);
       if (older.length < PAGE_SIZE) {
+        // Authoritative post-refresh snapshot -- the count
+        // `loadBatch` will actually surface, capped at
+        // PAGE_SIZE.  Branches `set` vs `delete` on zero so
+        // the skeleton tier collapses to nothing in the same
+        // tick if discovery resolved to an exhausted pool;
+        // the outer finally performs the canonical cleanup
+        // regardless.
+        const pending = Math.min(this.loadableOlderCountFor(workspaceId), PAGE_SIZE);
+        if (pending > 0) this.olderLoadingPendingByWs.set(workspaceId, pending);
+        else this.olderLoadingPendingByWs.delete(workspaceId);
         await this.loadBatch(workspaceId, PAGE_SIZE);
       }
     } finally {
+      // Clears every path: happy-path load (skeleton vanishes
+      // in the same tick `pushHistoryBatch` mounts the real
+      // rows), no-load branch (post-refresh found older >=
+      // PAGE_SIZE, e.g. an SSE terminal landed during the
+      // refresh round-trip and shifted an eager row down),
+      // and a pre-refresh optimistic snapshot stranded by a
+      // thrown `refreshDiscovery`.
+      this.olderLoadingPendingByWs.delete(workspaceId);
       this.loadingMoreByWs.set(workspaceId, false);
     }
   }
@@ -771,6 +1070,63 @@ class TrainingStore {
   // during loading).
   hydratingFor(workspaceId: Uuid): boolean {
     return this.hydratingByWs.get(workspaceId) ?? false;
+  }
+
+  // True while at least one `refillEagerAfterDelete` is in
+  // flight for `workspaceId`.  Together with the eager-tier
+  // gap count (see `eagerSkeletonCountFor`), this drives the
+  // single-skeleton placeholder rendered in `TrainHistory`
+  // immediately after a delete drains the eager tier under
+  // its `INITIAL_VISIBLE` budget.  Without the placeholder
+  // the row visibly disappears, the eager `<ul>` shrinks by
+  // one card-height, and then re-grows when the backfilled
+  // entry lands -- the operator sees a "shrink → re-grow"
+  // judder.  The placeholder reserves the slot from
+  // (post-`removeFromHistory`) through (`pushHistoryBatch`),
+  // converting the transition to a single in-place card swap.
+  autoRefillingFor(workspaceId: Uuid): boolean {
+    return (this.autoRefillingByWs.get(workspaceId) ?? 0) > 0;
+  }
+
+  // Skeleton-row count for the eager `<ul>` in `TrainHistory`.
+  // Returns the exact gap between current history length and
+  // `INITIAL_VISIBLE` whenever a "load is incoming" signal is
+  // active -- either the initial hydration is still running,
+  // OR an auto-refill from a recent delete is awaiting its
+  // backfill fetch.  Otherwise returns 0 so the eager `<ul>`
+  // renders no placeholders.  Unified across the two loading
+  // shapes so the rendering code stays a single
+  // `{#each Array(gap)}` block; the existing hydration path's
+  // empty-then-2-skeletons rendering is preserved naturally
+  // by the same arithmetic (history.length === 0 →
+  // gap === INITIAL_VISIBLE).
+  eagerSkeletonCountFor(workspaceId: Uuid): number {
+    if (!this.hydratingFor(workspaceId) && !this.autoRefillingFor(workspaceId)) return 0;
+    const hist = this.historyByWs.get(workspaceId) ?? [];
+    return Math.max(0, INITIAL_VISIBLE - hist.length);
+  }
+
+  // Skeleton-row count for the older-tier `<ul>` in
+  // `TrainHistory`.  Snapshotted at click-time by
+  // `handleOlderExpand` / `loadMoreHistory` to exactly the
+  // number of rows the in-flight `loadBatch` will surface,
+  // capped at `PAGE_SIZE`.  Zero when no load is pending --
+  // including the "expand on an already-loaded older tier"
+  // case where `handleOlderExpand` only refreshes discovery
+  // and does NOT call `loadBatch`, AND including the case
+  // where discovery is fully drained (`loadable === 0`).
+  //
+  // Honest by construction: the placeholder count never
+  // exceeds the count of rows that will land in this batch.
+  // A click on "Show 3 older runs" paints 3 skeletons and 3
+  // rows replace them in place; a click on "Show 8 older
+  // runs" paints 5 (one PAGE_SIZE) and the "Load 3 more"
+  // affordance surfaces below afterwards.  Previously the
+  // pane painted a single skeleton regardless of N, which
+  // read as "1 row incoming" to the operator's eye even when
+  // they'd just asked for many.
+  olderSkeletonCountFor(workspaceId: Uuid): number {
+    return this.olderLoadingPendingByWs.get(workspaceId) ?? 0;
   }
 
   // True while a `loadMoreHistory` call is in flight for this
@@ -971,10 +1327,25 @@ class TrainingStore {
     if (!this.discoveredByWs.has(workspaceId)) return;
     if (this.loadingMoreByWs.get(workspaceId)) return;
     this.loadingMoreByWs.set(workspaceId, true);
+    // Snapshot the batch size BEFORE the fetch so the
+    // skeleton-row count `TrainHistory` paints matches what
+    // the "Load N more" button just promised.  Computed
+    // against the cached discovery + history, capped at
+    // `PAGE_SIZE` -- identical to `loadBatch`'s internal
+    // `min(targetAdd, available)` cap, so the placeholders
+    // line up one-to-one with the rows that actually land.
+    // A zero snapshot (already at the discovered floor) skips
+    // setting the slot at all, so the placeholder loop renders
+    // nothing -- belt-and-suspenders for the
+    // `loadable === 0` path that should never reach here (the
+    // `Load N more` button hides on that condition).
+    const pending = Math.min(this.loadableOlderCountFor(workspaceId), PAGE_SIZE);
+    if (pending > 0) this.olderLoadingPendingByWs.set(workspaceId, pending);
     try {
       await this.loadBatch(workspaceId, PAGE_SIZE);
     } finally {
       this.loadingMoreByWs.set(workspaceId, false);
+      this.olderLoadingPendingByWs.delete(workspaceId);
     }
   }
 
@@ -1100,6 +1471,35 @@ class TrainingStore {
     this.hydratingByWs.delete(workspaceId);
     this.loadingMoreByWs.delete(workspaceId);
     this.olderExpandedByWs.delete(workspaceId);
+    // Drop history-row delete state too -- a workspace-delete
+    // implicitly cleans up every JSONL in the tree (the daemon's
+    // `WorkspaceDelete` flow stages the whole workspace dir),
+    // so any in-flight `deleteHistoryEntry` resolves into a
+    // no-op locally.  The `deletingHistoryByWs` clear races
+    // benignly with the in-flight pipeline's `finally` block
+    // (the `.get(workspaceId)` returns undefined, the cleanup
+    // short-circuits).  The error banner from a previous failed
+    // attempt has no surface to render on once the workspace is
+    // gone, so wipe it too.
+    this.deletingHistoryByWs.delete(workspaceId);
+    this.historyDeleteErrorByWs.delete(workspaceId);
+    // Drop any in-flight auto-refill counter.  Like the
+    // recover Promise tracked below, the actual `loadBatch`
+    // call can't be aborted -- it resolves into a no-op
+    // (`pushHistoryBatch` reads the now-empty `historyByWs`
+    // and writes back), or 404s the deleted workspace's
+    // JSONLs.  Clearing the counter keeps the eager-tier
+    // skeleton from lingering visually on a re-mount of the
+    // same id (unlikely after a workspace delete, but cheap
+    // to be exact).
+    this.autoRefillingByWs.delete(workspaceId);
+    // Same reasoning for the older-tier pending-count
+    // snapshot.  A workspace-delete mid-load lets the
+    // in-flight `loadBatch` resolve into nothing (no rows
+    // land); the snapshot would self-clear via its own
+    // `finally` block, but a stale entry surviving a
+    // workspace re-mount would render N phantom skeletons.
+    this.olderLoadingPendingByWs.delete(workspaceId);
     // Drop any in-flight recover Promise reference.  The Promise
     // itself can't be aborted (`trainingApi.list` doesn't take a
     // signal) so the round-trip still resolves -- but its

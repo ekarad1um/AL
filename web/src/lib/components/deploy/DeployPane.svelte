@@ -33,11 +33,16 @@
 
   interface Props {
     workspaceId: Uuid;
+    /// Workspace's human-readable name.  Threaded through purely
+    /// so the heads list can seed the alpkg export filename slug
+    /// (`<ws>-head-<id8>.alpkg`); nothing else on this surface
+    /// reads it today.
+    workspaceName: string;
     heads: readonly HeadRecord[];
     liveRevision: number;
     onchanged: () => Promise<void> | void;
   }
-  let { workspaceId, heads, liveRevision, onchanged }: Props = $props();
+  let { workspaceId, workspaceName, heads, liveRevision, onchanged }: Props = $props();
 
   const active = $derived(configStore.active);
 
@@ -256,7 +261,7 @@
            cleanly; the global config store updates from any
            in-flight deploy still land on configStore.active. -->
       {#key workspaceId}
-        <HeadsTable {workspaceId} {heads} {liveRevision} {onchanged} />
+        <HeadsTable {workspaceId} {workspaceName} {heads} {liveRevision} {onchanged} />
       {/key}
     </div>
     <div class="h-80 lg:col-span-2">

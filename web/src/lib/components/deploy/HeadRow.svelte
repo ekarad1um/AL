@@ -1,7 +1,8 @@
 <script lang="ts">
   import Button from '$lib/components/ui/Button.svelte';
+  import DownloadIcon from '$lib/components/ui/DownloadIcon.svelte';
   import StatusBadge from '$lib/components/ui/StatusBadge.svelte';
-  import TrashIcon from '$lib/components/ui/TrashIcon.svelte';
+  import Spinner from '$lib/components/Spinner.svelte';
   import { formatBytes } from '$lib/utils/format';
   import { formatRelative } from '$lib/utils/time';
   import type { HeadRecord, Uuid } from '$lib/api/types';
@@ -19,23 +20,47 @@
     isLatest: boolean;
     // True when this head is the runtime-active inference head AND
     // its source workspace matches the row's workspace.  Drives the
-    // row's blue tint, the Deploy → Deployed button-label morph,
-    // and disables the Deploy + Delete buttons (the daemon refuses
-    // to delete the runtime-active head).  No standalone "Deployed"
-    // pill: the row's chrome (border + bg) plus the button label
-    // are enough -- a third indicator would be visual repetition.
+    // row's blue tint + the Deploy → Deployed button-label morph.
+    // The daemon refuses to delete the active head; the right-click
+    // menu reflects that constraint by disabling the Delete item
+    // (HeadsTable.buildMenu).  No standalone "Deployed" pill on the
+    // row: the chrome (border + bg) plus the button label are
+    // enough -- a third indicator would be visual repetition.
     isDeployed: boolean;
     // Disabled while another head on this list is mid-mutation, so
     // the operator can't fire two destructive actions in parallel.
     busy?: boolean;
+    // True iff THIS row is the one currently exporting.  Driven by
+    // the parent's `exportingHeadId === head.head_id` so the
+    // hover-revealed Export icon's spinner morph fires whether the
+    // operator triggered export from the visible icon or the
+    // right-click menu (both paths land at the same parent
+    // `exportHeadAction`).  Local row state would have only
+    // observed the icon-driven path.
+    isExporting: boolean;
     ondeploy: (headId: Uuid) => Promise<void>;
-    ondelete: (head: HeadRecord) => void;
+    // Export the head as an `.alpkg` archive (zip-deflate container
+    // carrying the manifest + .mpk weights).  Parent owns the
+    // fetch / validate / pack / SaveAs pipeline; this row just
+    // surfaces the click.  Not gated on `isDeployed`: an operator
+    // may legitimately want to back up the currently-running head,
+    // and the daemon's export path is read-only (no conflict with
+    // the active swap).
+    onexport: (head: HeadRecord) => void;
   }
-  let { head, isLatest, isDeployed, busy = false, ondeploy, ondelete }: Props = $props();
+  let {
+    head,
+    isLatest,
+    isDeployed,
+    busy = false,
+    isExporting,
+    ondeploy,
+    onexport
+  }: Props = $props();
 
   let deploying = $state(false);
   async function onDeployClick(): Promise<void> {
-    if (deploying || isDeployed || busy) return;
+    if (deploying || isDeployed || busy || isExporting) return;
     deploying = true;
     try {
       await ondeploy(head.head_id);
@@ -44,7 +69,10 @@
     }
   }
 
-  const interactionDisabled = $derived(busy || deploying);
+  function onExportClick(): void {
+    if (isExporting || deploying || busy) return;
+    onexport(head);
+  }
 </script>
 
 <!-- One head row.  Headline is the head's short id rendered in
@@ -71,7 +99,14 @@
      artifact to a specific workspace version, with age trailing
      as the recency signal.  Deployed rows tint blue to match
      the dashboard's Active Head card. -->
+<!-- `data-head-id` is the parent HeadsTable's right-click hook:
+     `onListContextMenu` walks `e.target.closest('[data-head-id]')`
+     to identify which row the operator's cursor landed on, then
+     opens the shared ContextMenu over that head with Export +
+     Delete items.  No row-local context-menu state -- the parent
+     owns the single menu instance per-list. -->
 <li
+  data-head-id={head.head_id}
   class="group/row flex flex-wrap items-center justify-between gap-3 rounded-md border px-3 py-2.5 transition-colors"
   class:border-blue-200={isDeployed}
   class:bg-blue-50={isDeployed}
@@ -115,44 +150,77 @@
     </p>
   </div>
 
-  <!-- Actions cluster.  Delete LEFT of Deploy, hover-revealed only;
-       at rest the row's right edge reads as "Deploy CTA + nothing
-       else" so the operator's eye lands on the primary action
-       without competing chrome.  Same idiom as CategoryRow's
-       per-row delete (see CategoryRow.svelte:251-303): the button
-       is in flow (so the layout doesn't reflow on hover and the
-       Deploy CTA holds a stable position) but visually hidden via
-       `opacity-0 pointer-events-none`; `group-hover/row`,
-       `focus-visible`, and `pointer-coarse` selectors restore
-       opacity + interactivity for hover, keyboard, and touch
-       respectively.  Border-less to match CategoryRow's chrome-
-       free affordance -- the row already has its own border, and
-       a second nested border around a hover-revealed icon would
-       read as visual repetition.  Tooltips live on the wrapper
-       spans so the explanation surfaces in Firefox too: a
-       disabled <button> doesn't fire pointer events in Firefox,
-       so its native `title` stays hidden -- visible only in
-       Chrome / Safari.  The span receives the hover and shows its
-       own title cross-browser; the operator hovering the inactive
-       "Deployed" or "Can't delete" affordance sees the same hint
-       on every engine. -->
+  <!-- Actions cluster.  Two slots LEFT → RIGHT: Export (hover-
+       revealed icon), Deploy (always-visible primary CTA).  Delete
+       lives in the right-click ContextMenu owned by the parent
+       HeadsTable -- pulling it out of the resting chrome keeps
+       this row reading as "Deploy this head, that's the action".
+       The Export icon stays visible because operators frequently
+       want to archive a head without first activating it, and the
+       gesture chain `right-click → Export` is more friction than
+       a single click on the visible glyph.
+       Same hover-reveal idiom as CategoryRow's per-row delete
+       (see CategoryRow.svelte:251-303): the button is in flow (so
+       the layout doesn't reflow on hover and the Deploy CTA holds
+       a stable position) but visually hidden via `opacity-0
+       pointer-events-none`; `group-hover/row`, `focus-visible`,
+       and `pointer-coarse` selectors restore opacity +
+       interactivity for hover, keyboard, and touch respectively.
+       Border-less to match CategoryRow's chrome-free affordance --
+       the row already has its own border, and a nested border
+       around a hover-revealed icon would read as visual
+       repetition.  Tooltips live on the wrapper spans so the
+       explanation surfaces in Firefox too: a disabled <button>
+       doesn't fire pointer events in Firefox, so its native
+       `title` stays hidden -- visible only in Chrome / Safari.
+       The span receives the hover and shows its own title cross-
+       browser; the operator hovering the inactive "Deployed"
+       affordance sees the same hint on every engine. -->
   <div class="flex shrink-0 items-center gap-2">
     <span
       class="inline-flex shrink-0"
-      title={isDeployed
-        ? "Can't delete the deployed head. Deploy another head or revert to default first."
-        : 'Delete this head'}
+      title={isExporting ? 'Exporting…' : 'Export this head as a .alpkg archive'}
     >
+      <!-- During export the button stays visible regardless of
+           hover state (the `class:!opacity-100` /
+           `class:!pointer-events-auto` overrides) so the spinner
+           is legible the moment the operator's cursor moves off
+           the row.  Blue hover wash telegraphs the non-destructive
+           "download" intent and distinguishes this icon from any
+           destructive accent the right-click menu's Delete item
+           uses.
+           Hover-wash tone is row-state-aware: the button has no
+           rendered border, so the wash IS the button's visible
+           edge at rest+hover.  On a non-deployed row (`bg-white`)
+           a `bg-blue-50` wash reads as a crisp tinted pad.  On a
+           deployed row (`bg-blue-50`) the same wash would render
+           as a continuous surface with the row backdrop -- the
+           operator's hover affordance vanishes mid-action.  The
+           `class:` pair below steps the wash one tonal level
+           deeper (`bg-blue-100`) on deployed rows so the pad reads
+           as a distinct hover state in either context; on a
+           non-deployed row the original `bg-blue-50` wash holds.
+           Icon hover (`text-blue-600`) and focus ring
+           (`ring-blue-200`) still contrast against `bg-blue-100`
+           so no other tokens need to move. -->
       <button
         type="button"
-        onclick={() => ondelete(head)}
-        disabled={isDeployed || interactionDisabled}
-        aria-label={isDeployed
-          ? 'The deployed head cannot be deleted'
-          : `Delete head ${head.head_id.slice(0, 8)}…`}
-        class="pointer-events-none inline-flex shrink-0 items-center justify-center rounded-md p-1.5 text-zinc-300 opacity-0 transition duration-200 ease-out group-hover/row:pointer-events-auto group-hover/row:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-rose-200 focus-visible:outline-none enabled:hover:bg-rose-50 enabled:hover:text-rose-600 disabled:cursor-not-allowed disabled:text-zinc-200 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+        onclick={onExportClick}
+        disabled={deploying || busy}
+        aria-label={isExporting
+          ? `Exporting head ${head.head_id.slice(0, 8)}…`
+          : `Export head ${head.head_id.slice(0, 8)}…`}
+        class="pointer-events-none inline-flex shrink-0 items-center justify-center rounded-md p-1.5 text-zinc-300 opacity-0 transition duration-200 ease-out group-hover/row:pointer-events-auto group-hover/row:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-blue-200 focus-visible:outline-none enabled:hover:text-blue-600 disabled:cursor-not-allowed disabled:text-zinc-200 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+        class:enabled:hover:bg-blue-50={!isDeployed}
+        class:enabled:hover:bg-blue-100={isDeployed}
+        class:!opacity-100={isExporting}
+        class:!pointer-events-auto={isExporting}
       >
-        <TrashIcon />
+        {#if isExporting}
+          <Spinner class="h-3.5 w-3.5 text-blue-500" />
+        {:else}
+          <DownloadIcon />
+        {/if}
       </button>
     </span>
     <span
@@ -165,7 +233,7 @@
         size="sm"
         variant={isDeployed ? 'secondary' : 'primary'}
         onclick={onDeployClick}
-        disabled={isDeployed || interactionDisabled}
+        disabled={isDeployed || busy || deploying || isExporting}
         loading={deploying}
       >
         {#if isDeployed}Deployed{:else}Deploy{/if}

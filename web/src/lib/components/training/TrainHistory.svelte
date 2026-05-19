@@ -2,6 +2,7 @@
   import { SvelteSet } from 'svelte/reactivity';
   import { fade } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
+  import ContextMenu, { type MenuSection } from '$lib/components/ui/ContextMenu.svelte';
   import TrainHistoryItem from './TrainHistoryItem.svelte';
   import {
     training as trainingStore,
@@ -118,12 +119,73 @@
       loadableOlder === 0
   );
 
-  // True when the eager tier has zero rendered cards AND
-  // hydration is still in flight -- skeletons stand in for
-  // the about-to-arrive cards so the layout below them
-  // (older disclosure, hyperparameter section, heads list)
-  // doesn't jump on first paint.
-  const showEagerSkeletons = $derived(hydrating && eagerItems.length === 0);
+  // Exact skeleton-row count for the eager `<ul>`.  Non-zero
+  // in two states (combined by the store accessor):
+  //   * Initial hydration is still running -- the eager tier
+  //     is being populated for the first time.  History is
+  //     typically empty here, so the count is `INITIAL_VISIBLE`
+  //     and the placeholders reserve the section's height so
+  //     the older disclosure / hyperparameters / heads list
+  //     below don't jump on first paint.
+  //   * An auto-refill from a recent delete is awaiting its
+  //     backfill fetch -- the eager tier has shrunk by one
+  //     row and the store is in the middle of pulling the
+  //     next discovered entry in.  The placeholder reserves
+  //     the slot the deleted row occupied so the eager list
+  //     doesn't visibly shrink and then re-grow when the
+  //     fetched entry lands.
+  // The store accessor (`eagerSkeletonCountFor`) folds the
+  // two cases into one number; the rendering below stays a
+  // single `{#each Array(count)}` loop.
+  const eagerSkeletonCount = $derived(trainingStore.eagerSkeletonCountFor(workspaceId));
+
+  // Exact skeleton-row count for the older-tier `<ul>`.
+  // Snapshotted in the store at click-time on "Show N older
+  // runs" / "Load N more" to the number of rows the in-flight
+  // `loadBatch` will surface (capped at `PAGE_SIZE`).  Used to
+  // render that many `<li>` placeholders inside the same `<ul>`
+  // that hosts the already-loaded older rows, so the load
+  // transition is an in-place skeleton → real-row swap rather
+  // than a single 40 px placeholder that then expands into N
+  // entries.  Zero when no older-tier load is in flight
+  // (covers the "expand on an already-loaded tier" case where
+  // `handleOlderExpand` only refreshes discovery and the
+  // exhausted-discovery case where `loadable === 0`).
+  const olderSkeletonCount = $derived(trainingStore.olderSkeletonCountFor(workspaceId));
+
+  // The count the operator's NEXT "Load N more" click would
+  // surface, capped at `PAGE_SIZE`.  Formula:
+  // `max(0, min(loadableOlder - olderSkeletonCount, PAGE_SIZE))`.
+  // `loadableOlder` is already `discovered ∖ history` (the
+  // still-reachable pool); subtracting the in-flight
+  // `olderSkeletonCount` answers "after the in-flight batch
+  // lands, how many older runs remain reachable?".  When no
+  // batch is loading, `olderSkeletonCount` is 0 and the formula
+  // collapses to `min(loadableOlder, PAGE_SIZE)`.
+  //
+  // Drives BOTH the button's visibility (`> 0` → mount) and
+  // its displayed numeral, so the pager mounts in the same
+  // frame the disclosure opens instead of waiting for the
+  // auto-load to drain.  Two desirable properties:
+  //   - The button appears with the disclosure body's
+  //     `in:fade` (no separate 500-700 ms wait before it pops
+  //     in), so no standalone appearance transition is needed.
+  //   - The displayed numeral is stable from the click-tick
+  //     through the batch landing: at the click-tick
+  //     `olderSkeletonCount` jumps to `pending` (= `min(load
+  //     ableOlder, PAGE_SIZE)` at that moment); at batch
+  //     landing `pushHistoryBatch` shrinks `loadableOlder` by
+  //     exactly that same `pending` amount and
+  //     `olderSkeletonCount` returns to 0.  Both edits land in
+  //     a single Svelte render tick, so the numeral never
+  //     re-counts visibly mid-load.
+  // Zero correctly hides the button: either the current batch
+  // fully drains the discovered pool, or the click was on the
+  // last batch -- in both cases there's genuinely nothing
+  // more for the operator to surface.
+  const nextLoadCount = $derived(
+    Math.max(0, Math.min(loadableOlder - olderSkeletonCount, TRAINING_HISTORY_PAGE_SIZE))
+  );
 
   // ── Expansion bookkeeping (per-item, ephemeral) ─────────────
 
@@ -214,6 +276,102 @@
     await trainingStore.loadMoreHistory(workspaceId);
   }
 
+  // ── Right-click ContextMenu (single per-list) ───────────────
+  //
+  // Same delegation idiom as HeadsTable + CategoryList: the
+  // parent owns one ContextMenu instance, the list wrapper
+  // captures `oncontextmenu` and walks
+  // `closest('[data-job-id]')` to find the row, and the menu's
+  // items call the store's `deleteHistoryEntry` directly --
+  // there's no other action shape exposed today.  Cancel
+  // intentionally stays on the TrainPane header (single
+  // canonical run-lifecycle surface; see the docblock above).
+  //
+  // Daemon gates (mirrored in `buildMenu`):
+  // * `JobConflict` if a Train producer is active for this
+  //   workspace -- the producer holds the log tree.  We treat
+  //   "any active train job for this workspace" as the gate
+  //   (the daemon's check is per-workspace, not per-jobId), so
+  //   even non-live rows lock Delete while a sibling run is in
+  //   flight.
+  // * The live row itself can never be deleted (it IS the
+  //   producer's open file).  Same disablement; the `hint`
+  //   field reads `live` so the operator's tooltip distinguishes
+  //   "this row" from "any row".
+  // * `404` if the JSONL was already pruned by the keep-last-N
+  //   reaper; we surface it via the inline banner on the
+  //   failure path, no special UI for it.
+  let menuOpen = $state(false);
+  let menuX = $state(0);
+  let menuY = $state(0);
+  let menuSections = $state<MenuSection[]>([]);
+
+  function onListContextMenu(e: MouseEvent): void {
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    // Skip when the cursor lands on a control that owns its own
+    // right-click semantics (none today, but the guard documents
+    // the contract -- inputs/textareas in particular keep their
+    // native edit menu).
+    if (target.closest('input, textarea')) return;
+    const rowEl = target.closest<HTMLElement>('[data-job-id]');
+    const jobId = rowEl?.dataset.jobId ?? null;
+    if (!jobId) return;
+    // Resolve the jobId back to a `TrackedTrainingJob` via the
+    // store (vs. closing over the locals).  Active is the only
+    // slot that holds the live entry; history holds the
+    // terminals.  We look the active slot up first because
+    // `historyByWs` doesn't include the live one.
+    const live = trainingStore.activeFor(workspaceId);
+    const fromActive = live?.jobId === jobId ? live : null;
+    const fromHistory =
+      trainingStore.historyFor(workspaceId).find((j) => j.jobId === jobId) ?? null;
+    const job = fromActive ?? fromHistory;
+    if (!job) return;
+    const sections = buildMenu(job);
+    if (sections.length === 0) return;
+    e.preventDefault();
+    // Stop propagation so the workspace detail page's root
+    // `oncontextmenu` (Rename / Delete this workspace / Back)
+    // doesn't also open at the same cursor.  Same convention as
+    // CategoryList / HeadsTable.
+    e.stopPropagation();
+    menuX = e.clientX;
+    menuY = e.clientY;
+    menuSections = sections;
+    menuOpen = true;
+  }
+
+  function buildMenu(job: TrackedTrainingJob): MenuSection[] {
+    const live = trainingStore.activeFor(workspaceId);
+    const trainActive = live !== null;
+    const isLiveRow = live?.jobId === job.jobId;
+    const deleting = trainingStore.historyDeletingForJob(workspaceId, job.jobId);
+    // Hint priority: in-flight delete reads via the label morph
+    // ("Deleting…"), so the right-side hint slot stays empty
+    // there.  Otherwise distinguish "this row is the live run"
+    // from "another train is running" so the operator's tooltip
+    // names the actual obstacle.
+    let hint: string | undefined;
+    if (!deleting) {
+      if (isLiveRow) hint = 'live';
+      else if (trainActive) hint = 'train active';
+    }
+    return [
+      {
+        items: [
+          {
+            label: deleting ? 'Deleting…' : 'Delete',
+            variant: 'destructive',
+            disabled: trainActive || deleting,
+            hint,
+            onclick: () => void trainingStore.deleteHistoryEntry(workspaceId, job.jobId)
+          }
+        ]
+      }
+    ];
+  }
+
   // ── Render helpers ──────────────────────────────────────────
 
   // Plural-safe label fragment ("run" vs. "runs").  Inlined
@@ -221,6 +379,14 @@
   // call site is in this file.
   function runWord(n: number): string {
     return n === 1 ? 'run' : 'runs';
+  }
+
+  // Inline-banner copy + dismissal proxy.  Snapshotted as
+  // `$derived` so the banner re-renders on store mutations
+  // without each access re-reading the proxy.
+  const deleteError = $derived(trainingStore.historyDeleteErrorFor(workspaceId));
+  function onDismissDeleteError(): void {
+    trainingStore.dismissHistoryDeleteError(workspaceId);
   }
 </script>
 
@@ -243,7 +409,14 @@
      copy stays single-sourced against the gate; the daemon ↔
      frontend coupling is the only place that still has to
      move in lockstep. -->
-<div class="flex flex-col gap-2">
+<!-- `oncontextmenu` on the wrapping div delegates row-level
+     right-clicks to one handler -- same shape as HeadsTable +
+     CategoryList.  Heading + retention-hint right-clicks fall
+     through (no `data-job-id` ancestor, so `closest()` returns
+     null and we early-return without `preventDefault`), which
+     lets the workspace detail page's root context menu take
+     over for that cursor. -->
+<div class="flex flex-col gap-2" oncontextmenu={onListContextMenu} role="presentation">
   <div class="flex items-baseline justify-between">
     <h3 class="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">History</h3>
     {#if eagerHistory.length + olderHistory.length + loadableOlder > 0}
@@ -266,14 +439,80 @@
     {/if}
   </div>
 
+  {#if deleteError}
+    {@const hasMessage = deleteError.trim().length > 0}
+    <!-- History-delete failure banner.  Same rose-200 / rose-50
+         chrome as TrainPane's `startError` and HeadsTable's
+         `actionError` so the three dismissible surfaces read as
+         one family.  The two-mode (single-line vs multi-line)
+         padding switch mirrors HeadsTable's banner so the chip
+         collapses neatly when the daemon returns a code-only
+         envelope without a typed message. -->
+    <div
+      in:fade={{ duration: 200, easing: cubicOut }}
+      out:fade={{ duration: 160, easing: cubicOut }}
+      class="flex justify-between gap-2 rounded-md border border-rose-200 bg-rose-50 text-xs text-rose-900"
+      class:items-start={hasMessage}
+      class:items-center={!hasMessage}
+      class:px-3={hasMessage}
+      class:py-2={hasMessage}
+      class:py-1={!hasMessage}
+      class:pr-1={!hasMessage}
+      class:pl-2.5={!hasMessage}
+      role="alert"
+    >
+      <div class="min-w-0">
+        <p class="font-medium">Could not delete training log</p>
+        {#if hasMessage}
+          <p class="mt-0.5 wrap-break-word">{deleteError}</p>
+        {/if}
+      </div>
+      <button
+        type="button"
+        onclick={onDismissDeleteError}
+        aria-label="Dismiss"
+        class="shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
+        class:-mt-1={hasMessage}
+        class:-mr-2={hasMessage}
+      >
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          class="h-3.5 w-3.5"
+          aria-hidden="true"
+        >
+          <path d="M6 6l12 12M6 18L18 6" />
+        </svg>
+      </button>
+    </div>
+  {/if}
+
   {#if isEmpty}
     <!-- Empty state.  Sized to roughly the visual weight of a
          single collapsed history item so the section's height
          is stable between "no runs" and "one run" -- the
          first-ever submit doesn't shift the heads list below
-         by half a card. -->
+         by half a card.
+         Horizontally centred: the icon + sentence cluster sits
+         in the middle of the dashed card rather than pinned to
+         the left edge.  The card is a *notice* (no actions, no
+         data to scan in a column), so left-alignment was
+         expressing list-row affordance where there is no list
+         -- the operator's eye landed at the left margin
+         expecting a clickable row.  `justify-center` on the
+         flex container centres the icon+text cluster as a
+         single unit so the icon still hugs the start of the
+         sentence (the alternative -- centring each child --
+         would leave a visible gap between the glyph and its
+         caption).  `text-center` on the `<span>` propagates
+         the alignment to wrapped lines on narrow viewports;
+         without it the wrap would re-anchor to the left within
+         the centred cluster's bounding box. -->
     <div
-      class="flex items-center gap-2 rounded-md border border-dashed border-zinc-200 bg-zinc-50/60 px-3 py-3 text-[11px] text-zinc-500"
+      class="flex items-center justify-center gap-2 rounded-md border border-dashed border-zinc-200 bg-zinc-50/60 px-3 py-3 text-[11px] text-zinc-500"
     >
       <svg
         viewBox="0 0 20 20"
@@ -287,7 +526,9 @@
           clip-rule="evenodd"
         />
       </svg>
-      <span>No training runs yet for this workspace. Click <b>Train head</b> to start one.</span>
+      <span class="text-center"
+        >No training runs yet for this workspace. Click <b>Train head</b> to start one.</span
+      >
     </div>
   {:else}
     <!-- Eager tier: active + top INITIAL_VISIBLE non-hidden
@@ -301,13 +542,25 @@
           isLive={active?.jobId === job.jobId}
           expanded={expanded.has(job.jobId)}
           ontoggle={() => toggle(job.jobId)}
+          isDeleting={trainingStore.historyDeletingForJob(workspaceId, job.jobId)}
         />
       {/each}
-      {#if showEagerSkeletons}
-        <!-- Two skeleton rows matching INITIAL_VISIBLE.  Sized
-             to a collapsed-card footprint (h-10 = 40 px) so
-             the layout below this region doesn't jump as the
-             real cards land. -->
+      {#each Array.from({ length: eagerSkeletonCount }, (_, i) => i) as i (i)}
+        <!-- Skeleton row.  Sized to a collapsed-card footprint
+             (`h-10` = 40 px) so it matches the real
+             TrainHistoryItem's resting height -- the eager
+             `<ul>` keeps the same total height through every
+             transition (initial hydration → real cards land,
+             delete drains a row → auto-refill backfill lands).
+             Without this exact size match the eager tier
+             visibly shrinks for the duration of the backfill
+             fetch and re-grows when the new card mounts, a
+             "shrink → re-grow" judder the operator notices
+             every time they delete from a freshly-mounted
+             page.  The 40 px floor is the
+             `text-xs leading-tight` line-box + `py-2.5`
+             vertical padding the real card adopts before any
+             trailing tokens land. -->
         <li
           aria-hidden="true"
           class="h-10 animate-pulse overflow-hidden rounded-md border border-zinc-200 border-l-4 border-l-zinc-200 bg-white"
@@ -319,18 +572,7 @@
             <span class="h-3 w-12 shrink-0 rounded bg-zinc-200"></span>
           </div>
         </li>
-        <li
-          aria-hidden="true"
-          class="h-10 animate-pulse overflow-hidden rounded-md border border-zinc-200 border-l-4 border-l-zinc-200 bg-white"
-        >
-          <div class="flex items-center gap-x-3 px-3 py-2.5">
-            <span class="h-3 w-3 shrink-0 rounded-full bg-zinc-200"></span>
-            <span class="h-3 w-14 shrink-0 rounded bg-zinc-200"></span>
-            <span class="h-3 w-24 shrink-0 rounded bg-zinc-200"></span>
-            <span class="h-3 w-10 shrink-0 rounded bg-zinc-200"></span>
-          </div>
-        </li>
-      {/if}
+      {/each}
     </ul>
 
     {#if olderTotal > 0}
@@ -414,7 +656,22 @@
 
         {#if olderExpanded}
           <div in:fade={{ duration: 200, easing: cubicOut }} class="flex flex-col gap-2">
-            {#if olderHistory.length > 0}
+            <!-- Skeletons live INSIDE this `<ul>` (as `<li>`
+                 siblings of the loaded rows) so each one
+                 occupies a real list slot under the
+                 `flex-col gap-2` rhythm.  When the in-flight
+                 `loadBatch` resolves, the placeholders
+                 disappear in the same tick the real rows
+                 mount, an in-place skeleton → real-row swap
+                 that keeps the section's height constant.
+                 The previous design parked a single
+                 placeholder `<div>` outside the `<ul>`, which
+                 (a) suggested "1 row incoming" regardless of
+                 how many the operator just asked for, and (b)
+                 introduced a layout shift between
+                 placeholder-as-div (40 px) and ul-of-N-rows
+                 (N × 40 px + gaps). -->
+            {#if olderHistory.length > 0 || olderSkeletonCount > 0}
               <ul class="flex flex-col gap-2">
                 {#each olderHistory as job (job.jobId)}
                   <TrainHistoryItem
@@ -422,29 +679,30 @@
                     isLive={false}
                     expanded={expanded.has(job.jobId)}
                     ontoggle={() => toggle(job.jobId)}
+                    isDeleting={trainingStore.historyDeletingForJob(workspaceId, job.jobId)}
                   />
+                {/each}
+                {#each Array.from({ length: olderSkeletonCount }, (_, i) => i) as i (i)}
+                  <!-- Older-tier skeleton row.  Same shape +
+                       height as the eager skeleton so the two
+                       tiers read as one placeholder language;
+                       see `eagerSkeletonCount`'s render block
+                       above for the `h-10` rationale. -->
+                  <li
+                    aria-hidden="true"
+                    class="h-10 animate-pulse overflow-hidden rounded-md border border-zinc-200 border-l-4 border-l-zinc-200 bg-white"
+                  >
+                    <div class="flex items-center gap-x-3 px-3 py-2.5">
+                      <span class="h-3 w-3 shrink-0 rounded-full bg-zinc-200"></span>
+                      <span class="h-3 w-16 shrink-0 rounded bg-zinc-200"></span>
+                      <span class="h-3 w-24 shrink-0 rounded bg-zinc-200"></span>
+                    </div>
+                  </li>
                 {/each}
               </ul>
             {/if}
 
-            {#if loadingMore}
-              <!-- One skeleton row while the next page is in
-                   flight.  A single row is enough to convey
-                   "more incoming" without dominating the
-                   layout. -->
-              <div
-                aria-hidden="true"
-                class="h-10 animate-pulse overflow-hidden rounded-md border border-zinc-200 border-l-4 border-l-zinc-200 bg-white"
-              >
-                <div class="flex items-center gap-x-3 px-3 py-2.5">
-                  <span class="h-3 w-3 shrink-0 rounded-full bg-zinc-200"></span>
-                  <span class="h-3 w-16 shrink-0 rounded bg-zinc-200"></span>
-                  <span class="h-3 w-24 shrink-0 rounded bg-zinc-200"></span>
-                </div>
-              </div>
-            {/if}
-
-            {#if loadableOlder > 0 && !loadingMore}
+            {#if nextLoadCount > 0}
               <!-- "Load N more" pagination control.  Same
                    center-aligned, hairline-rule-framed
                    treatment as the parent "Show N older runs"
@@ -464,18 +722,67 @@
                    parent flex-col's 8 px `gap-2`, and bottom
                    pulls 16 px out of the section's 20 px `p-5`
                    bottom padding -- both leaving 4 px visible
-                   around the hover bg pill. -->
+                   around the hover bg pill.
+
+                   ## Visibility = `nextLoadCount > 0`
+                   The predicate reads "after the currently-
+                   loading batch lands, is there still more
+                   the operator can pull?" rather than the old
+                   "is anything available right now AND no
+                   load in flight?".  Effect: the pager mounts
+                   in the same frame the disclosure opens (it
+                   simply fades in with its parent's `in:fade`),
+                   instead of being held off until the
+                   auto-load completes -- which read as a 500-
+                   700 ms wait before the pager finally popped
+                   in.  No standalone appearance transition is
+                   needed because the pager is already part of
+                   the disclosure body's fade-in; adding one
+                   on top would re-introduce the perceived
+                   "waiting animation" the new predicate is
+                   designed to eliminate.
+
+                   ## Disabled while loading
+                   The button stays mounted but locks while
+                   `loadingMore` is true: a click during the
+                   load would hit `loadMoreHistory`'s internal
+                   re-entry guard and silently no-op anyway,
+                   so disabling surfaces that fact in the
+                   chrome rather than letting the operator
+                   wonder why their click "did nothing".
+                   `enabled:hover:*` keeps the wash from
+                   firing in the disabled state, and
+                   `disabled:opacity-50` carries the visual
+                   distinction.  Tailwind's default `transition`
+                   list includes `opacity`, so the
+                   enabled↔disabled flip is a 150 ms tween
+                   rather than a hard step -- the same wash
+                   tween already in the class list.
+
+                   ## Stable count from click-tick through
+                   batch landing
+                   See `nextLoadCount`'s docblock above for the
+                   full derivation; the relevant property here
+                   is that the displayed numeral doesn't
+                   visibly re-count when rows land.  At the
+                   click-tick `olderSkeletonCount` jumps to
+                   `pending`, and at batch landing
+                   `pushHistoryBatch` shrinks `loadableOlder`
+                   by exactly that same `pending` amount -- so
+                   the formula's value is identical on both
+                   sides of the await.  The eye reads the pager
+                   as a stable target rather than a value that
+                   jitters mid-load. -->
               <div class="-mt-1 -mb-4 flex items-center justify-center gap-2.5">
                 <span class="h-px w-6 bg-zinc-200" aria-hidden="true"></span>
                 <button
                   type="button"
                   onclick={() => void onLoadMore()}
-                  class="rounded-md px-2 py-0.5 text-[11px] text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900"
+                  disabled={loadingMore}
+                  class="rounded-md px-2 py-0.5 text-[11px] text-zinc-500 transition enabled:hover:bg-zinc-100 enabled:hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
                   title="Fetch the next batch of older training runs from the daemon."
                 >
-                  Load <span class="font-mono tabular-nums"
-                    >{Math.min(loadableOlder, TRAINING_HISTORY_PAGE_SIZE)}</span
-                  >
+                  Load <span class="font-mono tabular-nums">{nextLoadCount}</span>
                   more
                 </button>
                 <span class="h-px w-6 bg-zinc-200" aria-hidden="true"></span>
@@ -487,3 +794,17 @@
     {/if}
   {/if}
 </div>
+
+<!-- Single per-list ContextMenu instance.  Lives outside the
+     wrapping `<div>` so its `position: fixed` chrome paints
+     above the parent section's card boundaries; the menu's
+     own `z-50` handles stacking against the rest of the page.
+     Triggered from the wrapper's `oncontextmenu` handler
+     above. -->
+<ContextMenu
+  open={menuOpen}
+  x={menuX}
+  y={menuY}
+  sections={menuSections}
+  onclose={() => (menuOpen = false)}
+/>

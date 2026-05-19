@@ -2,8 +2,10 @@
   import { fade } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
   import Button from '$lib/components/ui/Button.svelte';
+  import ContextMenu, { type MenuSection } from '$lib/components/ui/ContextMenu.svelte';
   import { config as configStore } from '$lib/stores/config.svelte';
   import { errorCopy } from '$lib/utils/error-copy';
+  import { exportHead } from '$lib/api/heads-export';
   import HeadRow from './HeadRow.svelte';
   import DeleteHeadDialog from './DeleteHeadDialog.svelte';
   import type { ActiveResp, HeadRecord, Uuid } from '$lib/api/types';
@@ -36,11 +38,19 @@
 
   interface Props {
     workspaceId: Uuid;
+    /// Workspace's human-readable name, threaded through purely
+    /// to seed the alpkg export's filename slug (`<ws>-head-<id8>
+    /// .alpkg`) and the package manifest's `source.workspace_name`
+    /// lookup hint.  Not load-bearing for any other surface in
+    /// this component -- a missing name would only produce a
+    /// `head-<id8>.alpkg` fallback filename via
+    /// `safeFilenameSlug`'s empty-input branch.
+    workspaceName: string;
     heads: readonly HeadRecord[];
     liveRevision: number;
     onchanged: () => Promise<void> | void;
   }
-  let { workspaceId, heads, liveRevision, onchanged }: Props = $props();
+  let { workspaceId, workspaceName, heads, liveRevision, onchanged }: Props = $props();
 
   // Frontend mirror of the daemon's `MAX_HEADS_PER_WORKSPACE`
   // (modules/common/workspace.rs).  Surfaced inline next to the
@@ -91,26 +101,37 @@
     return null;
   });
 
-  // Per-list busy id: serialise deploy / delete across rows so the
-  // operator can't fire two destructive actions in parallel during
-  // a slow network blip.
+  // Per-list busy id: serialise deploy / delete / export across
+  // rows so the operator can't fire two heavy actions in parallel
+  // during a slow network blip.  Deploy and export both use this
+  // slot; delete uses its own dialog-driven flow.
   let busyHeadId = $state<Uuid | null>(null);
   // True while the daemon-default fallback row is mid-deploy.  The
   // workspace-head rows have a per-row spinner; the default row
   // gets a separate flag because it doesn't carry a `head_id`.
   let deployingDefault = $state(false);
+  // Mirror of `busyHeadId` for the export pipeline.  Two slots
+  // (rather than one shared "busy" id with a `kind` discriminator)
+  // keeps each handler's reset logic local and avoids a typo
+  // where the deploy chain forgets to clear the export id (or
+  // vice versa).  Both feed `interactionBlocked` so a row that's
+  // mid-export disables Deploy / Delete on every sibling row.
+  let exportingHeadId = $state<Uuid | null>(null);
 
   let deleteOpen = $state(false);
   let deleteHead = $state<HeadRecord | null>(null);
 
-  // Last failed deploy attempt, surfaced inline below the list.
-  // `kind` distinguishes a head deploy (carries the head id for
-  // copy) from a default deploy (no id) so the message can name
-  // the failed target.  Cleared on the next deploy click so a
-  // retry's pending UI isn't shadowed by a stale red banner.
-  let deployError = $state<
-    { kind: 'head'; headId: Uuid; message: string } | { kind: 'default'; message: string } | null
-  >(null);
+  // Last failed action attempt, surfaced inline below the list.
+  // `kind` discriminates the three action shapes so the banner's
+  // title can name the failed target ("Could not deploy head
+  // <id>" / "Could not deploy default head" / "Could not export
+  // head <id>").  Cleared at the start of the next action so a
+  // retry's pending UI isn't shadowed by a stale rose banner.
+  type ActionError =
+    | { kind: 'deploy-head'; headId: Uuid; message: string }
+    | { kind: 'deploy-default'; message: string }
+    | { kind: 'export-head'; headId: Uuid; message: string };
+  let actionError = $state<ActionError | null>(null);
 
   // Revert-to-prior: stash the runtime active record from before
   // the most recent successful deploy so the operator can roll
@@ -144,32 +165,32 @@
   }
 
   async function deployHead(headId: Uuid): Promise<void> {
-    if (busyHeadId !== null || deployingDefault) return;
+    if (interactionBlocked) return;
     busyHeadId = headId;
-    deployError = null;
+    actionError = null;
     try {
       recordPrevious({ kind: 'head', headId });
       await configStore.activateHead(workspaceId, headId);
       await onchanged();
     } catch (e) {
       previousActive = null;
-      deployError = { kind: 'head', headId, message: errorCopy(e) };
+      actionError = { kind: 'deploy-head', headId, message: errorCopy(e) };
     } finally {
       if (busyHeadId === headId) busyHeadId = null;
     }
   }
 
   async function deployDefault(): Promise<void> {
-    if (deployingDefault || busyHeadId !== null) return;
+    if (interactionBlocked) return;
     deployingDefault = true;
-    deployError = null;
+    actionError = null;
     try {
       recordPrevious({ kind: 'default' });
       await configStore.activateDefault();
       await onchanged();
     } catch (e) {
       previousActive = null;
-      deployError = { kind: 'default', message: errorCopy(e) };
+      actionError = { kind: 'deploy-default', message: errorCopy(e) };
     } finally {
       deployingDefault = false;
     }
@@ -186,35 +207,59 @@
   async function revert(): Promise<void> {
     const prev = previousActive;
     if (prev === null) return;
-    if (busyHeadId !== null || deployingDefault) return;
+    if (interactionBlocked) return;
     if (prev.origin === 'head') {
       const headId = prev.source_head_id;
       const wsId = prev.source_workspace_id;
       busyHeadId = headId;
-      deployError = null;
+      actionError = null;
       try {
         previousActive = configStore.active;
         await configStore.activateHead(wsId, headId);
         await onchanged();
       } catch (e) {
         previousActive = prev;
-        deployError = { kind: 'head', headId, message: errorCopy(e) };
+        actionError = { kind: 'deploy-head', headId, message: errorCopy(e) };
       } finally {
         if (busyHeadId === headId) busyHeadId = null;
       }
     } else {
       deployingDefault = true;
-      deployError = null;
+      actionError = null;
       try {
         previousActive = configStore.active;
         await configStore.activateDefault();
         await onchanged();
       } catch (e) {
         previousActive = prev;
-        deployError = { kind: 'default', message: errorCopy(e) };
+        actionError = { kind: 'deploy-default', message: errorCopy(e) };
       } finally {
         deployingDefault = false;
       }
+    }
+  }
+
+  // Drive the alpkg export pipeline for a single head row.  The
+  // orchestrator owns fetch / validate / pack / SaveAs; this
+  // handler just gates concurrency against the deploy chain
+  // (via `interactionBlocked`) and routes any typed failure into
+  // the shared `actionError` banner so the operator sees one
+  // alert surface for every action shape on this list.
+  //
+  // Read-only at the daemon level -- a stuck export does NOT
+  // block deploy/delete on the daemon side; the gate is purely
+  // a client-side guardrail to avoid two concurrent in-flight
+  // alpkg downloads stomping over the SaveAs dialog.
+  async function exportHeadAction(head: HeadRecord): Promise<void> {
+    if (interactionBlocked) return;
+    exportingHeadId = head.head_id;
+    actionError = null;
+    try {
+      await exportHead({ workspaceId, workspaceName, head });
+    } catch (e) {
+      actionError = { kind: 'export-head', headId: head.head_id, message: errorCopy(e) };
+    } finally {
+      if (exportingHeadId === head.head_id) exportingHeadId = null;
     }
   }
 
@@ -244,12 +289,12 @@
     );
   });
 
-  function dismissDeployError(): void {
-    deployError = null;
+  function dismissActionError(): void {
+    actionError = null;
   }
 
   function requestDelete(head: HeadRecord): void {
-    if (busyHeadId !== null || deployingDefault) return;
+    if (interactionBlocked) return;
     deleteHead = head;
     deleteOpen = true;
   }
@@ -275,7 +320,87 @@
     await onchanged();
   }
 
-  const interactionBlocked = $derived(busyHeadId !== null || deployingDefault);
+  // Any in-flight action across deploy / default-deploy / export
+  // blocks every sibling action until terminal.  The handlers
+  // each guard on this derived AND clear it in `finally` so a
+  // throw before the awaited daemon call can't strand the slot.
+  const interactionBlocked = $derived(
+    busyHeadId !== null || deployingDefault || exportingHeadId !== null
+  );
+
+  // Right-click ContextMenu.  Same pattern as the workspace list +
+  // CategoryList: parent owns a single menu instance, the list
+  // wrapper captures `oncontextmenu` and walks `data-head-id` to
+  // identify which row the cursor landed on, and the menu's items
+  // call the same handlers the visible Deploy/Export buttons use.
+  // Empty-area right-clicks (cursor lands outside any head row,
+  // e.g. on the dashed Default fallback or in the scroller gutter)
+  // get no menu -- the early-return below leaves `preventDefault`
+  // un-called so the workspace detail page's own context menu
+  // (Rename / Delete this workspace / …) takes over for that
+  // cursor instead.
+  let menuOpen = $state(false);
+  let menuX = $state(0);
+  let menuY = $state(0);
+  let menuSections = $state<MenuSection[]>([]);
+
+  function onListContextMenu(e: MouseEvent): void {
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    const rowEl = target.closest<HTMLElement>('[data-head-id]');
+    const headId = rowEl?.dataset.headId ?? null;
+    const head = headId ? (heads.find((h) => h.head_id === headId) ?? null) : null;
+    if (head === null) return;
+    const sections = buildMenu(head);
+    if (sections.length === 0) return;
+    e.preventDefault();
+    // Stop propagation so the workspace detail page's root
+    // `oncontextmenu` doesn't also open at the same cursor --
+    // inner handlers always win, matching the convention in
+    // CategoryList.
+    e.stopPropagation();
+    menuX = e.clientX;
+    menuY = e.clientY;
+    menuSections = sections;
+    menuOpen = true;
+  }
+
+  function buildMenu(head: HeadRecord): MenuSection[] {
+    const isThisDeployed = deployedHeadId === head.head_id;
+    const isThisExporting = exportingHeadId === head.head_id;
+    // Per-item disablement:
+    // * Export: only blocked when ANOTHER mutation is in flight
+    //   on this list (including this row's own deploy).  If this
+    //   row is already exporting, surface the live state in the
+    //   label rather than silently disabling.
+    // * Delete: blocked when this head is the runtime-active
+    //   one (the daemon would 409) or when any mutation is in
+    //   flight.  The `hint` column on the menu item carries the
+    //   short reason for visibility.
+    const exportDisabled = interactionBlocked && !isThisExporting;
+    const deleteDisabled = isThisDeployed || interactionBlocked;
+    const deleteHint = isThisDeployed ? 'deployed' : undefined;
+    return [
+      {
+        items: [
+          {
+            label: isThisExporting ? 'Exporting…' : 'Export as .alpkg',
+            disabled: exportDisabled || isThisExporting,
+            onclick: () => void exportHeadAction(head)
+          },
+          {
+            label: 'Delete',
+            variant: 'destructive',
+            disabled: deleteDisabled,
+            hint: deleteHint,
+            onclick: () => {
+              requestDelete(head);
+            }
+          }
+        ]
+      }
+    ];
+  }
 </script>
 
 <!-- Compact pane card matching the dataset module's InputPane /
@@ -399,17 +524,32 @@
        `px-3`.  No empty-state notice: when `heads.length === 0`
        the default fallback row below is the only deploy target,
        and the row's own copy plus its Deploy button already
-       answer "what can I do here". -->
-  <div class="-mr-1 min-h-0 flex-1 overflow-y-auto pr-1">
+       answer "what can I do here".
+       `oncontextmenu` hangs off this scroller (not the row
+       elements themselves) so the parent owns a single delegated
+       handler -- matches the convention in CategoryList /
+       workspaces list, and lets the menu state live in one
+       place.  Right-clicks outside a head row (e.g. on the
+       dashed Default row) fall through to the workspace detail
+       page's own context menu via the early-return in
+       `onListContextMenu`. -->
+  <div
+    class="-mr-1 min-h-0 flex-1 overflow-y-auto pr-1"
+    oncontextmenu={onListContextMenu}
+    role="presentation"
+  >
     <ul class="flex flex-col gap-2">
       {#each ordered as head (head.head_id)}
         <HeadRow
           {head}
           isLatest={head.head_id === latestHeadId}
           isDeployed={deployedHeadId === head.head_id}
-          busy={interactionBlocked && busyHeadId !== head.head_id}
+          busy={interactionBlocked &&
+            busyHeadId !== head.head_id &&
+            exportingHeadId !== head.head_id}
+          isExporting={exportingHeadId === head.head_id}
           ondeploy={deployHead}
-          ondelete={requestDelete}
+          onexport={exportHeadAction}
         />
       {/each}
 
@@ -469,13 +609,13 @@
     </ul>
   </div>
 
-  <!-- Deploy-failure banner.  Pinned to the bottom of the card
+  <!-- Action-failure banner.  Pinned to the bottom of the card
        (below the scroller, above the section's bottom padding)
        so a slow-network failure doesn't shove still-correct
        heads down and stays visible regardless of scroll position.
-       Names the target (head short id or "default") so the
-       operator can correlate the message with the row they
-       clicked.
+       Title branches on `actionError.kind` so the operator sees
+       which action failed (deploy / deploy-default / export) and
+       which row was involved.
        Shared style with TrainPane's start-error and InputPane's
        recorder/generic error chips so the three dismissible
        alert surfaces read as one family:
@@ -493,7 +633,7 @@
            2) for a thinner, more modern silhouette than the prior
            filled-path glyph -- matches InputPane's icon, and at
            h-3.5 w-3.5 reads identically across the family.
-       Two layout modes, driven by whether `deployError.message`
+       Two layout modes, driven by whether `actionError.message`
        carries any text:
          * MULTI-LINE (default for real failures -- the daemon
            returns a typed string explanation): `items-start` +
@@ -530,8 +670,18 @@
            for a more compact, glanceable chip when there's no
            message body to anchor. -->
 
-  {#if deployError}
-    {@const hasMessage = deployError.message.trim().length > 0}
+  {#if actionError}
+    <!-- Snapshot the reactive `actionError` into a non-reactive
+         local so the inner kind-discriminated branches can narrow
+         once and reuse the narrowed type without each
+         `actionError.X` access re-reading the `$state` proxy and
+         widening back to the union (which then loses
+         `.headId` for the export branch).  Pattern shared with
+         other reactive-discriminator surfaces in this codebase
+         (the `active` snapshot in DeployPane's `pillCopy`
+         derivation does the same trick). -->
+    {@const err = actionError}
+    {@const hasMessage = err.message.trim().length > 0}
     <div
       in:fade={{ duration: 200, easing: cubicOut }}
       out:fade={{ duration: 160, easing: cubicOut }}
@@ -547,23 +697,27 @@
     >
       <div class="min-w-0">
         <p class="font-medium">
-          Could not deploy
-          {#if deployError.kind === 'head'}
-            head
-            <span class="font-mono text-[10px]" title={deployError.headId}>
-              {deployError.headId.slice(0, 8)}…
+          {#if err.kind === 'deploy-head'}
+            Could not deploy head
+            <span class="font-mono text-[10px]" title={err.headId}>
+              {err.headId.slice(0, 8)}…
+            </span>
+          {:else if err.kind === 'export-head'}
+            Could not export head
+            <span class="font-mono text-[10px]" title={err.headId}>
+              {err.headId.slice(0, 8)}…
             </span>
           {:else}
-            default head
+            Could not deploy default head
           {/if}
         </p>
         {#if hasMessage}
-          <p class="mt-0.5 wrap-break-word">{deployError.message}</p>
+          <p class="mt-0.5 wrap-break-word">{err.message}</p>
         {/if}
       </div>
       <button
         type="button"
-        onclick={dismissDeployError}
+        onclick={dismissActionError}
         aria-label="Dismiss"
         class="shrink-0 rounded-md p-1 text-rose-700 transition hover:bg-rose-100"
         class:-mt-1={hasMessage}
@@ -591,4 +745,18 @@
   head={deleteHead}
   onclose={onDeleteClose}
   ondeleted={onDeleted}
+/>
+
+<!-- Single per-list ContextMenu instance.  Renders at the body
+     end so its `position: fixed` chrome paints above the section
+     card and the workspace detail page's tab strip without an
+     explicit `z-index` stack discipline (the menu's own `z-50`
+     handles the rest).  Triggered from the scroller's
+     `oncontextmenu` handler. -->
+<ContextMenu
+  open={menuOpen}
+  x={menuX}
+  y={menuY}
+  sections={menuSections}
+  onclose={() => (menuOpen = false)}
 />
