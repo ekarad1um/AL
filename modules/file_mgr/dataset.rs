@@ -55,18 +55,17 @@ pub const DATASETS_DIR_NAME: &str = "datasets";
 pub const CONVERTERS_DIR_NAME: &str = "converters";
 
 /// Subdirectory holding the trainer's per-job JSONL log backstop.
-/// Producer: `TrainJobLog` in [`crate::training`].  Deletes drain
-/// through the unified async asset surface (with a producer-active
-/// pre-check that returns 409 while a Train job for the workspace
-/// is running).
+/// Producer: the shared [`super::JsonlEventLog`] writer
+/// instantiated as `JsonlEventLog<TrainEvent>` in
+/// [`crate::training`].  Deletes drain through the unified async
+/// asset surface (with a producer-active pre-check that returns
+/// 409 while a Train job for the workspace is running).
 pub const TRAINING_LOGS_DIR_NAME: &str = "training_logs";
 
 /// Subdirectory holding the converter's per-job JSONL log
-/// backstop.  Producer: `ConvertJobLog` in
-/// [`crate::converter`].  (Linked here as plain text rather
-/// than an intra-doc link because the helper is private to the
-/// converter crate; rustdoc cannot resolve a `pub(crate)` item
-/// from a sibling module.)
+/// backstop.  Producer: the shared [`super::JsonlEventLog`]
+/// writer instantiated as `JsonlEventLog<ConvertEvent>` in
+/// [`crate::converter`].
 pub const CONVERTER_LOGS_DIR_NAME: &str = "converter_logs";
 
 /// Discriminator for which workspace tree a workspace-rooted

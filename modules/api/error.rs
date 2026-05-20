@@ -167,6 +167,20 @@ impl ApiError {
             {
                 "another_train_running"
             }
+            // `.alpkg` head-import collision -- divergent
+            // `sha256` for an already-imported `head_id`.
+            // Frontend's error-copy maps the dedicated code to
+            // a recovery hint ("delete the existing head first").
+            // The error reaches us either directly as a
+            // `FileError::HeadIdCollision` (via api.File) or
+            // wrapped through the convert worker's
+            // `ConvertError::HeadIdCollision` variant.
+            ApiError::File(crate::file_mgr::FileError::HeadIdCollision { .. }) => {
+                "head_id_collision"
+            }
+            ApiError::Convert(crate::converter::ConvertError::HeadIdCollision(_)) => {
+                "head_id_collision"
+            }
             _ => self.kind().code_str(),
         }
     }

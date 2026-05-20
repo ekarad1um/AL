@@ -752,8 +752,10 @@ async fn async_main(args: Cli) -> Result<()> {
         });
     }
     {
-        // Producer-side log retention: `TrainJobLog::open` and
-        // `ConvertJobLog::open` invoke `enforce_keep_last_n`
+        // Producer-side log retention: the shared
+        // `JsonlEventLog::open` (instantiated for
+        // `TrainEvent` on the training side and `ConvertEvent`
+        // on the converter side) invokes `enforce_keep_last_n`
         // after creating their new `<job_id>.jsonl`.  The hook
         // forwards both counts into `WorkspaceMetrics` so
         // operators see "log files reaped" via
@@ -1371,12 +1373,13 @@ async fn async_main(args: Cli) -> Result<()> {
     // Per-workspace JSONL job logs are NOT swept here:
     // retention lives in
     // `crate::file_mgr::log_retention::enforce_keep_last_n`,
-    // which the producers (`TrainJobLog::open`,
-    // `ConvertJobLog::open`) invoke at the only moment the
-    // per-tree cap can be exceeded (a new run arrives).
-    // Routing logs through both surfaces would double the
-    // pruning logic without changing the steady-state
-    // behaviour.
+    // which the shared `JsonlEventLog::open` (instantiated as
+    // `JsonlEventLog<TrainEvent>` for training and
+    // `JsonlEventLog<ConvertEvent>` for the converter) invokes
+    // at the only moment the per-tree cap can be exceeded (a
+    // new run arrives).  Routing logs through both surfaces
+    // would double the pruning logic without changing the
+    // steady-state behaviour.
     //
     // `<root>/logs/acousticsd.log.*` is also untouched -- the
     // `tracing_appender::rolling` daily rotation with
@@ -1421,10 +1424,8 @@ async fn async_main(args: Cli) -> Result<()> {
                     .await;
                     match outcome {
                         Ok(Ok(report)) => {
-                            metrics.record_storage_sweep(
-                                report.tmp_orphans_reaped,
-                                report.failures,
-                            );
+                            metrics
+                                .record_storage_sweep(report.tmp_orphans_reaped, report.failures);
                             if report.did_work() || report.failures > 0 {
                                 tracing::info!(
                                     target: "acoustics",

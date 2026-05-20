@@ -59,6 +59,8 @@
 
 use std::fmt;
 
+use serde::Serialize;
+
 /// Coarse category of a domain error.
 ///
 /// Used by the API layer to map domain errors to HTTP statuses
@@ -139,6 +141,44 @@ pub trait Categorized {
     fn kind(&self) -> ErrorKind;
 }
 
+/// Operator-vs-internal axis for terminal job-failure events
+/// (training `TrainEvent::JobFailed`, converter
+/// `ConvertEvent::JobFailed`).  Derived from [`ErrorKind`] via
+/// [`From`] so each producer maps its domain error through
+/// [`Categorized::kind`] then converts uniformly.  Frontends
+/// use this to colour the failure card (amber vs red) without
+/// parsing free-form error strings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// The operator can act on this — typically a malformed
+    /// payload or out-of-bounds config they can fix and retry.
+    /// Maps from [`ErrorKind::UserInput`].
+    OperatorFixable,
+    /// Daemon-internal failure (panic, IO mid-job, model
+    /// corruption, downstream service flap).  Retry is the only
+    /// operator action.  Maps from every other [`ErrorKind`].
+    Internal,
+}
+
+impl From<ErrorKind> for Severity {
+    fn from(kind: ErrorKind) -> Self {
+        // Exhaustive (matches the daemon-wide [`Categorized`]
+        // convention): a new [`ErrorKind`] variant must force
+        // an explicit classification here.  The variant
+        // docstrings on [`Severity`] cover the operator-facing
+        // meaning of each tone.
+        match kind {
+            ErrorKind::UserInput => Severity::OperatorFixable,
+            ErrorKind::NotFound
+            | ErrorKind::Conflict
+            | ErrorKind::NotImplemented
+            | ErrorKind::Unavailable
+            | ErrorKind::Internal => Severity::Internal,
+        }
+    }
+}
+
 // MARK: Tests
 
 #[cfg(test)]
@@ -178,5 +218,44 @@ mod tests {
         assert!(ErrorKind::UserInput < ErrorKind::Internal);
         assert!(ErrorKind::NotFound < ErrorKind::Internal);
         assert!(ErrorKind::Conflict < ErrorKind::Unavailable);
+    }
+
+    /// Only [`ErrorKind::UserInput`] maps to
+    /// [`Severity::OperatorFixable`]; every other category
+    /// surfaces as [`Severity::Internal`].  Pinned because the
+    /// JSONL job-failure schemas (`TrainEvent::JobFailed`,
+    /// `ConvertEvent::JobFailed`) bake this two-tone axis into
+    /// their wire shape -- a regression here would silently
+    /// downgrade frontend hint-card colouring.
+    #[test]
+    fn severity_from_errorkind_collapses_to_two_tones() {
+        assert_eq!(
+            Severity::from(ErrorKind::UserInput),
+            Severity::OperatorFixable
+        );
+        for k in [
+            ErrorKind::NotFound,
+            ErrorKind::Conflict,
+            ErrorKind::NotImplemented,
+            ErrorKind::Unavailable,
+            ErrorKind::Internal,
+        ] {
+            assert_eq!(
+                Severity::from(k),
+                Severity::Internal,
+                "kind {k:?} must collapse to Internal",
+            );
+        }
+    }
+
+    /// `Severity` round-trips through JSON as the snake_case
+    /// `operator_fixable` / `internal` variants the frontend
+    /// matches on.
+    #[test]
+    fn severity_serializes_snake_case() {
+        let v = serde_json::to_value(Severity::OperatorFixable).unwrap();
+        assert_eq!(v, serde_json::json!("operator_fixable"));
+        let v = serde_json::to_value(Severity::Internal).unwrap();
+        assert_eq!(v, serde_json::json!("internal"));
     }
 }

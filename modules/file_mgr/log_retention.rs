@@ -3,9 +3,12 @@
 //!
 //! # Scope
 //!
-//! `TrainJobLog` (`<workspace>/training_logs/<job_id>.jsonl`) and
-//! `ConvertJobLog` (`<workspace>/converter_logs/<job_id>.jsonl`)
-//! call [`enforce_keep_last_n`] right after opening the new log
+//! The shared [`super::JsonlEventLog`] writer is invoked from
+//! training (`JsonlEventLog<TrainEvent>` against
+//! `<workspace>/training_logs/<job_id>.jsonl`) and the converter
+//! (`JsonlEventLog<ConvertEvent>` against
+//! `<workspace>/converter_logs/<job_id>.jsonl`); both call
+//! [`enforce_keep_last_n`] right after opening the new log
 //! file.  The newly-opened file's mtime is set by `create(true)`
 //! and is therefore the freshest non-future entry in the
 //! directory, so it survives every sweep as long as
@@ -142,7 +145,8 @@ pub struct RetentionReport {
 /// # Metrics
 ///
 /// On return, both counts in the returned [`RetentionReport`]
-/// are forwarded through [`super::metrics_hooks::emit_logs_pruned`].
+/// are forwarded through `super::metrics_hooks::emit_logs_pruned`
+/// (crate-private).
 /// The returned report is for caller (test) introspection only;
 /// production callers can discard it.  Mirrors the
 /// emit-at-completion pattern of other `file_mgr` write helpers

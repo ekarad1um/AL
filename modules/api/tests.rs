@@ -332,7 +332,13 @@ async fn post_inference_validates_bounds() {
     // hop_samples below MIN_HOP_SAMPLES (=11_025) -> 400.  Caps
     // overlap at 75% so the engine doesn't burn CPU re-running on
     // near-identical audio.
-    let resp = call(&r, Method::POST, "/inference", Some(r#"{"hop_samples":1024}"#)).await;
+    let resp = call(
+        &r,
+        Method::POST,
+        "/inference",
+        Some(r#"{"hop_samples":1024}"#),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         StatusCode::BAD_REQUEST,
@@ -341,7 +347,13 @@ async fn post_inference_validates_bounds() {
 
     // hop_samples above MAX_HOP_SAMPLES (=44_100) -> 400.  Cadence
     // ceiling is one inference per wall-clock second.
-    let resp = call(&r, Method::POST, "/inference", Some(r#"{"hop_samples":44101}"#)).await;
+    let resp = call(
+        &r,
+        Method::POST,
+        "/inference",
+        Some(r#"{"hop_samples":44101}"#),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         StatusCode::BAD_REQUEST,
@@ -351,9 +363,21 @@ async fn post_inference_validates_bounds() {
     // Inclusive endpoints accept.  MIN (=11_025) matches the
     // default; MAX (=44_100) matches the Speech-Commands /
     // Teachable-Machine 1 Hz cadence convention.
-    let resp = call(&r, Method::POST, "/inference", Some(r#"{"hop_samples":11025}"#)).await;
+    let resp = call(
+        &r,
+        Method::POST,
+        "/inference",
+        Some(r#"{"hop_samples":11025}"#),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK, "MIN_HOP_SAMPLES must accept");
-    let resp = call(&r, Method::POST, "/inference", Some(r#"{"hop_samples":44100}"#)).await;
+    let resp = call(
+        &r,
+        Method::POST,
+        "/inference",
+        Some(r#"{"hop_samples":44100}"#),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK, "MAX_HOP_SAMPLES must accept");
 }
 

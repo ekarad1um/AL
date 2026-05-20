@@ -119,10 +119,16 @@ pub mod recovery;
 // the training reaper.
 pub mod storage_reaper;
 // Producer-side keep-last-N retention for per-workspace JSONL
-// job logs.  Invoked synchronously from `TrainJobLog::open` /
-// `ConvertJobLog::open` so the cap is enforced at the only
-// moment it can be exceeded.
+// job logs.  Invoked synchronously from `JsonlEventLog::open`
+// (the shared writer wired up by training / converter) so the
+// cap is enforced at the only moment it can be exceeded.
 pub mod log_retention;
+// Producer-side per-job JSONL writer generic over the event
+// type.  Single source of truth for `<workspace>/{training,
+// converter}_logs/<job_id>.jsonl`; each producer brings its own
+// typed event enum and the wire envelope (`{seq, at, ...event}`)
+// matches the producer-agnostic [`log_page::LogEvent`] reader.
+pub mod jsonl_event_log;
 mod uploader;
 
 // Process-wide hook registry letting the daemon publish into
@@ -150,13 +156,14 @@ pub use fs_atomic::put_atomic;
 pub use fs_service::{
     FileMetadataGuard, FsError, FsService, FsServiceImpl, MetadataGuard, UploadPermit,
 };
-pub use head_rotation::{HeadRotationResult, PendingHead, publish_trained_head};
+pub use head_rotation::{HeadImportResult, HeadRotationResult, PendingHead, publish_trained_head};
 pub use job_registry::{
     EventGap, EventStream, EventStreamError, JobEvent, JobHandle, JobProgress, JobRegistry,
     JobRegistryCfg, JobRegistryCounters, JobResult as RegistryJobResult, JobSnapshot,
     JobState as RegistryJobState, LeaseGuard as JobRegistryLeaseGuard, RegistryConflict,
     RegistryEvent,
 };
+pub use jsonl_event_log::JsonlEventLog;
 pub use log_retention::{LOG_RETENTION_KEEP_COUNT, RetentionReport, enforce_keep_last_n};
 pub use metadata::{AssetKind, AssetRecord, WorkspaceMetadata};
 pub use mime::content_type_from_path;
@@ -166,10 +173,10 @@ pub use recovery::{
     recover_workspaces,
 };
 pub use request_payload::{
-    ConvertRequest, ConverterPath, ConverterPathError, LabelsFormat, MAX_BATCH_SIZE,
-    MAX_CONVERT_SHARDS, MAX_EPOCHS, MAX_LEARNING_RATE, MIN_BATCH_SIZE, MIN_EPOCHS,
-    TfjsConvertParams, TrainRequest, TrainingCfg, ValidationError, canonical_training_cfg_sha256,
-    from_manifest_value, to_manifest_value, validate_convert_request, validate_training_cfg,
+    ConvertRequest, ConverterPath, ConverterPathError, LabelsFormat, MAX_BATCH_SIZE, MAX_EPOCHS,
+    MAX_LEARNING_RATE, MIN_BATCH_SIZE, MIN_EPOCHS, TfjsConvertParams, TrainRequest, TrainingCfg,
+    ValidationError, canonical_training_cfg_sha256, from_manifest_value, to_manifest_value,
+    validate_convert_request, validate_training_cfg,
 };
 pub use schema::{
     ACTIVE_CURRENT_FILENAME, ACTIVE_DIR_NAME, ACTIVE_GENERATIONS_DIR_NAME, ACTIVE_HEAD_FILENAME,

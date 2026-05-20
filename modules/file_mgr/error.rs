@@ -125,6 +125,32 @@ pub enum FileError {
         /// The pinned head id.
         head_id: String,
     },
+    /// `.alpkg` head import refused because a head with the
+    /// same `head_id` already exists in the destination
+    /// workspace but carries a different `sha256` -- meaning
+    /// the operator is trying to publish a divergent version
+    /// of the same logical head.  The rotation primitive
+    /// refuses rather than overwriting because doing so would
+    /// silently invalidate any external reference (running
+    /// inference, exported alpkg) pinned to the original
+    /// sha256.  Operator deletes the existing head first, then
+    /// retries.  Maps to HTTP 409 with the dedicated
+    /// `head_id_collision` discriminator so the frontend's
+    /// error-copy can fix the message.
+    #[error(
+        "head {head_id} already exists in this workspace with a different sha256 \
+         (got {got_sha256}, stored {stored_sha256}); delete the existing head before re-importing"
+    )]
+    HeadIdCollision {
+        /// The colliding head id (operator-supplied via the
+        /// imported manifest).
+        head_id: String,
+        /// SHA-256 from the operator's import manifest.
+        got_sha256: String,
+        /// SHA-256 currently recorded in the workspace's
+        /// `heads.json` index.
+        stored_sha256: String,
+    },
 }
 
 /// Shorthand for `FileError::Io { path: path.to_string(), source }`.
@@ -202,6 +228,13 @@ impl crate::common::error::Categorized for FileError {
             // taxonomy as the other "request well-formed,
             // state isn't ready" shapes.
             FileError::ActiveSourcePinned { .. } => Conflict,
+            // `.alpkg` re-import refused: same head_id, different
+            // sha256.  Conflict so the frontend's error-copy
+            // surfaces a recovery hint ("delete the existing
+            // head first").  The api layer extends this with
+            // a dedicated `head_id_collision` discriminator
+            // code.
+            FileError::HeadIdCollision { .. } => Conflict,
             // Daemon-internal: filesystem failures mid-write,
             // malformed metadata.json a previous boot wrote,
             // tempfile-persist failures, daemon-owned metadata

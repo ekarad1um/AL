@@ -384,9 +384,17 @@ impl ActiveHeadManifest {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConverterType {
-    /// TFJS-bundled-graph -> head conversion (the only
-    /// converter the daemon ships today).
+    /// TFJS-bundled-graph -> head conversion.
     Tfjs,
+    /// `.alpkg` archive -> head import.  Operator-uploaded
+    /// `.mpk` + `.json` pair (the daemon-emitted export
+    /// format) is verified against the embedded manifest's
+    /// declared size + sha256 and published into the
+    /// workspace's `heads/` tree via the same rotation
+    /// primitive the training producer uses.  Idempotent on
+    /// (head_id, sha256): re-importing the same head is a
+    /// no-op success.
+    Alpkg,
 }
 
 // MARK: JobType / JobReference

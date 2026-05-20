@@ -138,10 +138,12 @@ pub struct WorkspaceMetricsSnapshot {
     /// Cumulative per-workspace `<job_id>.jsonl` files pruned
     /// by the producer-side keep-last-N retention pass
     /// (`crate::file_mgr::log_retention::enforce_keep_last_n`).
-    /// `TrainJobLog::open` and `ConvertJobLog::open` invoke
-    /// retention immediately after creating the new log file,
-    /// so this counter bumps roughly once per train / convert
-    /// job once a workspace's log tree exceeds the keep cap.
+    /// The shared [`crate::file_mgr::JsonlEventLog`] writer
+    /// invokes retention immediately after creating the new log
+    /// file (training side opens `JsonlEventLog<TrainEvent>`;
+    /// converter side opens `JsonlEventLog<ConvertEvent>`), so
+    /// this counter bumps roughly once per train / convert job
+    /// once a workspace's log tree exceeds the keep cap.
     pub log_files_pruned_total: u64,
     /// Cumulative per-workspace failures observed by the
     /// producer-side log retention pass (failed metadata
@@ -224,9 +226,7 @@ impl WorkspaceMetrics {
                 .load(Ordering::Relaxed),
             tmp_orphans_reaped_total: self.tmp_orphans_reaped_total.load(Ordering::Relaxed),
             log_files_pruned_total: self.log_files_pruned_total.load(Ordering::Relaxed),
-            log_retention_failures_total: self
-                .log_retention_failures_total
-                .load(Ordering::Relaxed),
+            log_retention_failures_total: self.log_retention_failures_total.load(Ordering::Relaxed),
             storage_reaper_failures_total: self
                 .storage_reaper_failures_total
                 .load(Ordering::Relaxed),

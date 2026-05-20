@@ -110,7 +110,8 @@ pub enum Stage {
 }
 
 /// Per-epoch metrics attached to `Stage::Train` progress events
-/// and to durable [`Event::EpochCompleted`] lines.
+/// and to durable `Event::EpochCompleted` lines (the `Event`
+/// enum is crate-private to `training::finetune`).
 ///
 /// `val_acc` and `best_val_acc` carry `f32::NAN` when
 /// `val_split == 0.0`; both serialise to JSON `null` so the
@@ -162,7 +163,8 @@ impl Progress {
     }
 }
 
-/// One class entry surfaced in [`Event::DatasetScanned`].
+/// One class entry surfaced in `Event::DatasetScanned` (the
+/// `Event` enum is crate-private to `training::finetune`).
 #[derive(Clone, Debug, Serialize)]
 pub struct ClassCount {
     pub name: String,
@@ -691,7 +693,14 @@ fn run_inner(
         lr: cfg.lr,
         seed: cfg.seed,
     };
-    let train_outcome = train_head(head_auto, train_data, train_settings, progress, event, cancel)?;
+    let train_outcome = train_head(
+        head_auto,
+        train_data,
+        train_settings,
+        progress,
+        event,
+        cancel,
+    )?;
     let head_auto = train_outcome.head;
     event(Event::TrainCompleted {
         epochs_run: train_outcome.epochs_run as u32,
@@ -707,9 +716,7 @@ fn run_inner(
     ));
     check_cancel(cancel)?;
 
-    event(Event::PhaseStarted {
-        phase: Stage::Save,
-    });
+    event(Event::PhaseStarted { phase: Stage::Save });
     // No path on the wire -- the typed `TrainEvent::HeadPublished`
     // (emitted by the wrapper after the rotation primitive
     // succeeds) carries the public `head_id` the operator

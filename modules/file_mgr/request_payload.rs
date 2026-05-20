@@ -199,10 +199,15 @@ impl From<ConverterPath> for String {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "converter_type", rename_all = "snake_case")]
 pub enum ConvertRequest {
-    /// TFJS bundle conversion.  The only variant today; new
-    /// converters require a reviewed payload contract via
-    /// `crate::common::workspace::ConverterType`.
+    /// TFJS bundle conversion.
     Tfjs(TfjsConvertParams),
+    /// `.alpkg` head import.  Operator-uploaded `.mpk` +
+    /// `.json` pair (the daemon's own export format) is
+    /// verified + published as a head via the same rotation
+    /// primitive training uses.  See
+    /// [`crate::common::workspace::ConverterType::Alpkg`] for
+    /// the pipeline narrative.
+    Alpkg(AlpkgParams),
 }
 
 impl ConvertRequest {
@@ -211,24 +216,38 @@ impl ConvertRequest {
     pub fn converter_type(&self) -> crate::common::workspace::ConverterType {
         match self {
             ConvertRequest::Tfjs(_) => crate::common::workspace::ConverterType::Tfjs,
+            ConvertRequest::Alpkg(_) => crate::common::workspace::ConverterType::Alpkg,
         }
     }
 }
 
-/// TFJS-specific convert payload.  Every path field is a
-/// [`ConverterPath`] (rooted under `<workspace>/converters/`);
+/// TFJS-specific convert payload.  Both path fields are
+/// [`ConverterPath`]s (rooted under `<workspace>/converters/`);
 /// `deny_unknown_fields` rejects any stray key after the
 /// `converter_type = "tfjs"` dispatch.
+///
+/// ## Shard derivation
+///
+/// The shard file list is derived on the daemon side, not
+/// supplied by the operator.  `model.json`'s
+/// `weightsManifest[].paths` already names every shard as a
+/// path relative to the model.json directory, so the convert
+/// route parses it, prepends the model.json's parent, and
+/// resolves each derived path through the same converter input
+/// pipeline the operator-named fields go through.  Safety:
+/// each derived shard is re-validated via [`AssetPath::parse`]
+/// (rejects path traversal, NUL bytes, allowlist violations);
+/// see the route's `derive_tfjs_shard_asset_paths` helper for
+/// the full rationale.  Operators only name the manifest +
+/// labels file; shards "come along" with the manifest.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TfjsConvertParams {
     /// Converter-rooted path to `model.json` (the TFJS
-    /// manifest the converter parses).
+    /// manifest the converter parses).  Its embedded
+    /// `weightsManifest[].paths` drives the shard discovery
+    /// described in the type-level docstring.
     pub model_json_path: ConverterPath,
-    /// Converter-rooted paths to the manifest-declared
-    /// shards in caller order.  Bounded by [`MAX_CONVERT_SHARDS`]
-    /// in [`validate_convert_request`].
-    pub shards: Vec<ConverterPath>,
     /// Converter-rooted path to the labels source.
     pub labels_path: ConverterPath,
     /// Encoding of [`Self::labels_path`].
@@ -246,6 +265,46 @@ pub enum LabelsFormat {
     TfjsMetadata,
 }
 
+/// `.alpkg`-import convert payload.  Single-path shape: the
+/// operator only names the `.json` manifest, and the daemon
+/// derives the sibling `.mpk` from `<parent>/<head_id>.mpk`
+/// where `<head_id>` comes from the manifest itself.  The
+/// `head_id` is a UUID (`[0-9a-f-]` only -- always AssetPath-
+/// allowlist-clean) and the parent is already validated by
+/// [`ConverterPath::parse`], so the derived path is safe by
+/// construction; the route re-parses through [`AssetPath`] as
+/// belt-and-suspenders.
+///
+/// The frontend's import orchestrator uploads both files under
+/// `converters/alpkg/<head_id>/{<head_id>.json,<head_id>.mpk}`
+/// so the convention "manifest's sibling named after the
+/// head_id" holds round-trip.  Any other client that follows
+/// the same convention (manifest + sibling `.mpk` named after
+/// the manifest's declared head_id) round-trips too.
+///
+/// The convert worker reads the manifest, structurally
+/// validates it, stream-verifies the `.mpk` bytes against the
+/// manifest's `size_bytes` and `sha256`, and -- on success
+/// with no `head_id` collision in the destination workspace
+/// -- publishes the head via the rotation primitive.  A re-
+/// import of an already-present `head_id` is an idempotent
+/// no-op when the `sha256` also matches, or a 409
+/// `head_id_collision` when the `sha256` differs (operator
+/// must delete the existing head before re-importing a
+/// divergent version).  `deny_unknown_fields` rejects any
+/// stray key after the `converter_type = "alpkg"` dispatch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlpkgParams {
+    /// Converter-rooted path to the head's `.json` manifest.
+    /// The manifest's `head_id` decides the published head's id
+    /// AND drives the daemon's derivation of the sibling
+    /// `.mpk` weights file's location (`<parent>/<head_id>.mpk`).
+    /// `sha256` from the manifest is the integrity gate the
+    /// worker checks against the derived `.mpk`'s actual bytes.
+    pub manifest_path: ConverterPath,
+}
+
 // MARK: Validation
 
 /// Inclusive lower bound on [`TrainingCfg::epochs`].
@@ -259,10 +318,6 @@ pub const MAX_BATCH_SIZE: u32 = 4_096;
 /// Inclusive upper bound on [`TrainingCfg::learning_rate`].  Lower
 /// bound is the strict `> 0.0` finiteness check.
 pub const MAX_LEARNING_RATE: f32 = 1.0;
-/// Defensive cap on [`TfjsConvertParams::shards`] length.  Real
-/// TFJS bundles ship single-digit shard counts; this is a DoS
-/// gate, not an operator-tuning knob.
-pub const MAX_CONVERT_SHARDS: usize = 64;
 
 /// Structured failure for [`validate_training_cfg`] /
 /// [`validate_convert_request`].  Every variant is operator-input;
@@ -304,16 +359,17 @@ pub enum ValidationError {
         /// Observed value (rendered with full precision).
         got: f32,
     },
-    /// Convert request had zero shards.
-    #[error("convert request must declare at least one shard")]
-    NoShards,
-    /// Convert request had more shards than [`MAX_CONVERT_SHARDS`].
-    #[error("convert request too many shards: got {got}, max {max}")]
-    TooManyShards {
-        /// Observed shard count.
-        got: usize,
-        /// Allowed maximum.
-        max: usize,
+    /// Alpkg request's `manifest_path` doesn't end in `.json`.
+    /// Operator-input hygiene: the converter worker would
+    /// fail later when the manifest read returns
+    /// non-JSON bytes, but a 400 at the boundary is friendlier
+    /// than a generic parse failure deep in the convert job.
+    /// The sibling `.mpk` derivation depends on a `.json`
+    /// manifest filename to be well-defined.
+    #[error("alpkg manifest_path must end in `.json`: got {got}")]
+    AlpkgManifestExtension {
+        /// Observed converter-rooted path (display form).
+        got: String,
     },
 }
 
@@ -370,20 +426,33 @@ pub fn validate_training_cfg(cfg: &TrainingCfg) -> Result<(), ValidationError> {
 /// Dispatches by variant to the per-converter rules; path shape is
 /// already enforced by [`ConverterPath`] at deserialize time, so
 /// this function only checks bounds the type system cannot express.
+///
+/// TFJS has no request-level checks today: every operator-supplied
+/// path is validated by [`ConverterPath`] at deserialize, the shard
+/// list is derived by the route from the parsed model.json (so
+/// there's no operator-supplied cardinality to bound here -- the
+/// daemon's own DoS gate against pathological shard counts lives
+/// inside the converter via `ConvertLimits::max_shards`), and the
+/// labels_format is an enum the deserializer already exhausted.
 pub fn validate_convert_request(req: &ConvertRequest) -> Result<(), ValidationError> {
     match req {
-        ConvertRequest::Tfjs(params) => validate_tfjs_params(params),
+        ConvertRequest::Tfjs(_params) => Ok(()),
+        ConvertRequest::Alpkg(params) => validate_alpkg_params(params),
     }
 }
 
-fn validate_tfjs_params(params: &TfjsConvertParams) -> Result<(), ValidationError> {
-    if params.shards.is_empty() {
-        return Err(ValidationError::NoShards);
-    }
-    if params.shards.len() > MAX_CONVERT_SHARDS {
-        return Err(ValidationError::TooManyShards {
-            got: params.shards.len(),
-            max: MAX_CONVERT_SHARDS,
+/// File-extension hygiene for [`AlpkgParams`].  Case-sensitive
+/// because the daemon's own export emits lowercase `.json`; a
+/// non-matching extension is almost certainly a swapped path on
+/// the operator side, AND the sibling `.mpk` derivation depends
+/// on a `.json` suffix to be well-defined.  `ConverterPath`
+/// already enforced the AssetPath allowlist at deserialize, so
+/// this check is the only extra guard.
+fn validate_alpkg_params(params: &AlpkgParams) -> Result<(), ValidationError> {
+    let manifest = params.manifest_path.workspace_path().as_str();
+    if !manifest.ends_with(".json") {
+        return Err(ValidationError::AlpkgManifestExtension {
+            got: manifest.to_string(),
         });
     }
     Ok(())
@@ -463,7 +532,6 @@ mod tests {
     fn good_tfjs_params() -> TfjsConvertParams {
         TfjsConvertParams {
             model_json_path: ConverterPath::parse("/tfjs/model.json").unwrap(),
-            shards: vec![ConverterPath::parse("/tfjs/group1-shard1of1.bin").unwrap()],
             labels_path: ConverterPath::parse("/tfjs/metadata.json").unwrap(),
             labels_format: LabelsFormat::TfjsMetadata,
         }
@@ -688,7 +756,6 @@ mod tests {
         let body = r#"{
             "converter_type": "tfjs",
             "model_json_path": "/tfjs/model.json",
-            "shards": ["/tfjs/group1-shard1of1.bin"],
             "labels_path": "/tfjs/metadata.json",
             "labels_format": "tfjs_metadata"
         }"#;
@@ -697,8 +764,9 @@ mod tests {
             req.converter_type(),
             crate::common::workspace::ConverterType::Tfjs
         );
-        let ConvertRequest::Tfjs(p) = &req;
-        assert_eq!(p.shards.len(), 1);
+        let ConvertRequest::Tfjs(p) = &req else {
+            panic!("expected ConvertRequest::Tfjs");
+        };
         assert_eq!(p.labels_format, LabelsFormat::TfjsMetadata);
         assert_eq!(
             p.model_json_path.workspace_path().as_str(),
@@ -719,7 +787,6 @@ mod tests {
         let body = r#"{
             "converter_type": "onnx",
             "model_json_path": "/m",
-            "shards": ["/s"],
             "labels_path": "/l",
             "labels_format": "lines"
         }"#;
@@ -732,7 +799,6 @@ mod tests {
         // Legacy flat shape with no discriminator.
         let body = r#"{
             "model_json_path": "/tfjs/model.json",
-            "shards": ["/tfjs/s.bin"],
             "labels_path": "/tfjs/metadata.json",
             "labels_format": "tfjs_metadata"
         }"#;
@@ -748,7 +814,6 @@ mod tests {
         let body = r#"{
             "converter_type": "tfjs",
             "model_json_path": "/m",
-            "shards": ["/s"],
             "labels_path": "/l",
             "labels_format": "lines",
             "stray": true
@@ -764,12 +829,15 @@ mod tests {
     fn convert_request_accepts_relative_paths_as_canonical_form() {
         // Mixing slashless (canonical) and slashed (legacy) paths
         // on the same body is fine; both resolve to the same
-        // workspace path.
+        // workspace path.  The shard-level slashless test was
+        // dropped along with the `shards` field's removal from
+        // `TfjsConvertParams`; the daemon derives shards from
+        // `model.json` now (see [`TfjsConvertParams`] doc) so
+        // there's no operator-supplied shard string to validate.
         for field in ["model_json_path", "labels_path"] {
             let mut v = serde_json::json!({
                 "converter_type": "tfjs",
                 "model_json_path": "/m",
-                "shards": ["/s"],
                 "labels_path": "/l",
                 "labels_format": "lines",
             });
@@ -777,7 +845,9 @@ mod tests {
             let body = serde_json::to_string(&v).unwrap();
             let req: ConvertRequest =
                 serde_json::from_str(&body).expect("slashless path is canonical");
-            let ConvertRequest::Tfjs(p) = &req;
+            let ConvertRequest::Tfjs(p) = &req else {
+                panic!("expected ConvertRequest::Tfjs");
+            };
             let bound_field = match field {
                 "model_json_path" => p.model_json_path.workspace_path().as_str(),
                 "labels_path" => p.labels_path.workspace_path().as_str(),
@@ -785,45 +855,6 @@ mod tests {
             };
             assert_eq!(bound_field, "converters/relative/path");
         }
-
-        // Shard entry-level slashless path also accepted.
-        let body = r#"{
-            "converter_type": "tfjs",
-            "model_json_path": "/m",
-            "shards": ["relative/shard"],
-            "labels_path": "/l",
-            "labels_format": "lines"
-        }"#;
-        let req: ConvertRequest = serde_json::from_str(body).expect("slashless shard is canonical");
-        let ConvertRequest::Tfjs(p) = &req;
-        assert_eq!(
-            p.shards[0].workspace_path().as_str(),
-            "converters/relative/shard"
-        );
-    }
-
-    #[test]
-    fn convert_request_rejects_empty_shards() {
-        let req = ConvertRequest::Tfjs(TfjsConvertParams {
-            shards: vec![],
-            ..good_tfjs_params()
-        });
-        let err = validate_convert_request(&req).unwrap_err();
-        assert_eq!(err, ValidationError::NoShards);
-        assert_eq!(err.kind(), ErrorKind::UserInput);
-    }
-
-    #[test]
-    fn convert_request_rejects_too_many_shards() {
-        let shards: Vec<ConverterPath> = (0..MAX_CONVERT_SHARDS + 1)
-            .map(|i| ConverterPath::parse(&format!("/s{i}")).unwrap())
-            .collect();
-        let req = ConvertRequest::Tfjs(TfjsConvertParams {
-            shards,
-            ..good_tfjs_params()
-        });
-        let err = validate_convert_request(&req).unwrap_err();
-        assert!(matches!(err, ValidationError::TooManyShards { .. }));
     }
 
     #[test]
@@ -831,22 +862,28 @@ mod tests {
         let body = r#"{
             "converter_type": "tfjs",
             "model_json_path": "/tfjs/model.json",
-            "shards": ["/tfjs/shard.bin"],
             "labels_path": "/tfjs/labels.txt",
             "labels_format": "lines"
         }"#;
         let req: ConvertRequest = serde_json::from_str(body).unwrap();
-        let ConvertRequest::Tfjs(p) = &req;
+        let ConvertRequest::Tfjs(p) = &req else {
+            panic!("expected ConvertRequest::Tfjs");
+        };
         assert_eq!(p.labels_format, LabelsFormat::Lines);
     }
 
     #[test]
     fn convert_request_rejects_traversal_in_paths() {
+        // Shard traversal is now a daemon-side concern (the
+        // worker's `validate_shard_path` runs over manifest-
+        // declared paths inside `parse_tfjs_manifest_with_limits`),
+        // not a request-shape concern.  The standalone shard-
+        // traversal sub-test that used to live here was dropped
+        // when the `shards` field left the wire shape.
         for field in ["model_json_path", "labels_path"] {
             let mut v = serde_json::json!({
                 "converter_type": "tfjs",
                 "model_json_path": "/m",
-                "shards": ["/s"],
                 "labels_path": "/l",
                 "labels_format": "lines",
             });
@@ -855,16 +892,6 @@ mod tests {
             let res: Result<ConvertRequest, _> = serde_json::from_str(&body);
             assert!(res.is_err(), "{field}=/.. must be rejected");
         }
-
-        let body = r#"{
-            "converter_type": "tfjs",
-            "model_json_path": "/m",
-            "shards": ["/../etc/passwd"],
-            "labels_path": "/l",
-            "labels_format": "lines"
-        }"#;
-        let res: Result<ConvertRequest, _> = serde_json::from_str(body);
-        assert!(res.is_err(), "shard traversal must be rejected");
     }
 
     #[test]
@@ -966,7 +993,9 @@ mod tests {
             max: 1_000,
         };
         assert_eq!(err.kind(), ErrorKind::UserInput);
-        let err = ValidationError::NoShards;
+        let err = ValidationError::AlpkgManifestExtension {
+            got: "alpkg/foo.bin".to_string(),
+        };
         assert_eq!(err.kind(), ErrorKind::UserInput);
     }
 

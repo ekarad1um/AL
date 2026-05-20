@@ -63,10 +63,13 @@ pub use source::{LoadedSource, SourceModel, TfjsSource, TfjsSourceLimited};
 use std::path::{Path, PathBuf};
 
 use crate::common::dims::BACKBONE_FEATURE_DIM;
+use crate::common::error::{Categorized, Severity};
 use crate::common::hex::hex_lowercase;
 use crate::common::ids::HeadId;
-use crate::common::log_truncate::truncate_log_message;
-use crate::file_mgr::FsService;
+use crate::common::workspace::{ConverterType, WorkspaceRevision};
+use crate::file_mgr::{
+    CONVERTER_LOGS_DIR_NAME, FsService, JobHandle, JsonlEventLog, RegistryJobResult,
+};
 use crate::model::{self, Head};
 use burn::backend::NdArray;
 use burn::module::{Module, Param};
@@ -237,6 +240,60 @@ pub enum ConvertError {
     /// job completes (typically 10-30 s).
     #[error("converter job already running")]
     Busy,
+    /// `.alpkg` import: failed to read the operator-uploaded
+    /// `.json` manifest file at the resolved on-disk path.  IO
+    /// failure mid-job (the route's startup read already
+    /// verified the file exists and parses).
+    #[error("alpkg manifest read {path}: {source}")]
+    AlpkgManifestRead {
+        /// Path that failed to read (display form).
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// `.alpkg` import: the operator-uploaded `.json` manifest
+    /// parsed at start-time but failed structural validation
+    /// at the worker (the inner check reads + verifies every
+    /// field, separate from the start-time parse which only
+    /// extracted `head_id`).  The `reason` carries the
+    /// failing-field description in operator-facing English.
+    #[error("alpkg manifest schema: {reason}")]
+    AlpkgManifestSchema {
+        /// Human-readable failure shape (which field is wrong + how).
+        reason: String,
+    },
+    /// `.alpkg` import: the manifest's declared `size_bytes`
+    /// does not match the `.mpk` file's actual length on disk.
+    /// Indicates the operator's archive is corrupt or the .mpk
+    /// was swapped after export.
+    #[error("alpkg .mpk size mismatch: manifest declares {expected} bytes, file holds {observed}")]
+    AlpkgSizeMismatch {
+        /// `size_bytes` value from the embedded manifest.
+        expected: u64,
+        /// Actual on-disk length of the `.mpk` file.
+        observed: u64,
+    },
+    /// `.alpkg` import: streaming SHA-256 of the `.mpk` file
+    /// does not match the manifest's declared `sha256`.  Same
+    /// "archive corrupt or tampered" semantic as
+    /// [`Self::AlpkgSizeMismatch`].
+    #[error("alpkg .mpk hash mismatch: manifest declares {expected}, file hashes to {observed}")]
+    AlpkgHashMismatch {
+        /// `sha256` value from the embedded manifest.
+        expected: String,
+        /// Hash actually computed over the `.mpk` bytes.
+        observed: String,
+    },
+    /// `.alpkg` import refused: a head with the same
+    /// `head_id` already exists in the destination workspace
+    /// but carries a different `sha256` -- divergent versions
+    /// of the same logical head.  The rotation primitive
+    /// refuses to overwrite; operator deletes the existing
+    /// head first.  Maps to HTTP 409 with the dedicated
+    /// `head_id_collision` discriminator (see the crate-private
+    /// `crate::api::ApiError::code` method).
+    #[error("{0}")]
+    HeadIdCollision(#[source] crate::file_mgr::FileError),
 }
 
 /// Shorthand for `ConvertError::Read { path: path.to_string(), source }`.
@@ -268,6 +325,18 @@ pub(crate) fn convert_write_err(
     }
 }
 
+/// Shorthand for `ConvertError::AlpkgManifestSchema { reason: ... }`.
+/// Mirrors [`convert_read_err`] / [`convert_write_err`] for the
+/// six manifest schema-validation sites in
+/// [`validate_alpkg_head_manifest`].  `reason` is `impl Into<String>`
+/// so call sites pass `&'static str` literals or `format!()` output
+/// without per-site `.to_string()`.
+fn alpkg_schema_err(reason: impl Into<String>) -> ConvertError {
+    ConvertError::AlpkgManifestSchema {
+        reason: reason.into(),
+    }
+}
+
 impl crate::common::error::Categorized for ConvertError {
     /// Exhaustive `match` so adding a new variant forces a
     /// classification update; the API layer dispatches uniformly via
@@ -288,7 +357,16 @@ impl crate::common::error::Categorized for ConvertError {
             | ConvertError::LimitExceeded { .. }
             | ConvertError::TfjsZeroDimension { .. }
             | ConvertError::NonFiniteWeight { .. }
-            | ConvertError::BadClassCount { .. } => UserInput,
+            | ConvertError::BadClassCount { .. }
+            // `.alpkg` operator-input variants: the archive's
+            // manifest parses but fails structural checks, or
+            // the `.mpk` bytes don't match the declared hash /
+            // size.  The operator's recovery is "fix the
+            // archive" or "re-export from the source workspace",
+            // same as the TFJS variants above.
+            | ConvertError::AlpkgManifestSchema { .. }
+            | ConvertError::AlpkgSizeMismatch { .. }
+            | ConvertError::AlpkgHashMismatch { .. } => UserInput,
 
             // Caller asked for a converter mode we haven't built.
             ConvertError::NotImplemented(_) => NotImplemented,
@@ -299,14 +377,31 @@ impl crate::common::error::Categorized for ConvertError {
             // after the active job completes.
             ConvertError::Busy => Conflict,
 
+            // `.alpkg` head-id collision (same id, different
+            // sha256).  Conflict matches the FileError's
+            // categorization; the api layer extends this with the
+            // dedicated `head_id_collision` discriminator.
+            ConvertError::HeadIdCollision(_) => Conflict,
+
             // Filesystem / serializer / Burn-record / tensor: daemon-
             // internal infrastructure failure, not the uploader's
             // fault.
+            //
+            // `AlpkgManifestRead` lives here too -- a file going
+            // missing between the route's start-time parse
+            // (which succeeded, otherwise the worker wouldn't
+            // have spawned) and the worker's re-read is a
+            // daemon-internal infrastructure failure (transient
+            // FS, permission flip, external process), not user
+            // input.  A 500 + retry is the right operator
+            // affordance; a 400 would mislead them into
+            // re-uploading a perfectly valid archive.
             ConvertError::Read { .. }
             | ConvertError::Write { .. }
             | ConvertError::Record(_)
             | ConvertError::Tensor(_)
-            | ConvertError::MetadataSerialize(_) => Internal,
+            | ConvertError::MetadataSerialize(_)
+            | ConvertError::AlpkgManifestRead { .. } => Internal,
         }
     }
 }
@@ -1156,23 +1251,482 @@ pub(crate) fn head_weights_from_head_byte_ranges(
     })
 }
 
+// MARK: typed events
+//
+// Wire shape for the durable JSONL log + the cross-cutting SSE
+// bridge.  Every line is `{seq, at, ...flattened ConvertEvent}`,
+// written by the shared [`JsonlEventLog<ConvertEvent>`]
+// ([`crate::file_mgr::jsonl_event_log`]) and round-tripped by
+// the producer-agnostic [`crate::file_mgr::log_page::LogEvent`]
+// reader.  Mirrors the [`crate::training::TrainEvent`] taxonomy
+// so SSE clients render convert progress the same way they
+// render training progress (per-step transitions, typed
+// terminal payloads, severity-tagged failures).  Forward-compat
+// is carried by the `kind` discriminator and `#[non_exhaustive]`
+// on [`ConvertEvent`].
+
+/// Per-converter stage selector.  Stamped on
+/// [`ConvertEvent::StageStarted`] (so SSE clients render a
+/// per-step progress bar) and on [`ConvertEvent::JobFailed`]
+/// (so operators see which step blew up without parsing the
+/// error string).
+///
+/// Variants are flat across both converters (TFJS + Alpkg) so
+/// the wire enum is a closed snake_case set the frontend can
+/// match exhaustively; each variant's docstring names which
+/// converter emits it.  `Prepare` and `PublishHead` are shared
+/// between both.
+///
+/// `#[non_exhaustive]`: a future converter (ONNX, raw `.mpk`,
+/// …) will add stage variants and consumers must tolerate
+/// the unknown case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ConvertStage {
+    /// Shared: pre-dispatch, just after the wrapper opened the
+    /// JSONL log.  Operator hasn't seen any per-converter step
+    /// yet.  Used as the initial value of the wrapper's stage
+    /// tracker so a `JobFailed` raised before any
+    /// `StageStarted` carries a sensible label.
+    Prepare,
+    /// Alpkg: read + JSON-parse the operator-uploaded `.json`
+    /// manifest from disk.
+    ReadManifest,
+    /// Alpkg: structural validation of the parsed manifest
+    /// (head_id agreement, label count, sha256 shape).
+    ValidateManifest,
+    /// Alpkg: stream the `.mpk` once to verify size + sha256
+    /// against the manifest's declared values.
+    VerifyMpk,
+    /// Alpkg: hard-link (or copy) the `.mpk` into
+    /// `<workspace>/.tmp/` so the rotation primitive can
+    /// rename it intra-FS into `heads/`.
+    StageMpk,
+    /// Tfjs: read + parse the operator-uploaded `model.json`.
+    /// Failure here is a malformed manifest (invalid JSON,
+    /// missing `weightsManifest`, …) and surfaces as
+    /// [`ConvertFailPayload::SourceMalformed`].
+    ReadModelJson,
+    /// Tfjs: stage every declared shard from
+    /// `<workspace>/converters/...` into the per-job
+    /// `<workspace>/.tmp/convert-<job_id>/` (intra-FS hard-link
+    /// with a copy fallback).  Mirror of alpkg's
+    /// [`Self::StageMpk`]; separating it from `ReadModelJson`
+    /// gives the operator a per-step progress signal and
+    /// pinpoints whether a failure was at parse time or in the
+    /// shard layout.
+    StageShards,
+    /// Tfjs: parse the head's kernel + bias byte ranges out of
+    /// the staged shard set and assemble [`HeadWeights`] in
+    /// Burn's `[in_dim, n_classes]` layout.
+    ExtractWeights,
+    /// Tfjs: read the operator-uploaded labels file (or
+    /// `metadata.json` companion) and cross-check the count
+    /// against the extracted head's `n_classes`.
+    ReadLabels,
+    /// Tfjs: build the ACSTHEAD-wrapped `.mpk` blob in memory
+    /// and stage it under `<workspace>/.tmp/`.
+    StageHeadMpk,
+    /// Shared: call `publish_{trained,imported}_head` to land
+    /// the head into the workspace's sliding-window rotation.
+    /// Terminal step on the happy path.
+    PublishHead,
+}
+
+/// Typed failure payload for [`ConvertEvent::JobFailed`].
+/// `category` discriminates; per-variant fields carry the
+/// structured data the frontend uses to build hint copy
+/// without re-parsing the human-readable `error` string.  Maps
+/// many-to-one from [`ConvertError`] variants: structurally
+/// distinct error variants share a category when the
+/// frontend's hint copy is the same.
+///
+/// `#[non_exhaustive]`: new structured failure modes will land
+/// here when the frontend grows hint copy for them; consumers
+/// must tolerate the unknown variant by falling back to the
+/// `error` string.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "category", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ConvertFailPayload {
+    /// TFJS source model failed parse or per-tensor validation
+    /// (malformed `model.json`, unsupported dtype, missing
+    /// head locator, non-finite weight, blob length mismatch,
+    /// …).  Catch-all for "operator's exported model is wrong;
+    /// re-export and retry"; `detail` carries the specific
+    /// diagnostic.
+    SourceMalformed { detail: String },
+    /// Resource cap declared in [`ConvertLimits`] tripped at
+    /// the manifest layer (`manifest_bytes`, `shards`,
+    /// `n_classes`, `tensor_bytes`, `kernel_bytes`,
+    /// `bias_bytes`).  Operator can shrink the source model.
+    LimitExceeded {
+        /// Stable identifier for the cap that fired (matches
+        /// the field name on [`ConvertLimits`]).
+        what: String,
+        /// Value the manifest declared (or arrived with).
+        value: u64,
+        /// Per-cap maximum the daemon enforced.
+        max: u64,
+    },
+    /// `n_classes` outside `1..=ConvertLimits::max_n_classes`.
+    /// Distinct from [`Self::LimitExceeded`] because zero-
+    /// class also lands here; the frontend renders specific
+    /// "your head has no classes" copy for `got == 0`.
+    BadClassCount { got: u32, max: u32 },
+    /// Labels source (lines file or TFJS `metadata.json`)
+    /// failed to parse, was empty, or its count did not match
+    /// the head kernel's declared `n_classes`.
+    Labels { detail: String },
+    /// `.alpkg` archive's embedded `.json` manifest parsed but
+    /// failed structural validation (head_id mismatch, missing
+    /// labels, sha256 wrong shape, …).
+    AlpkgManifestSchema { reason: String },
+    /// `.alpkg` `.mpk` byte count does not match the
+    /// manifest's `size_bytes`.  Archive is corrupt or tampered.
+    AlpkgSizeMismatch { expected: u64, observed: u64 },
+    /// `.alpkg` `.mpk` SHA-256 does not match the manifest's
+    /// `sha256`.  Archive is corrupt or tampered.
+    AlpkgHashMismatch { expected: String, observed: String },
+    /// Destination workspace already holds a head with the
+    /// same `head_id` but a different `sha256`.  Operator
+    /// deletes the existing first.
+    HeadIdCollision {
+        head_id: String,
+        got_sha256: String,
+        stored_sha256: String,
+    },
+    /// Daemon-internal failure (FS write, recorder, tensor
+    /// construction, semaphore acquisition, JSON serializer).
+    /// Operator can only retry; the daemon log carries the
+    /// actionable detail.
+    Internal { detail: String },
+}
+
+/// Terminal-success summary for [`ConvertEvent::JobCompleted`]
+/// and the return value of [`run_convert_job`].  Carries enough
+/// to render the published-head card without a follow-up
+/// `GET /workspace/{id}/heads/{head_id}`: identity, integrity
+/// hash, class count, label list.  The registry's
+/// [`RegistryJobResult::Convert`] takes a strict subset
+/// (`head_id`, `sha256`, `n_classes`) at the
+/// `JobHandle::succeed` call site; the full list lives on this
+/// type so JSONL replay renders the same shape SSE delivered
+/// live.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ConvertResult {
+    pub head_id: HeadId,
+    /// Lowercase-hex SHA-256 of the published `.mpk` bytes.
+    pub head_sha256: String,
+    pub n_classes: u32,
+    /// Full label list in n_classes order; carried so a
+    /// JSONL replay hydrates the head's class list without
+    /// reading the workspace's heads index.
+    pub classes: Vec<String>,
+}
+
+/// One algorithmic / lifecycle event emitted to the durable
+/// JSONL log AND the cross-cutting SSE broadcast.  Discriminator
+/// is `kind`, snake_case on the wire.  Variants split into:
+///
+/// - **Wrapper** ([`Self::JobSubmitted`], [`Self::JobRunning`],
+///   [`Self::HeadPublished`], [`Self::JobCompleted`],
+///   [`Self::JobFailed`]): emitted by [`run_convert_job`].
+/// - **Stage transitions** ([`Self::StageStarted`]):
+///   per-converter step boundaries, mirroring
+///   [`crate::training::TrainEvent::PhaseStarted`].
+/// - **Stage outcomes** (the per-converter data-bearing
+///   variants like [`Self::MpkVerified`],
+///   [`Self::WeightsExtracted`]): emitted right after the
+///   matching step produces a fact worth surfacing to the
+///   operator before publication.
+///
+/// `#[non_exhaustive]`: the wire `kind` discriminator is open
+/// by design — future converters will add variants and
+/// external matches must handle the unknown case.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ConvertEvent {
+    /// Admission cleared, log opened, before any pipeline work.
+    /// Carries the converter discriminator + head_id so a
+    /// JSONL replay describes "what was attempted" without a
+    /// side fetch.
+    JobSubmitted {
+        head_id: HeadId,
+        converter: ConverterType,
+    },
+    /// Worker started executing on the blocking pool (post-
+    /// admission, post-log-open).  Distinct from `JobSubmitted`
+    /// so the SSE consumer renders a "queued -> running"
+    /// transition even when the gap is sub-second.
+    JobRunning,
+    /// Stage boundary.  Updates the wrapper's stage tracker so
+    /// a subsequent `JobFailed` carries the stage label.  The
+    /// frontend renders per-step progress from this single
+    /// shape rather than matching per-stage events.
+    StageStarted { stage: ConvertStage },
+    /// Alpkg [`ConvertStage::ValidateManifest`] outcome: the
+    /// operator's manifest parsed AND passed structural checks.
+    /// `n_classes` is the declared head dimensionality;
+    /// `sha256` is the manifest's declared `.mpk` hash (the
+    /// `VerifyMpk` step proves agreement with the actual file).
+    ManifestValidated { n_classes: u32, sha256: String },
+    /// Alpkg [`ConvertStage::VerifyMpk`] outcome: streamed
+    /// SHA-256 + byte count match the manifest's declared
+    /// values.  Emitted before `StageMpk` so SSE sees the
+    /// "verified" milestone separately from the file staging.
+    MpkVerified { size_bytes: u64, sha256: String },
+    /// Tfjs [`ConvertStage::ExtractWeights`] outcome: head
+    /// kernel + bias extracted from the operator's shard set;
+    /// `n_classes` and `in_dim` describe the parsed shape.
+    /// Emitted before publication so the operator sees the
+    /// derived shape early.
+    WeightsExtracted { n_classes: u32, in_dim: u32 },
+    /// Tfjs [`ConvertStage::ReadLabels`] outcome: labels file
+    /// parsed and cross-checked against the head's declared
+    /// `n_classes`.  `n_labels` is the count actually read
+    /// (== head's n_classes by the time this is emitted).
+    LabelsLoaded { n_labels: u32 },
+    /// Head landed in `<workspace>/heads/<head_id>.mpk` via the
+    /// rotation primitive.  Emitted only on success; the
+    /// absence of this event in a JSONL transcript means the
+    /// publish was not reached (`JobFailed` will follow).
+    /// `idempotent_skip = true` for the Alpkg "head already
+    /// exists with matching sha256" no-op rotation path.
+    HeadPublished {
+        head_id: HeadId,
+        head_sha256: String,
+        size_bytes: u64,
+        n_classes: u32,
+        classes: Vec<String>,
+        workspace_revision: WorkspaceRevision,
+        idempotent_skip: bool,
+    },
+    /// Terminal: success.  Carries the full [`ConvertResult`]
+    /// so a tab-refresh hydration of the JSONL surfaces the
+    /// run's verdict + label list without a separate fetch.
+    JobCompleted { result: ConvertResult },
+    /// Terminal: failure.  `stage` is the last `StageStarted`
+    /// observed by the wrapper; `severity` is derived from the
+    /// underlying error's [`crate::common::error::ErrorKind`];
+    /// `error` is the human-readable diagnostic; `payload` is
+    /// the typed structured-fields enum the frontend uses to
+    /// build hint copy.
+    JobFailed {
+        stage: ConvertStage,
+        severity: Severity,
+        error: String,
+        #[serde(flatten)]
+        payload: ConvertFailPayload,
+    },
+}
+
+/// Map a [`ConvertError`] to the typed [`ConvertFailPayload`]
+/// the frontend matches on for hint copy.  Many-to-one: the
+/// long tail of source-malformation variants collapses to
+/// [`ConvertFailPayload::SourceMalformed`] because the
+/// operator-actionable advice is the same ("re-export your
+/// model"); structurally-rich variants (limit caps, alpkg
+/// integrity, head-id collision) keep their own payload so the
+/// frontend can render specific guidance.
+fn fail_payload_from_convert_error(err: &ConvertError) -> ConvertFailPayload {
+    match err {
+        ConvertError::LimitExceeded { what, value, max } => ConvertFailPayload::LimitExceeded {
+            what: what.to_string(),
+            value: *value,
+            max: *max,
+        },
+        ConvertError::BadClassCount { got, max } => ConvertFailPayload::BadClassCount {
+            got: u32::try_from(*got).unwrap_or(u32::MAX),
+            max: u32::try_from(*max).unwrap_or(u32::MAX),
+        },
+        ConvertError::Labels(detail) => ConvertFailPayload::Labels {
+            detail: detail.clone(),
+        },
+        ConvertError::AlpkgManifestSchema { reason } => ConvertFailPayload::AlpkgManifestSchema {
+            reason: reason.clone(),
+        },
+        ConvertError::AlpkgSizeMismatch { expected, observed } => {
+            ConvertFailPayload::AlpkgSizeMismatch {
+                expected: *expected,
+                observed: *observed,
+            }
+        }
+        ConvertError::AlpkgHashMismatch { expected, observed } => {
+            ConvertFailPayload::AlpkgHashMismatch {
+                expected: expected.clone(),
+                observed: observed.clone(),
+            }
+        }
+        ConvertError::HeadIdCollision(file_err) => match file_err {
+            crate::file_mgr::FileError::HeadIdCollision {
+                head_id,
+                got_sha256,
+                stored_sha256,
+            } => ConvertFailPayload::HeadIdCollision {
+                head_id: head_id.to_string(),
+                got_sha256: got_sha256.clone(),
+                stored_sha256: stored_sha256.clone(),
+            },
+            // Any other FileError wrapped under HeadIdCollision
+            // is a violated invariant: the only constructor of
+            // this variant inside the convert worker pulls the
+            // typed collision out of the FileError's source
+            // chain (see `run_alpkg_convert`).  Surface as
+            // Internal so the frontend doesn't try to render
+            // collision-specific copy without the structured
+            // fields.
+            other => ConvertFailPayload::Internal {
+                detail: format!("head-id-collision wraps unexpected FileError: {other}"),
+            },
+        },
+        // TFJS source-malformed catch-all: every UserInput-
+        // kinded TFJS error not handled above collapses here.
+        // The operator-actionable advice ("re-export the model")
+        // is identical regardless of which specific parse /
+        // locate / shape check fired.
+        ConvertError::TfjsParse { .. }
+        | ConvertError::TfjsLocator(_)
+        | ConvertError::TfjsShortRead { .. }
+        | ConvertError::TfjsDtype { .. }
+        | ConvertError::TfjsUnsafePath(_)
+        | ConvertError::TfjsShapeOverflow { .. }
+        | ConvertError::TfjsBlobLength { .. }
+        | ConvertError::TfjsZeroDimension { .. }
+        | ConvertError::NonFiniteWeight { .. } => ConvertFailPayload::SourceMalformed {
+            detail: err.to_string(),
+        },
+        // Daemon-internal: FS / serializer / Burn-record /
+        // tensor / busy slot / not-implemented / alpkg manifest
+        // re-read failure.  Same bucket as training's
+        // `FailPayload::Internal`; operator's only action is to
+        // retry.
+        ConvertError::Read { .. }
+        | ConvertError::Write { .. }
+        | ConvertError::Record(_)
+        | ConvertError::Tensor(_)
+        | ConvertError::MetadataSerialize(_)
+        | ConvertError::NotImplemented(_)
+        | ConvertError::Busy
+        | ConvertError::AlpkgManifestRead { .. } => ConvertFailPayload::Internal {
+            detail: err.to_string(),
+        },
+    }
+}
+
+/// Map a [`ConvertError`] to the [`Severity`] axis the
+/// frontend uses for failure card colour.  Thin wrapper around
+/// `Severity::from(err.kind())` so the call site reads
+/// `severity_from_convert_error(e)` instead of repeating the
+/// trait import + `.kind()` chain.  Single source of truth for
+/// the mapping is [`Severity`]'s [`From<ErrorKind>`] impl,
+/// shared with the training producer.
+fn severity_from_convert_error(err: &ConvertError) -> Severity {
+    Severity::from(err.kind())
+}
+
+/// Fan one [`ConvertEvent`] out to its three sinks: the stage
+/// tracker (so the next terminal event has a stage to attach),
+/// the durable JSONL log (best-effort), and the cross-cutting
+/// SSE broadcast via the optional [`JobHandle`] (best-effort).
+/// All failures are tracing-warned, never returned — a failed
+/// log write must not promote a successful run to failed.
+///
+/// Mirror of `crate::training::emit_train_event`; the converter
+/// version omits the per-event progress hook because convert
+/// jobs do not surface a monotonic counter (no epoch / batch
+/// equivalent), only stage transitions.
+fn emit_convert_event(
+    log: &mut JsonlEventLog<ConvertEvent>,
+    handle: Option<&JobHandle>,
+    stage: &mut ConvertStage,
+    event: ConvertEvent,
+) {
+    if let ConvertEvent::StageStarted { stage: new_stage } = &event {
+        *stage = *new_stage;
+    }
+    if let Err(err) = log.emit(&event) {
+        tracing::warn!(target: "converter", err = %err, "converter: log emit failed");
+    }
+    if let Some(h) = handle {
+        match serde_json::to_string(&event) {
+            Ok(s) => h.append_log(s),
+            Err(e) => {
+                tracing::warn!(target: "converter", err = %e, "converter: SSE event serialize failed");
+            }
+        }
+    }
+}
+
 // MARK: convert pipeline
 
 /// Inputs to the convert worker.  Built by the api producer from a
 /// validated [`crate::file_mgr::ConvertRequest`] + snapshotted state;
 /// all paths are pre-resolved under `<workspace_dir>/converters/` so
 /// the worker reads them directly without re-validating.
+///
+/// Variant-specific fields live on [`ConvertJobKind`] so the shared
+/// admission fields (`job_id`, `workspace_id`, `head_id`,
+/// `workspace_revision`) stay flat at one level -- every caller
+/// reads them identically regardless of converter.
 #[derive(Clone, Debug)]
 pub struct ConvertJob {
     /// Drives the JSONL log filename
     /// `<workspace_dir>/converter_logs/<job_id>.jsonl`.
     pub job_id: crate::common::ids::JobId,
     pub workspace_id: crate::common::ids::WorkspaceId,
-    /// Pre-allocated; published verbatim on success.
+    /// For TFJS: pre-allocated by the route via `HeadId::new()`
+    /// and published verbatim on success.
+    /// For Alpkg: extracted from the operator-supplied manifest
+    /// at start-time so the synchronous response can return it
+    /// before the worker spawns.
     pub head_id: crate::common::ids::HeadId,
     /// Producer-snapshotted; recorded in the per-head manifest for
-    /// stale detection.
+    /// stale detection.  For Alpkg, this is the destination
+    /// workspace's revision at convert-start time (after the
+    /// operator's PUTs bumped it); the source manifest's
+    /// `workspace_revision` is workspace-local and meaningless
+    /// across installs, so we discard it.
     pub workspace_revision: crate::common::workspace::WorkspaceRevision,
+    /// Converter-specific job payload.  Dispatched on by the
+    /// private inner of [`run_convert_job`].
+    pub kind: ConvertJobKind,
+}
+
+/// Variant-specific convert payload.  One arm per
+/// [`crate::common::workspace::ConverterType`].
+#[derive(Clone, Debug)]
+pub enum ConvertJobKind {
+    /// TFJS bundle -> head conversion.  Paths are pre-resolved
+    /// absolute filesystem paths under `<workspace>/converters/`.
+    Tfjs(ConvertJobTfjs),
+    /// `.alpkg` archive -> head import.  Both paths are pre-
+    /// resolved absolute filesystem paths to the operator-
+    /// uploaded `.mpk` + `.json` pair.
+    Alpkg(ConvertJobAlpkg),
+}
+
+impl ConvertJobKind {
+    /// Discriminator-only mapping to the operator-facing
+    /// [`ConverterType`] enum.  Used by [`run_convert_job`] to
+    /// stamp [`ConvertEvent::JobSubmitted`] so SSE / JSONL
+    /// consumers know which converter the worker is running
+    /// before the first stage event lands.
+    pub fn converter_type(&self) -> ConverterType {
+        match self {
+            ConvertJobKind::Tfjs(_) => ConverterType::Tfjs,
+            ConvertJobKind::Alpkg(_) => ConverterType::Alpkg,
+        }
+    }
+}
+
+/// TFJS-specific worker inputs.  See the variant docstring on
+/// [`crate::file_mgr::TfjsConvertParams`] for the operator-facing
+/// shape this is built from.
+#[derive(Clone, Debug)]
+pub struct ConvertJobTfjs {
     pub model_json_path: PathBuf,
     /// In manifest-declared order; per-shard bytes are cross-checked
     /// against declared offsets inside [`run_convert_job`].
@@ -1181,27 +1735,107 @@ pub struct ConvertJob {
     pub labels_format: crate::file_mgr::LabelsFormat,
 }
 
-/// Run a convert job end-to-end: open the JSONL log, parse the
-/// manifest, stream shards into staging, build [`HeadWeights`],
-/// resolve labels, stage the ACSTHEAD-wrapped `.mpk`, and call
-/// `FsService::publish_trained_head` to land the head into the
-/// workspace's sliding-window rotation.  On failure no head record is
-/// committed; the staged `.mpk` is best-effort cleaned up and the
-/// JSONL log records the terminal error.  The caller holds the
-/// convert permit + workspace job-reference until this returns.
+/// `.alpkg`-specific worker inputs.  Both paths point at files
+/// previously uploaded by the import orchestrator to
+/// `<workspace>/converters/alpkg/<head_id>/`.
+#[derive(Clone, Debug)]
+pub struct ConvertJobAlpkg {
+    /// On-disk path to the head's `.mpk` weights file.
+    pub mpk_path: PathBuf,
+    /// On-disk path to the head's `.json` manifest.
+    pub manifest_path: PathBuf,
+}
+
+/// Run a convert job end-to-end: open the typed JSONL log,
+/// fan typed [`ConvertEvent`]s through that log AND the
+/// cross-cutting SSE bridge (when `job_handle` is `Some`),
+/// dispatch to the per-converter worker, sweep the per-job
+/// tempfiles, and surface the terminal `JobCompleted` /
+/// `JobFailed` event before consuming `job_handle` to flip
+/// the registry state.
+///
+/// `job_handle` is owned by the worker for its lifetime:
+/// every algorithmic event fans through it (rich SSE payload),
+/// and the terminal `succeed` / `fail` call consumes it
+/// (registry state flip).  Callers must NOT call `succeed` /
+/// `fail` on a handle they handed to this function — doing so
+/// would double-transition the registry and panic on the
+/// second `succeed`.  `None` is the test-only mode (no SSE,
+/// no registry transition).
+///
+/// On failure no head record is committed; the staged `.mpk`
+/// is best-effort cleaned up and the JSONL log records the
+/// terminal error.  The caller holds the convert permit +
+/// workspace job-reference until this returns.
 pub fn run_convert_job(
     files: std::sync::Arc<dyn crate::file_mgr::FsService>,
     job: ConvertJob,
-) -> Result<ConvertOutcome, ConvertError> {
+    job_handle: Option<JobHandle>,
+) -> Result<ConvertResult, ConvertError> {
     let workspace_dir = crate::file_mgr::schema::workspace_dir_for(files.root(), &job.workspace_id);
-    let mut log = ConvertJobLog::open(&workspace_dir, job.job_id)?;
-    log.event("started", None, None)?;
-    let result = run_convert_job_inner(&files, &job, &workspace_dir, &mut log);
+
+    // Open the per-job JSONL log.  Map io::Error -> ConvertError
+    // so an unwritable `converter_logs/` surfaces as a typed
+    // failure (mirrors `training::run_job`'s open-side mapping).
+    // The handle is propagated through the failure path so a
+    // shutdown drain still observes the registry transition; the
+    // open failure means no JSONL line is possible at all, so
+    // the failure copy goes only through `JobHandle::fail`.
+    let mut log = match JsonlEventLog::<ConvertEvent>::open(
+        &workspace_dir,
+        CONVERTER_LOGS_DIR_NAME,
+        job.job_id,
+    ) {
+        Ok(l) => l,
+        Err(source) => {
+            let log_path = workspace_dir
+                .join(CONVERTER_LOGS_DIR_NAME)
+                .join(format!("{}.jsonl", job.job_id));
+            let e = convert_write_err(log_path.display(), source);
+            if let Some(h) = job_handle {
+                h.fail(e.to_string());
+            }
+            return Err(e);
+        }
+    };
+
+    let mut stage = ConvertStage::Prepare;
+    let converter = job.kind.converter_type();
+
+    // Admission cleared.  `JobSubmitted` carries enough to
+    // describe "what was attempted"; `JobRunning` renders the
+    // queued -> running transition even when the gap is
+    // sub-second.  Mirrors `training::run_job`'s wrapper-only
+    // event pair.
+    emit_convert_event(
+        &mut log,
+        job_handle.as_ref(),
+        &mut stage,
+        ConvertEvent::JobSubmitted {
+            head_id: job.head_id,
+            converter,
+        },
+    );
+    emit_convert_event(
+        &mut log,
+        job_handle.as_ref(),
+        &mut stage,
+        ConvertEvent::JobRunning,
+    );
+
+    let result = run_convert_job_inner(
+        &files,
+        &job,
+        &workspace_dir,
+        &mut log,
+        job_handle.as_ref(),
+        &mut stage,
+    );
 
     // Unconditional sweep of per-job tempfiles; both removes are
     // NotFound-tolerant since on success the `.mpk` was renamed
-    // out by `publish_trained_head` and only the staging dir
-    // remains.
+    // out by `publish_{trained,imported}_head` and only the
+    // staging dir remains.
     let staging_dir = convert_staging_dir(&workspace_dir, job.job_id);
     let mpk_tempfile = convert_mpk_tempfile(&workspace_dir, job.job_id, job.head_id);
     if let Err(e) = std::fs::remove_dir_all(&staging_dir)
@@ -1225,29 +1859,38 @@ pub fn run_convert_job(
         );
     }
 
-    // Terminal log write must not promote a log-IO error over the
-    // inner result: a failed `completed` write after a successful
-    // publish would otherwise make the caller see Err while the
-    // head is on disk.  Surface log failures via tracing instead.
-    match &result {
-        Ok(_) => {
-            if let Err(log_err) = log.event("completed", None, None) {
-                tracing::warn!(
-                    target: "converter",
-                    err = %log_err,
-                    "convert succeeded but terminal `completed` log write failed",
-                );
-            }
-        }
-        Err(e) => {
-            if let Err(log_err) = log.event("failed", None, Some(&e.to_string())) {
-                tracing::warn!(
-                    target: "converter",
-                    err = %log_err,
-                    original = %e,
-                    "convert failed and terminal `failed` log write also failed",
-                );
-            }
+    // Build the typed terminal event and fan it out.  Ordering
+    // matters: emit the rich payload FIRST (so SSE consumers
+    // see `kind: job_completed` / `kind: job_failed` with the
+    // structured fields), THEN the registry transition (which
+    // emits the flat `state` event consumers can ignore once
+    // they have the typed payload).
+    let final_event = match &result {
+        Ok(r) => ConvertEvent::JobCompleted { result: r.clone() },
+        Err(e) => ConvertEvent::JobFailed {
+            stage,
+            severity: severity_from_convert_error(e),
+            error: e.to_string(),
+            payload: fail_payload_from_convert_error(e),
+        },
+    };
+    emit_convert_event(&mut log, job_handle.as_ref(), &mut stage, final_event);
+
+    // Registry transition.  Consumes the JobHandle; only the
+    // worker calls this so the route's spawn_blocking closure
+    // sees `Result<ConvertResult, ConvertError>` for logging
+    // without itself touching the handle.  A failed registry
+    // emit is best-effort (the broadcast / ring can lag the
+    // worker on a busy daemon) — the typed payload above is
+    // the durable record.
+    if let Some(handle) = job_handle {
+        match &result {
+            Ok(r) => handle.succeed(Some(RegistryJobResult::Convert {
+                head_id: r.head_id,
+                sha256: r.head_sha256.clone(),
+                n_classes: r.n_classes,
+            })),
+            Err(e) => handle.fail(format!("{e}")),
         }
     }
     result
@@ -1274,42 +1917,469 @@ fn convert_mpk_tempfile(
         .join(format!("convert-{job_id}-{head_id}.mpk"))
 }
 
-/// Terminal outcome of a successful convert job.  Surfaced on
-/// `JobResult::Convert` so `GET /jobs/{job_id}` carries the produced
-/// head's identity + integrity hash + class count without requiring
-/// the operator to read the JSONL log.
-#[derive(Clone, Debug)]
-pub struct ConvertOutcome {
-    /// Matches the input `ConvertJob.head_id` verbatim.
-    pub head_id: crate::common::ids::HeadId,
-    /// Lowercase-hex SHA-256 of the published `.mpk` bytes.
-    pub sha256: String,
-    pub n_classes: u32,
-}
-
 /// Inner body of [`run_convert_job`]; the wrapper opens / closes the
-/// JSONL log so terminal events are always recorded.
+/// JSONL log + handles the terminal-event fan-out, so the per-
+/// converter workers only need to emit stage transitions and
+/// outcome events through [`emit_convert_event`].  Dispatches on
+/// [`ConvertJobKind`] to the variant-specific worker; the shared
+/// admission fields on [`ConvertJob`] (`job_id`, `workspace_id`,
+/// `head_id`, `workspace_revision`) ride through unchanged.
 fn run_convert_job_inner(
     files: &std::sync::Arc<dyn crate::file_mgr::FsService>,
     job: &ConvertJob,
     workspace_dir: &Path,
-    log: &mut ConvertJobLog,
-) -> Result<ConvertOutcome, ConvertError> {
-    log.event("read_model_json", None, None)?;
-    let json_bytes = std::fs::read(&job.model_json_path)
-        .map_err(|e| convert_read_err(job.model_json_path.display(), e))?;
+    log: &mut JsonlEventLog<ConvertEvent>,
+    handle: Option<&JobHandle>,
+    stage: &mut ConvertStage,
+) -> Result<ConvertResult, ConvertError> {
+    match &job.kind {
+        ConvertJobKind::Tfjs(tfjs) => {
+            run_tfjs_convert(files, job, tfjs, workspace_dir, log, handle, stage)
+        }
+        ConvertJobKind::Alpkg(alpkg) => {
+            run_alpkg_convert(files, job, alpkg, workspace_dir, log, handle, stage)
+        }
+    }
+}
+
+/// `.alpkg` head-import worker.  Verifies the operator-uploaded
+/// `.mpk` + `.json` pair, idempotency-checks against the
+/// destination workspace's existing heads, stages the `.mpk` into
+/// `<workspace>/.tmp/`, and publishes through the workspace
+/// rotation primitive.
+///
+/// Per-step typed-event emissions (each fanned to the JSONL log
+/// AND the SSE bridge via [`emit_convert_event`]):
+///
+/// 1. [`ConvertStage::ReadManifest`] — read + parse the
+///    operator's `.json`.
+/// 2. [`ConvertStage::ValidateManifest`] — structural shape
+///    checks (n_classes / labels / sha256 / head_id agreement).
+///    Success emits [`ConvertEvent::ManifestValidated`] with
+///    the declared `n_classes` + manifest's `.mpk` sha256.
+/// 3. [`ConvertStage::VerifyMpk`] — stream the `.mpk` bytes
+///    once, computing SHA-256 + counting bytes; reject on size
+///    or hash drift vs. the manifest.  Success emits
+///    [`ConvertEvent::MpkVerified`] with the observed size +
+///    sha256 (the values agree with the manifest by definition
+///    at this point; emitting them gives operators a single
+///    "verified" milestone separate from the file staging).
+/// 4. [`ConvertStage::StageMpk`] — intra-FS hard-link (or copy
+///    fallback) from the operator's
+///    `converters/alpkg/<id>/<id>.mpk` to a unique tempfile
+///    under `<workspace>/.tmp/`.  The rotation primitive's
+///    atomic rename step needs the tempfile to live on the
+///    same filesystem as `<workspace>/heads/`.
+/// 5. [`ConvertStage::PublishHead`] — call
+///    `publish_imported_head` with the rewritten manifest
+///    (workspace_id + workspace_revision stamped to the
+///    destination's current values; the source manifest's
+///    workspace-local revision is meaningless here).  Success
+///    emits [`ConvertEvent::HeadPublished`] with `idempotent_skip`
+///    distinguishing `HeadImportResult::Published` (real
+///    rotation) from `AlreadyExists` (no-op).  `HeadIdCollision`
+///    surfaces as `ConvertError::HeadIdCollision`.
+///
+/// The wrapper [`run_convert_job`] sweeps the tempfile + any
+/// staging dir on both success and failure paths, so this
+/// function doesn't need its own cleanup -- the publish step's
+/// successful rename moves the tempfile out before the sweep
+/// fires, and a failure leaves the tempfile for the sweep to
+/// reap.
+#[allow(clippy::too_many_arguments)]
+fn run_alpkg_convert(
+    files: &std::sync::Arc<dyn crate::file_mgr::FsService>,
+    job: &ConvertJob,
+    alpkg: &ConvertJobAlpkg,
+    workspace_dir: &Path,
+    log: &mut JsonlEventLog<ConvertEvent>,
+    handle: Option<&JobHandle>,
+    stage: &mut ConvertStage,
+) -> Result<ConvertResult, ConvertError> {
+    // Step 1: read + parse the manifest.  The route's blocking
+    // pool already read this once for the head_id extraction;
+    // we re-read here so the worker is self-contained and so
+    // the operator's logs telegraph the failure source by step.
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::StageStarted {
+            stage: ConvertStage::ReadManifest,
+        },
+    );
+    let manifest_bytes =
+        std::fs::read(&alpkg.manifest_path).map_err(|e| ConvertError::AlpkgManifestRead {
+            path: alpkg.manifest_path.display().to_string(),
+            source: e,
+        })?;
+    let manifest: crate::common::workspace::HeadManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| ConvertError::AlpkgManifestSchema {
+            reason: format!("{}: {}", alpkg.manifest_path.display(), e),
+        })?;
+
+    // Step 2: structural manifest validation.  `serde(deny_unknown_fields)`
+    // already rejected stray keys at the parse step above; this
+    // pass enforces value-shape invariants serde can't express.
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::StageStarted {
+            stage: ConvertStage::ValidateManifest,
+        },
+    );
+    validate_alpkg_head_manifest(&manifest, job.head_id)?;
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::ManifestValidated {
+            n_classes: manifest.n_classes,
+            sha256: manifest.sha256.clone(),
+        },
+    );
+
+    // Step 3: stream the .mpk once to verify size + hash.  Doing
+    // the hash via a streaming reader (8 KiB buffer) caps the
+    // resident memory at the buffer size even for larger heads,
+    // and visits each byte exactly once -- the bottleneck is
+    // disk read, not the hash compute.
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::StageStarted {
+            stage: ConvertStage::VerifyMpk,
+        },
+    );
+    let (observed_size, observed_sha256) = stream_sha256_file(&alpkg.mpk_path)?;
+    if observed_size != manifest.size_bytes {
+        return Err(ConvertError::AlpkgSizeMismatch {
+            expected: manifest.size_bytes,
+            observed: observed_size,
+        });
+    }
+    if observed_sha256 != manifest.sha256 {
+        return Err(ConvertError::AlpkgHashMismatch {
+            expected: manifest.sha256.clone(),
+            observed: observed_sha256,
+        });
+    }
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::MpkVerified {
+            size_bytes: observed_size,
+            sha256: observed_sha256.clone(),
+        },
+    );
+
+    // Step 4: stage the .mpk into the workspace's `.tmp/`.  The
+    // rotation primitive needs an intra-FS source for its
+    // atomic-rename step (cross-FS rename would EXDEV); hard-
+    // link is the cheap intra-FS pattern (no byte copy), falling
+    // back to `fs::copy` if the FS rejects links.  The
+    // tempfile's name encodes `convert-<job_id>-<head_id>` so the
+    // wrapper's unconditional cleanup at `run_convert_job` exit
+    // can find + remove it on failure paths.
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::StageStarted {
+            stage: ConvertStage::StageMpk,
+        },
+    );
+    let tmp_root = workspace_dir.join(".tmp");
+    std::fs::create_dir_all(&tmp_root).map_err(|e| convert_write_err(tmp_root.display(), e))?;
+    let mpk_tempfile = convert_mpk_tempfile(workspace_dir, job.job_id, job.head_id);
+    // Defensive remove: a previous failed-and-retried run could
+    // have left this exact path occupied.  NotFound is the
+    // happy case.
+    if let Err(e) = std::fs::remove_file(&mpk_tempfile)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(convert_write_err(mpk_tempfile.display(), e));
+    }
+    if let Err(e) = std::fs::hard_link(&alpkg.mpk_path, &mpk_tempfile) {
+        // EXDEV / EPERM / unsupported: fall back to byte copy.
+        // NotFound on the source is a real read error (the
+        // operator's uploaded file vanished between the route's
+        // resolve and now); surface it as such.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Err(convert_read_err(alpkg.mpk_path.display(), e));
+        }
+        std::fs::copy(&alpkg.mpk_path, &mpk_tempfile)
+            .map_err(|source| convert_read_err(alpkg.mpk_path.display(), source))?;
+    }
+    // The rotation primitive checks `mpk_tempfile.is_file()`
+    // before renaming; ensure the staged file is fsynced to its
+    // current path so a crash between here and the rename
+    // doesn't surface a partially-written tempfile after boot.
+    let f = std::fs::File::open(&mpk_tempfile)
+        .map_err(|e| convert_read_err(mpk_tempfile.display(), e))?;
+    f.sync_all()
+        .map_err(|e| convert_write_err(mpk_tempfile.display(), e))?;
+    drop(f);
+
+    // Step 5: publish via the imported-head rotation.  We rewrite
+    // `workspace_id` + `workspace_revision` to the destination's
+    // values (the source manifest's values are workspace-local
+    // to the exporting install and meaningless here); `created_at`
+    // is also re-stamped so the head's apparent age tracks when
+    // it landed in this workspace, not when the source workspace
+    // first trained it -- matching the TFJS convert path's
+    // semantics where `created_at` is the convert-time wall
+    // clock.  `head_id`, `sha256`, `n_classes`, `size_bytes`,
+    // and `labels` survive verbatim because those describe the
+    // *head*, not the workspace.
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::StageStarted {
+            stage: ConvertStage::PublishHead,
+        },
+    );
+    let published_manifest = crate::common::workspace::HeadManifest {
+        head_id: job.head_id,
+        workspace_id: job.workspace_id,
+        workspace_revision: job.workspace_revision.clone(),
+        sha256: manifest.sha256.clone(),
+        n_classes: manifest.n_classes,
+        size_bytes: manifest.size_bytes,
+        created_at: crate::file_mgr::now_rfc3339(),
+        labels: manifest.labels.clone(),
+    };
+    let pending = crate::file_mgr::PendingHead {
+        head_id: job.head_id,
+        mpk_tempfile: mpk_tempfile.clone(),
+        manifest: published_manifest,
+    };
+    let idempotent_skip = match files.publish_imported_head(&job.workspace_id, pending) {
+        Ok(crate::file_mgr::HeadImportResult::Published(_)) => false,
+        Ok(crate::file_mgr::HeadImportResult::AlreadyExists) => {
+            // Idempotent no-op: the head was already in the
+            // workspace's index with a matching sha256.  The
+            // staged tempfile is now orphaned; the wrapper's
+            // unconditional cleanup will reap it.  The
+            // `HeadPublished` event still fires (true outcome:
+            // the head is present in this workspace's index),
+            // tagged with `idempotent_skip = true` so the
+            // frontend can render "Already imported" copy.
+            true
+        }
+        Err(fs_err) => {
+            // Distinguish the head-id-collision case (operator-
+            // facing 409 with the dedicated discriminator) from
+            // generic file-system failures.  The `FsError`'s
+            // source chain carries the `FileError`; one
+            // destructure does both the match + the field
+            // extraction so the re-wrapped error preserves the
+            // original head_id + sha256 strings verbatim.
+            use std::error::Error as _;
+            if let Some(crate::file_mgr::FileError::HeadIdCollision {
+                head_id,
+                got_sha256,
+                stored_sha256,
+            }) = fs_err
+                .source()
+                .and_then(|s| s.downcast_ref::<crate::file_mgr::FileError>())
+            {
+                return Err(ConvertError::HeadIdCollision(
+                    crate::file_mgr::FileError::HeadIdCollision {
+                        head_id: head_id.clone(),
+                        got_sha256: got_sha256.clone(),
+                        stored_sha256: stored_sha256.clone(),
+                    },
+                ));
+            }
+            return Err(convert_write_err(
+                workspace_dir.display(),
+                std::io::Error::other(fs_err.to_string()),
+            ));
+        }
+    };
+
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::HeadPublished {
+            head_id: job.head_id,
+            head_sha256: manifest.sha256.clone(),
+            size_bytes: manifest.size_bytes,
+            n_classes: manifest.n_classes,
+            classes: manifest.labels.clone(),
+            workspace_revision: job.workspace_revision.clone(),
+            idempotent_skip,
+        },
+    );
+
+    Ok(ConvertResult {
+        head_id: job.head_id,
+        head_sha256: manifest.sha256,
+        n_classes: manifest.n_classes,
+        classes: manifest.labels,
+    })
+}
+
+/// Structural validation for the operator-uploaded
+/// [`HeadManifest`].  Mirrors the frontend's `validateManifestStructure`
+/// so a bypassed-frontend caller hits the same rejection shape.
+/// `expected_head_id` is `job.head_id`, snapshotted by the route's
+/// start-time parse -- agreement is the trip-wire for a manifest
+/// swap between parse #1 (route) and parse #2 (worker).
+fn validate_alpkg_head_manifest(
+    manifest: &crate::common::workspace::HeadManifest,
+    expected_head_id: crate::common::ids::HeadId,
+) -> Result<(), ConvertError> {
+    if manifest.head_id != expected_head_id {
+        return Err(alpkg_schema_err(format!(
+            "manifest head_id {} does not match route-extracted head_id {}",
+            manifest.head_id, expected_head_id
+        )));
+    }
+    if manifest.n_classes == 0 {
+        return Err(alpkg_schema_err("n_classes must be >= 1"));
+    }
+    let limits = ConvertLimits::default();
+    let max_n = u32::try_from(limits.max_n_classes).unwrap_or(u32::MAX);
+    if manifest.n_classes > max_n {
+        return Err(alpkg_schema_err(format!(
+            "n_classes = {} exceeds cap {}",
+            manifest.n_classes, max_n
+        )));
+    }
+    if manifest.labels.len() != manifest.n_classes as usize {
+        return Err(alpkg_schema_err(format!(
+            "labels.len() = {} does not match n_classes = {}",
+            manifest.labels.len(),
+            manifest.n_classes
+        )));
+    }
+    for (i, lbl) in manifest.labels.iter().enumerate() {
+        if lbl.is_empty() {
+            return Err(alpkg_schema_err(format!("labels[{i}] is empty")));
+        }
+    }
+    // sha256 must be 64 lowercase hex chars -- matches the
+    // daemon's `hex_lowercase(Sha256::digest(...))` output shape
+    // that the manifest's `sha256` field is canonically populated
+    // from.
+    if manifest.sha256.len() != 64
+        || !manifest
+            .sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(alpkg_schema_err(format!(
+            "sha256 must be 64 lowercase hex chars; got `{}`",
+            manifest.sha256
+        )));
+    }
+    Ok(())
+}
+
+/// Stream-read a file, computing its SHA-256 digest + byte count
+/// in a single pass.  Used by the `.alpkg` worker to verify the
+/// operator-uploaded `.mpk` against the manifest's declared
+/// size + sha256.  8 KiB buffer caps resident memory regardless
+/// of file size.
+fn stream_sha256_file(path: &Path) -> Result<(u64, String), ConvertError> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path).map_err(|e| convert_read_err(path.display(), e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| convert_read_err(path.display(), e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total = total.saturating_add(n as u64);
+    }
+    Ok((total, hex_lowercase(&hasher.finalize())))
+}
+
+/// TFJS bundle -> head conversion worker.  Reads the operator-
+/// uploaded `model.json` + shards + labels, extracts the head
+/// `Linear` layer's weights into a Burn `.mpk`, and publishes
+/// the result via the workspace rotation primitive.
+///
+/// Per-step typed-event emissions (each fanned to the JSONL log
+/// AND the SSE bridge via [`emit_convert_event`]):
+///
+/// 1. [`ConvertStage::ReadModelJson`] — read + parse
+///    `model.json`.  A malformed manifest fails here.
+/// 2. [`ConvertStage::StageShards`] — hard-link (or copy on
+///    cross-FS) every shard declared in the manifest into
+///    `<workspace>/.tmp/convert-<job_id>/`.  An operator-
+///    uploaded shard that vanished between request validation
+///    and worker spawn fails here.
+/// 3. [`ConvertStage::ExtractWeights`] — locate the head
+///    kernel + bias entries and decode them out of the staged
+///    shard bytes.  Success emits
+///    [`ConvertEvent::WeightsExtracted`] with the parsed
+///    `n_classes` + `in_dim` so SSE sees the derived shape
+///    before publication.
+/// 4. [`ConvertStage::ReadLabels`] — read the labels file and
+///    cross-check the count against the head's
+///    `n_classes`.  Success emits
+///    [`ConvertEvent::LabelsLoaded`].
+/// 5. [`ConvertStage::StageHeadMpk`] — assemble the ACSTHEAD-
+///    wrapped `.mpk` blob in memory and stage it under
+///    `<workspace>/.tmp/`.
+/// 6. [`ConvertStage::PublishHead`] — call `publish_trained_head`;
+///    success emits [`ConvertEvent::HeadPublished`]
+///    (`idempotent_skip = false` always for TFJS — there's no
+///    "already exists" path the way Alpkg has).
+#[allow(clippy::too_many_arguments)]
+fn run_tfjs_convert(
+    files: &std::sync::Arc<dyn crate::file_mgr::FsService>,
+    job: &ConvertJob,
+    tfjs: &ConvertJobTfjs,
+    workspace_dir: &Path,
+    log: &mut JsonlEventLog<ConvertEvent>,
+    handle: Option<&JobHandle>,
+    stage: &mut ConvertStage,
+) -> Result<ConvertResult, ConvertError> {
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::StageStarted {
+            stage: ConvertStage::ReadModelJson,
+        },
+    );
+    let json_bytes = std::fs::read(&tfjs.model_json_path)
+        .map_err(|e| convert_read_err(tfjs.model_json_path.display(), e))?;
     let limits = ConvertLimits::default();
     let manifest = parse_tfjs_manifest_with_limits(&json_bytes, &limits)?;
 
-    // The converter reads via `job.shard_paths` (not the manifest
+    // The converter reads via `tfjs.shard_paths` (not the manifest
     // names), but cardinality must match so the streaming reader
-    // walks the right number of files.
-    if manifest.shards.len() != job.shard_paths.len() {
+    // walks the right number of files.  As of the single-path
+    // `TfjsConvertParams` simplification, BOTH the request's shard
+    // list and the manifest's `weightsManifest[].paths` are
+    // derived from the same `model.json`, so this check is
+    // trivially true in the happy path.  It stays as
+    // defense-in-depth against the rare race where the operator
+    // re-uploads model.json between the route's start-time parse
+    // and the worker's re-read (single-tab convert is gated by
+    // the daemon's `max_convert_jobs = 1` semaphore so the same-
+    // tab race is closed, but cross-tab uploads can interleave).
+    if manifest.shards.len() != tfjs.shard_paths.len() {
         return Err(ConvertError::TfjsParse {
             what: "shards",
             msg: format!(
-                "request declared {} shards but manifest declares {}",
-                job.shard_paths.len(),
+                "model.json shard count changed mid-job: route saw {}, worker sees {}",
+                tfjs.shard_paths.len(),
                 manifest.shards.len(),
             ),
         });
@@ -1317,7 +2387,18 @@ fn run_convert_job_inner(
 
     // Stage the shard set into a per-job dir under `.tmp/` so the
     // streaming reader can resolve the manifest's declared paths
-    // (which are sibling-relative to `model.json`).
+    // (which are sibling-relative to `model.json`).  Distinct
+    // stage so a hard-link / copy failure on any shard pinpoints
+    // "the staging step" rather than the read-and-parse step;
+    // mirrors alpkg's [`ConvertStage::StageMpk`].
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::StageStarted {
+            stage: ConvertStage::StageShards,
+        },
+    );
     let tmp_root = workspace_dir.join(".tmp");
     std::fs::create_dir_all(&tmp_root).map_err(|e| convert_write_err(tmp_root.display(), e))?;
     let staging_dir = convert_staging_dir(workspace_dir, job.job_id);
@@ -1336,7 +2417,7 @@ fn run_convert_job_inner(
                 std::io::Error::other(e.to_string()),
             )
         })?;
-    for (declared, src) in manifest.shards.iter().zip(job.shard_paths.iter()) {
+    for (declared, src) in manifest.shards.iter().zip(tfjs.shard_paths.iter()) {
         let dst = staging_dir.join(declared);
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).map_err(|e| convert_write_err(parent.display(), e))?;
@@ -1353,7 +2434,14 @@ fn run_convert_job_inner(
         }
     }
 
-    log.event("extract_weights", None, None)?;
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::StageStarted {
+            stage: ConvertStage::ExtractWeights,
+        },
+    );
     let (k_entry, b_entry) = pick_tfjs_head_entries(&manifest)?;
     // The source-bundle sha is not persisted on the head manifest
     // schema; pass `None` so the streaming reader skips the hasher
@@ -1367,11 +2455,53 @@ fn run_convert_job_inner(
         &kernel_bytes,
         &bias_bytes,
     )?;
+    // Coerce to u32 once at the boundary.  `head_weights_from_
+    // head_byte_ranges` already gated `n_classes` against
+    // `limits.max_n_classes` (10_000), so the `try_from` is
+    // guaranteed to succeed in practice; the structured
+    // `BadClassCount` error here is defensive against a future
+    // loosening of the upstream cap.  Reusing the same
+    // `n_classes_u32` for both `WeightsExtracted` and the
+    // downstream `HeadManifest` / `ConvertResult` keeps the
+    // wire value identical across events; reusing `limits`
+    // ties the failing-constraint cap to the same struct
+    // `parse_tfjs_manifest_with_limits` was given upstream.
+    let n_classes_u32 =
+        u32::try_from(weights.n_classes).map_err(|_| ConvertError::BadClassCount {
+            got: weights.n_classes,
+            max: limits.max_n_classes,
+        })?;
+    let in_dim_u32 = u32::try_from(weights.in_dim).unwrap_or(u32::MAX);
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::WeightsExtracted {
+            n_classes: n_classes_u32,
+            in_dim: in_dim_u32,
+        },
+    );
 
-    log.event("read_labels", None, None)?;
-    let labels = read_labels_from_path(&job.labels_path, job.labels_format, weights.n_classes)?;
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::StageStarted {
+            stage: ConvertStage::ReadLabels,
+        },
+    );
+    let labels = read_labels_from_path(&tfjs.labels_path, tfjs.labels_format, weights.n_classes)?;
+    let n_labels = u32::try_from(labels.len()).unwrap_or(u32::MAX);
+    emit_convert_event(log, handle, stage, ConvertEvent::LabelsLoaded { n_labels });
 
-    log.event("stage_head_mpk", None, None)?;
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::StageStarted {
+            stage: ConvertStage::StageHeadMpk,
+        },
+    );
     // Build the ACSTHEAD-wrapped `.mpk` in memory and stage it under
     // `.tmp/` so the rotation primitive can rename it intra-FS into
     // `heads/<head_id>.mpk` atomically.
@@ -1383,15 +2513,12 @@ fn run_convert_job_inner(
         convert_write_err(mpk_tempfile.display(), std::io::Error::other(e.to_string()))
     })?;
 
-    let n_classes_u32 =
-        u32::try_from(weights.n_classes).map_err(|_| ConvertError::BadClassCount {
-            got: weights.n_classes,
-            max: ConvertLimits::default().max_n_classes,
-        })?;
-
     // Heads carry only sha256 / n_classes / size_bytes / labels /
     // workspace_revision; the JSONL convert log is the durable
-    // record of which inputs produced this head.
+    // record of which inputs produced this head.  `n_classes_u32`
+    // was computed once above (right after extraction) and
+    // reused here so the wire `n_classes` value stays identical
+    // across every event + the on-disk manifest.
     let manifest_struct = crate::common::workspace::HeadManifest {
         head_id: job.head_id,
         workspace_id: job.workspace_id,
@@ -1408,7 +2535,14 @@ fn run_convert_job_inner(
         manifest: manifest_struct,
     };
 
-    log.event("publish_head", None, None)?;
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::StageStarted {
+            stage: ConvertStage::PublishHead,
+        },
+    );
     files
         .publish_trained_head(&job.workspace_id, pending)
         .map_err(|e| {
@@ -1417,14 +2551,32 @@ fn run_convert_job_inner(
                 std::io::Error::other(e.to_string()),
             )
         })?;
+    emit_convert_event(
+        log,
+        handle,
+        stage,
+        ConvertEvent::HeadPublished {
+            head_id: job.head_id,
+            head_sha256: head_sha256.clone(),
+            size_bytes: head_size,
+            n_classes: n_classes_u32,
+            classes: labels.clone(),
+            workspace_revision: job.workspace_revision.clone(),
+            // TFJS extract is never an idempotent no-op: the
+            // daemon-allocated `head_id` is fresh per job, so
+            // the rotation primitive always publishes new bytes.
+            idempotent_skip: false,
+        },
+    );
 
     // Tempfile cleanup happens unconditionally in `run_convert_job`
     // after the inner returns -- this covers the failure paths
     // above too without each `?` site needing its own scrub.
-    Ok(ConvertOutcome {
+    Ok(ConvertResult {
         head_id: job.head_id,
-        sha256: head_sha256,
+        head_sha256,
         n_classes: n_classes_u32,
+        classes: labels,
     })
 }
 
@@ -1499,76 +2651,6 @@ fn build_head_mpk_blob(weights: &HeadWeights) -> Result<Vec<u8>, ConvertError> {
     blob.extend_from_slice(&header);
     blob.extend_from_slice(&payload);
     Ok(blob)
-}
-
-/// Bounded JSONL writer for
-/// `<workspace_dir>/converter_logs/<job_id>.jsonl`.  One event per
-/// line; flushes once per terminal event (open / publish / close).
-/// `message` is capped at 8 KiB; structural fields stay uncapped
-/// because they are fixed-shape.
-struct ConvertJobLog {
-    file: std::fs::File,
-    seq: u64,
-}
-
-impl ConvertJobLog {
-    /// Open `<workspace_dir>/converter_logs/<job_id>.jsonl` for
-    /// append; creates the dir if missing.  Mirror of
-    /// [`crate::training::TrainJobLog::open`] for the converter
-    /// producer: after the new file is created, enforces
-    /// [`crate::file_mgr::LOG_RETENTION_KEEP_COUNT`] over the
-    /// dir's `.jsonl` files (the just-opened file is the freshest
-    /// by mtime and survives, modulo forward-stamped siblings).
-    /// The helper publishes per-sweep counters through its
-    /// installed metrics hook itself; retention failures surface
-    /// as a `tracing::warn!` plus a `log_retention_failures_total`
-    /// bump and do NOT fail the open.
-    fn open(workspace_dir: &Path, job_id: crate::common::ids::JobId) -> Result<Self, ConvertError> {
-        let dir = workspace_dir.join("converter_logs");
-        std::fs::create_dir_all(&dir).map_err(|e| convert_write_err(dir.display(), e))?;
-        let path = dir.join(format!("{job_id}.jsonl"));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| convert_write_err(path.display(), e))?;
-        crate::file_mgr::enforce_keep_last_n(&dir, crate::file_mgr::LOG_RETENTION_KEEP_COUNT);
-        Ok(Self { file, seq: 0 })
-    }
-
-    /// Append one JSONL event line.  `state` carries the
-    /// lifecycle phase (`started`, `read_model_json`, ...,
-    /// `completed`, `failed`); `message` is an optional bounded
-    /// diagnostic payload.
-    fn event(
-        &mut self,
-        state: &str,
-        progress: Option<u64>,
-        message: Option<&str>,
-    ) -> Result<(), ConvertError> {
-        use std::io::Write as _;
-        self.seq = self.seq.saturating_add(1);
-        let now = crate::file_mgr::now_rfc3339();
-        let truncated_msg = message.map(truncate_log_message);
-        let line = serde_json::json!({
-            "seq": self.seq,
-            "at": now,
-            "state": state,
-            "progress": progress,
-            "message": truncated_msg,
-        });
-        let mut bytes = serde_json::to_vec(&line).map_err(ConvertError::MetadataSerialize)?;
-        bytes.push(b'\n');
-        self.file
-            .write_all(&bytes)
-            .map_err(|e| convert_write_err("<converter_logs>", e))?;
-        // Best-effort flush.  fsync per-line would 10x the cost
-        // for negligible recovery benefit (a crash mid-job loses
-        // at most the trailing event; the workspace state is
-        // recovered via boot recovery).
-        let _ = self.file.flush();
-        Ok(())
-    }
 }
 
 /// Validate `n_classes` against `1..=ConvertLimits::max_n_classes`.
@@ -2328,6 +3410,134 @@ mod tests {
         assert_kind(ConvertError::from(serde_err), ErrorKind::Internal);
     }
 
+    /// Each [`ConvertError`] variant lifts to the documented
+    /// [`ConvertFailPayload`] category via
+    /// [`fail_payload_from_convert_error`].  Mirrors the
+    /// training-side `fail_payload_lifts_each_error_variant`
+    /// test; pinning the mapping here means the frontend's
+    /// category-based hint copy survives a future error-variant
+    /// addition (the daemon won't compile if a new variant is
+    /// added without an arm in `fail_payload_from_convert_error`).
+    #[test]
+    fn fail_payload_lifts_each_convert_error_variant() {
+        // Helper: assert the payload's serialised `category`
+        // field matches the expected snake_case discriminator.
+        fn assert_category(err: ConvertError, expected: &str) {
+            let payload = fail_payload_from_convert_error(&err);
+            let v = serde_json::to_value(&payload).expect("payload serializes");
+            assert_eq!(
+                v["category"].as_str(),
+                Some(expected),
+                "{err:?} -> {payload:?}",
+            );
+        }
+
+        // Structured variants with their own payload arm.
+        assert_category(
+            ConvertError::LimitExceeded {
+                what: "n_classes",
+                value: 99,
+                max: 10,
+            },
+            "limit_exceeded",
+        );
+        assert_category(
+            ConvertError::BadClassCount { got: 0, max: 10 },
+            "bad_class_count",
+        );
+        assert_category(ConvertError::Labels("bad".into()), "labels");
+        assert_category(
+            ConvertError::AlpkgManifestSchema { reason: "x".into() },
+            "alpkg_manifest_schema",
+        );
+        assert_category(
+            ConvertError::AlpkgSizeMismatch {
+                expected: 1,
+                observed: 2,
+            },
+            "alpkg_size_mismatch",
+        );
+        assert_category(
+            ConvertError::AlpkgHashMismatch {
+                expected: "a".into(),
+                observed: "b".into(),
+            },
+            "alpkg_hash_mismatch",
+        );
+        assert_category(
+            ConvertError::HeadIdCollision(crate::file_mgr::FileError::HeadIdCollision {
+                head_id: crate::common::ids::HeadId::new().to_string(),
+                got_sha256: "a".into(),
+                stored_sha256: "b".into(),
+            }),
+            "head_id_collision",
+        );
+
+        // Source-malformed catch-all (TFJS-side UserInput errors
+        // without their own payload variant).
+        assert_category(
+            ConvertError::TfjsParse {
+                what: "x",
+                msg: "y".into(),
+            },
+            "source_malformed",
+        );
+        assert_category(ConvertError::TfjsLocator("x".into()), "source_malformed");
+        assert_category(
+            ConvertError::TfjsShortRead { have: 0, need: 1 },
+            "source_malformed",
+        );
+        assert_category(
+            ConvertError::TfjsUnsafePath("..".into()),
+            "source_malformed",
+        );
+        assert_category(
+            ConvertError::TfjsZeroDimension {
+                name: "k".into(),
+                shape: vec![0],
+            },
+            "source_malformed",
+        );
+        assert_category(
+            ConvertError::NonFiniteWeight {
+                tensor: "k".into(),
+                index: 0,
+                value: f32::NAN,
+            },
+            "source_malformed",
+        );
+
+        // Internal catch-all (FS, serializer, busy, etc.).
+        assert_category(
+            ConvertError::Read {
+                path: "/tmp/x".into(),
+                source: std::io::Error::other("io"),
+            },
+            "internal",
+        );
+        assert_category(
+            ConvertError::Write {
+                path: "/tmp/x".into(),
+                source: std::io::Error::other("io"),
+            },
+            "internal",
+        );
+        assert_category(ConvertError::Record("x".into()), "internal");
+        assert_category(ConvertError::Tensor("x".into()), "internal");
+        assert_category(ConvertError::Busy, "internal");
+        assert_category(ConvertError::NotImplemented("x"), "internal");
+        assert_category(
+            ConvertError::AlpkgManifestRead {
+                path: "/tmp/x".into(),
+                source: std::io::Error::other("io"),
+            },
+            "internal",
+        );
+        let serde_err: serde_json::Error =
+            serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err();
+        assert_category(ConvertError::from(serde_err), "internal");
+    }
+
     /// Cross-test serialization gate for every test in this
     /// module that touches the global [`CONVERT_SEMAPHORE`].
     /// The semaphore is shared across the test binary; without
@@ -2471,16 +3681,18 @@ mod tests {
             workspace_id: ws,
             head_id,
             workspace_revision: rev(0),
-            model_json_path: model_json,
-            shard_paths: shards,
-            labels_path: labels,
-            labels_format: crate::file_mgr::LabelsFormat::Lines,
+            kind: ConvertJobKind::Tfjs(ConvertJobTfjs {
+                model_json_path: model_json,
+                shard_paths: shards,
+                labels_path: labels,
+                labels_format: crate::file_mgr::LabelsFormat::Lines,
+            }),
         };
 
         // The convert semaphore is held by `_gate` for the test's
         // body so cross-test races stay clean.  `run_convert_job`
         // does not re-acquire (the api producer owns the permit).
-        run_convert_job(fs.clone(), job).expect("convert publishes");
+        run_convert_job(fs.clone(), job, None).expect("convert publishes");
 
         // Head landed in the workspace's index.
         let summary = fs.summary(&ws).expect("summary");
@@ -2520,8 +3732,8 @@ mod tests {
 
     /// A failed `run_convert_job` does NOT commit a head record.
     /// Force failure by giving `model.json` an invalid manifest;
-    /// the workspace's `heads.json` stays empty and a `failed`
-    /// log line lands in the JSONL.
+    /// the workspace's `heads.json` stays empty and a
+    /// `JobFailed` typed-event line lands in the JSONL.
     #[test]
     fn convert_failure_releases_references_and_no_head_committed() {
         // Cross-test serialization (see above).
@@ -2549,12 +3761,14 @@ mod tests {
             workspace_id: ws,
             head_id,
             workspace_revision: rev(0),
-            model_json_path: bad_model,
-            shard_paths: vec![bad_shard],
-            labels_path: bad_labels,
-            labels_format: crate::file_mgr::LabelsFormat::Lines,
+            kind: ConvertJobKind::Tfjs(ConvertJobTfjs {
+                model_json_path: bad_model,
+                shard_paths: vec![bad_shard],
+                labels_path: bad_labels,
+                labels_format: crate::file_mgr::LabelsFormat::Lines,
+            }),
         };
-        let err = run_convert_job(fs.clone(), job).expect_err("invalid manifest must fail");
+        let err = run_convert_job(fs.clone(), job, None).expect_err("invalid manifest must fail");
         assert!(
             matches!(err, ConvertError::TfjsParse { .. }),
             "expected TfjsParse, got {err:?}",
@@ -2580,9 +3794,13 @@ mod tests {
             mpk_tempfile.display(),
         );
 
-        // The JSONL log carries a `failed` line.
+        // The JSONL log carries a `job_failed` typed-event line.
+        // After the typed-event migration the wire discriminator
+        // is `kind` (not the legacy `state` string); the snake-
+        // case variant name `job_failed` derives from
+        // `ConvertEvent::JobFailed`.
         let log_path = workspace_dir
-            .join("converter_logs")
+            .join(CONVERTER_LOGS_DIR_NAME)
             .join(format!("{job_id}.jsonl"));
         assert!(log_path.is_file(), "log missing");
         let log = std::fs::read_to_string(&log_path).unwrap();
@@ -2590,15 +3808,40 @@ mod tests {
             log.lines().any(|line| {
                 serde_json::from_str::<serde_json::Value>(line)
                     .ok()
-                    .and_then(|v| v["state"].as_str().map(str::to_string))
+                    .and_then(|v| v["kind"].as_str().map(str::to_string))
                     .as_deref()
-                    == Some("failed")
+                    == Some("job_failed")
             }),
-            "log must contain a `failed` event line; got:\n{log}",
+            "log must contain a `job_failed` event line; got:\n{log}",
+        );
+        // The same line carries the typed failure payload's
+        // category + severity (one of the rich-payload upgrades
+        // Layer B brought over the stringly-typed predecessor).
+        let job_failed_line = log
+            .lines()
+            .find_map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                (v["kind"].as_str()? == "job_failed").then_some(v)
+            })
+            .expect("at least one job_failed line");
+        assert_eq!(
+            job_failed_line["category"].as_str(),
+            Some("source_malformed"),
+            "TfjsParse maps to source_malformed payload; got line {job_failed_line}",
+        );
+        assert_eq!(
+            job_failed_line["severity"].as_str(),
+            Some("operator_fixable"),
+            "UserInput-kinded errors carry operator_fixable severity",
+        );
+        assert_eq!(
+            job_failed_line["stage"].as_str(),
+            Some("read_model_json"),
+            "failure stage stamped from last StageStarted; got line {job_failed_line}",
         );
     }
 
-    /// `ConvertJobLog::open` enforces
+    /// `JsonlEventLog::<ConvertEvent>::open` enforces
     /// `LOG_RETENTION_KEEP_COUNT` on
     /// `<workspace>/converter_logs/` after creating the new
     /// `<job_id>.jsonl`: the just-opened file is the freshest
@@ -2613,7 +3856,7 @@ mod tests {
         // global `CONVERT_SEMAPHORE`.
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path();
-        let dir = workspace_dir.join("converter_logs");
+        let dir = workspace_dir.join(CONVERTER_LOGS_DIR_NAME);
         std::fs::create_dir_all(&dir).unwrap();
         let cap = crate::file_mgr::LOG_RETENTION_KEEP_COUNT;
         let mut stale_paths = Vec::with_capacity(cap + 1);
@@ -2621,9 +3864,7 @@ mod tests {
             let p = dir.join(format!("00000000-0000-4000-8000-{i:012x}.jsonl"));
             std::fs::write(&p, b"{}\n").unwrap();
             let backdate = std::time::SystemTime::now()
-                .checked_sub(std::time::Duration::from_secs(
-                    (1000 - i as u64) * 60,
-                ))
+                .checked_sub(std::time::Duration::from_secs((1000 - i as u64) * 60))
                 .expect("backdate");
             let secs = backdate
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2634,7 +3875,9 @@ mod tests {
             stale_paths.push(p);
         }
         let job_id = crate::common::ids::JobId::new();
-        let _log = ConvertJobLog::open(workspace_dir, job_id).expect("open log");
+        let _log =
+            JsonlEventLog::<ConvertEvent>::open(workspace_dir, CONVERTER_LOGS_DIR_NAME, job_id)
+                .expect("open log");
 
         let new_path = dir.join(format!("{job_id}.jsonl"));
         assert!(new_path.is_file(), "new log survived");
@@ -2680,39 +3923,51 @@ mod tests {
             workspace_id: ws,
             head_id,
             workspace_revision: rev(0),
-            model_json_path: model_json,
-            shard_paths: shards,
-            labels_path: labels,
-            labels_format: crate::file_mgr::LabelsFormat::Lines,
+            kind: ConvertJobKind::Tfjs(ConvertJobTfjs {
+                model_json_path: model_json,
+                shard_paths: shards,
+                labels_path: labels,
+                labels_format: crate::file_mgr::LabelsFormat::Lines,
+            }),
         };
-        run_convert_job(fs.clone(), job).expect("convert publishes");
+        run_convert_job(fs.clone(), job, None).expect("convert publishes");
 
         let log_path = workspace_dir
-            .join("converter_logs")
+            .join(CONVERTER_LOGS_DIR_NAME)
             .join(format!("{job_id}.jsonl"));
         let log = std::fs::read_to_string(&log_path).expect("read log");
         let mut prev_seq: u64 = 0;
-        let mut saw_started = false;
+        let mut saw_submitted = false;
+        let mut saw_running = false;
         let mut saw_completed = false;
         for line in log.lines() {
             let v: serde_json::Value = serde_json::from_str(line)
                 .unwrap_or_else(|e| panic!("non-JSON log line {line:?}: {e}"));
-            // Fixed-shape fields.
+            // Fixed-shape envelope fields shared by every typed
+            // ConvertEvent serialization.  `kind` replaces the
+            // legacy stringly-typed `state` discriminator.
             assert!(v["seq"].is_u64(), "seq must be u64; line={line}");
             assert!(v["at"].is_string(), "at must be string");
-            assert!(v["state"].is_string(), "state must be string");
+            assert!(v["kind"].is_string(), "kind must be string");
             // Monotonic seq.
             let seq = v["seq"].as_u64().unwrap();
             assert!(seq > prev_seq, "seq not monotonic: {prev_seq} -> {seq}");
             prev_seq = seq;
-            match v["state"].as_str().unwrap() {
-                "started" => saw_started = true,
-                "completed" => saw_completed = true,
+            match v["kind"].as_str().unwrap() {
+                "job_submitted" => saw_submitted = true,
+                "job_running" => saw_running = true,
+                "job_completed" => saw_completed = true,
                 _ => {}
             }
         }
-        assert!(saw_started, "log must contain a `started` event");
-        assert!(saw_completed, "log must contain a `completed` event");
+        // Three wrapper events from `run_convert_job` must appear
+        // in order on the happy path.  Per-stage events
+        // (`stage_started`, `weights_extracted`, …) appear
+        // between them; matching by kind sidesteps the per-
+        // converter step ordering.
+        assert!(saw_submitted, "log must contain a `job_submitted` event");
+        assert!(saw_running, "log must contain a `job_running` event");
+        assert!(saw_completed, "log must contain a `job_completed` event");
     }
 
     // MARK: convert-pipeline manifest-shape pins
@@ -2740,12 +3995,14 @@ mod tests {
             workspace_id: ws,
             head_id,
             workspace_revision: rev(7),
-            model_json_path: model_json,
-            shard_paths: shards,
-            labels_path: labels,
-            labels_format: crate::file_mgr::LabelsFormat::Lines,
+            kind: ConvertJobKind::Tfjs(ConvertJobTfjs {
+                model_json_path: model_json,
+                shard_paths: shards,
+                labels_path: labels,
+                labels_format: crate::file_mgr::LabelsFormat::Lines,
+            }),
         };
-        run_convert_job(fs.clone(), job).expect("convert publishes");
+        run_convert_job(fs.clone(), job, None).expect("convert publishes");
 
         let manifest_bytes = std::fs::read(crate::file_mgr::schema::head_manifest_path(
             &workspace_dir,
@@ -2804,12 +4061,14 @@ mod tests {
             workspace_id: ws,
             head_id,
             workspace_revision: rev(7),
-            model_json_path: model_json,
-            shard_paths: shards,
-            labels_path: labels,
-            labels_format: crate::file_mgr::LabelsFormat::Lines,
+            kind: ConvertJobKind::Tfjs(ConvertJobTfjs {
+                model_json_path: model_json,
+                shard_paths: shards,
+                labels_path: labels,
+                labels_format: crate::file_mgr::LabelsFormat::Lines,
+            }),
         };
-        run_convert_job(fs.clone(), job).expect("convert publishes");
+        run_convert_job(fs.clone(), job, None).expect("convert publishes");
 
         let index_bytes = std::fs::read(crate::file_mgr::schema::head_index_path(&workspace_dir))
             .expect("read on-disk heads.json");
@@ -2868,12 +4127,14 @@ mod tests {
             workspace_id: ws,
             head_id,
             workspace_revision: snapshot.clone(),
-            model_json_path: model_json,
-            shard_paths: shards,
-            labels_path: labels,
-            labels_format: crate::file_mgr::LabelsFormat::Lines,
+            kind: ConvertJobKind::Tfjs(ConvertJobTfjs {
+                model_json_path: model_json,
+                shard_paths: shards,
+                labels_path: labels,
+                labels_format: crate::file_mgr::LabelsFormat::Lines,
+            }),
         };
-        run_convert_job(fs.clone(), job).expect("convert publishes");
+        run_convert_job(fs.clone(), job, None).expect("convert publishes");
 
         let manifest = crate::file_mgr::schema::read_head_manifest(&workspace_dir, head_id)
             .expect("read manifest");

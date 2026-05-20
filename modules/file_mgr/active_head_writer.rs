@@ -612,10 +612,7 @@ pub fn staging_path_for(root: &Path, activation_id: &str) -> PathBuf {
 /// -- a pre-existing fragility this helper narrows but cannot
 /// fully close without activation coordinating on the
 /// per-workspace mutation lock.
-pub fn active_source_head_in_workspace(
-    root: &Path,
-    workspace_id: WorkspaceId,
-) -> Option<HeadId> {
+pub fn active_source_head_in_workspace(root: &Path, workspace_id: WorkspaceId) -> Option<HeadId> {
     let pointer = read_active_current(root).ok()?;
     let manifest = read_active_manifest(root, &pointer.activation_id).ok()?;
     match manifest.origin {

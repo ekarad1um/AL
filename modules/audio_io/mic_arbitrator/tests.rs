@@ -1224,7 +1224,7 @@ fn integration_auto_picks_loud_channel_inside_one_mic() {
 /// test via `arb_test_cfg()`.
 #[test]
 fn integration_producer_publishes_monotonic_timing_anchor() {
-    use crate::common::time::{shared_timing_anchor, BufferTimingAnchor};
+    use crate::common::time::{BufferTimingAnchor, shared_timing_anchor};
     let buf = AudioBuffer::new(65_536);
     let writer = buf.take_writer();
     let reader = buf.reader_at(0);

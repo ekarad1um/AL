@@ -51,11 +51,16 @@ pub const MAX_LOG_PAGE_LIMIT: usize = 1000;
 /// shape extracts only the two cursor-relevant fields (`seq` for
 /// pagination, `at` for sorting) and carries every other field
 /// in `payload` via `#[serde(flatten)]`.  Producers
-/// (`ConvertJobLog`, `TrainJobLog`) own their per-line schema:
-/// the converter writes `{state, progress, message}` triples;
-/// the training producer writes typed events tagged on `kind`.
-/// Either shape round-trips through this type because unknown
-/// fields land in `payload` rather than failing the parse.
+/// (the shared [`super::JsonlEventLog`] writer instantiated as
+/// `JsonlEventLog<TrainEvent>` for training and
+/// `JsonlEventLog<ConvertEvent>` for the converter) own their
+/// per-line schema: both write typed events tagged on `kind`,
+/// with event-specific fields flattened into the `{seq, at}`
+/// envelope.  Either shape round-trips through this type
+/// because unknown fields land in `payload` rather than failing
+/// the parse, and consumers can downcast based on which JSONL
+/// tree the file lives under or on the `kind` value within
+/// `payload`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogEvent {
     pub seq: u64,

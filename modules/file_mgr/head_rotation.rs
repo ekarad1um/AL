@@ -485,6 +485,97 @@ impl WorkspaceMgr {
         let cell = self.cache_cell_for_head_delete(ws)?;
         publish_trained_head(&workspace_dir, &cell, pending, pinned_head)
     }
+
+    /// Index-atomic publish of an *imported* head (from the
+    /// `.alpkg` convert path).  Same per-workspace mutex + cache
+    /// cell discipline as
+    /// [`Self::publish_trained_head_for_workspace`], plus an
+    /// idempotency / collision check held under the same mutex so
+    /// no concurrent producer can interleave between the check
+    /// and the publish.
+    ///
+    /// Three outcomes:
+    ///   - `Ok(HeadImportResult::AlreadyExists)` -- a head with the
+    ///     same `head_id` AND the same `sha256` already lives in the
+    ///     workspace's index.  No publish runs; the caller treats
+    ///     this as success and returns the existing head's identity.
+    ///   - `Ok(HeadImportResult::Published(rotation))` -- the head
+    ///     was new (or carried a fresh id) and landed into the
+    ///     sliding-window rotation.  `rotation.displaced_head_id`
+    ///     names any evicted predecessor.
+    ///   - `Err(FileError::HeadIdCollision { .. })` -- a head with
+    ///     the same `head_id` already lives in the workspace's
+    ///     index BUT with a different `sha256`.  The rotation
+    ///     refuses to overwrite (so external references pinned to
+    ///     the original sha256 stay valid); operator deletes the
+    ///     existing head before retrying.
+    ///
+    /// Caller guarantees mirror
+    /// [`Self::publish_trained_head_for_workspace`]:
+    /// `pending.mpk_tempfile` is fsynced under
+    /// `<workspace_dir>/.tmp/`; `pending.manifest.head_id` matches
+    /// `pending.head_id`.
+    pub fn publish_imported_head_for_workspace(
+        self: &Arc<Self>,
+        ws: &WorkspaceId,
+        pending: PendingHead,
+    ) -> Result<HeadImportResult, FileError> {
+        let workspace_dir = self.workspace_dir(ws);
+        if !workspace_core_path(&workspace_dir).exists() {
+            return Err(FileError::NotFound(ws.to_string()));
+        }
+        let lock = self.metadata_lock(ws);
+        let _guard = lock.lock();
+
+        // Idempotency / collision check under the per-workspace
+        // mutex -- the same lock that serialises every publish so
+        // no concurrent rotation can interleave between this
+        // observation and the delegate `publish_trained_head`
+        // below.  The cache cell's `heads()` snapshot is canonical
+        // because the lock excludes every other writer.
+        let cell = self.cache_cell_for_head_delete(ws)?;
+        let prev_heads = cell.heads();
+        for existing in &prev_heads.heads {
+            if existing.head_id == pending.head_id {
+                if existing.sha256 == pending.manifest.sha256 {
+                    // Idempotent re-import: same id + same hash.
+                    // Caller-visible identity is unchanged; no
+                    // rotation, no displacement, no disk write.
+                    return Ok(HeadImportResult::AlreadyExists);
+                }
+                return Err(FileError::HeadIdCollision {
+                    head_id: pending.head_id.to_string(),
+                    got_sha256: pending.manifest.sha256.clone(),
+                    stored_sha256: existing.sha256.clone(),
+                });
+            }
+        }
+
+        // No collision.  Resolve the pin under the mutex (mirrors
+        // the trained-head path) and delegate to the shared
+        // rotation primitive.
+        let pinned_head = crate::file_mgr::active_source_head_in_workspace(&self.root, *ws);
+        let rotation = publish_trained_head(&workspace_dir, &cell, pending, pinned_head)?;
+        Ok(HeadImportResult::Published(rotation))
+    }
+}
+
+/// Outcome of a successful
+/// [`crate::file_mgr::WorkspaceMgr::publish_imported_head_for_workspace`]
+/// call.  Distinguishes the idempotent-no-op branch from the
+/// real-publish branch so the convert worker can emit different log
+/// events ("idempotent_skip" vs. "published") for operator
+/// visibility while presenting the same successful terminal upward.
+#[derive(Clone, Copy, Debug)]
+pub enum HeadImportResult {
+    /// A real rotation ran; the new head is in the workspace's
+    /// index.  Inner field carries the evicted predecessor (if
+    /// any) for operator-facing diagnostics.
+    Published(HeadRotationResult),
+    /// The head was already in the workspace's index with a
+    /// matching sha256; no publish ran.  The caller treats this
+    /// as a successful idempotent no-op.
+    AlreadyExists,
 }
 
 // MARK: Tests

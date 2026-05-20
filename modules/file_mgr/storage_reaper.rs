@@ -28,8 +28,10 @@
 //! Per-workspace JSONL job logs
 //! (`<workspace>/{training,converter}_logs/<job>.jsonl`) are
 //! NOT pruned here: retention lives in
-//! [`super::log_retention`], which is invoked by the producers
-//! (`TrainJobLog::open`, `ConvertJobLog::open`) at the only
+//! [`super::log_retention`], which is invoked by the shared
+//! [`super::JsonlEventLog`] writer (instantiated as
+//! `JsonlEventLog<TrainEvent>` for training and
+//! `JsonlEventLog<ConvertEvent>` for the converter) at the only
 //! moment the cap can be exceeded (a new run arrives).
 //!
 //! The daemon-root `<root>/logs/acousticsd.log.*` is also

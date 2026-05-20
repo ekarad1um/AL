@@ -36,8 +36,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use crate::common::ids::{HeadId, JobId, WorkspaceId};
 use crate::common::workspace::{HeadManifest, WorkspaceRevision};
 use crate::file_mgr::{
-    DATASETS_DIR_NAME, FsService, JobHandle, PendingHead, RegistryJobResult, TrainingCfg,
-    now_rfc3339, sha256_file_streaming, validate_training_cfg,
+    DATASETS_DIR_NAME, FsService, JobHandle, JsonlEventLog, PendingHead, RegistryJobResult,
+    TRAINING_LOGS_DIR_NAME, TrainingCfg, now_rfc3339, sha256_file_streaming, validate_training_cfg,
 };
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -74,31 +74,21 @@ pub struct TrainingJob {
 // MARK: typed events
 //
 // Wire shape for the durable JSONL log + the cross-cutting SSE
-// bridge.  Every line is a [`TrainLogLine`] envelope (`seq` +
-// `at` + flattened [`TrainEvent`]), so a tab-refresh hydrates
-// from the JSONL with no shape divergence from the live SSE
-// stream.  Forward-compat is carried by the `kind` discriminator
-// and `#[non_exhaustive]` on `TrainEvent` (consumers must
-// tolerate unknown variants); a future wire-breaking change can
-// introduce versioning lazily by adding a `schema_version` field
-// only at that point (absence on a line means today's shape).
+// bridge.  Every line is `{seq, at, ...flattened TrainEvent}`,
+// written by the shared [`JsonlEventLog<TrainEvent>`]
+// (`crate::file_mgr::jsonl_event_log`), so a tab-refresh
+// hydrates from the JSONL with no shape divergence from the
+// live SSE stream.  Forward-compat is carried by the `kind`
+// discriminator and `#[non_exhaustive]` on `TrainEvent`
+// (consumers must tolerate unknown variants); a future
+// wire-breaking change can introduce versioning lazily by
+// adding a `schema_version` field only at that point (absence
+// on a line means today's shape).
 
-/// Operator-vs-internal axis for [`TrainEvent::JobFailed`].
-/// Derived from [`crate::common::error::Categorized::kind`] on
-/// the source error — `UserInput` lifts to `OperatorFixable`,
-/// everything else to `Internal`.  Frontend uses this to colour
-/// the failure card (amber vs red) without parsing free-form
-/// strings.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Severity {
-    /// The operator can act on this — typically a dataset shape
-    /// problem they can fix and retry.
-    OperatorFixable,
-    /// Daemon-internal failure (panic, IO mid-job, model
-    /// corruption).  Retry is the only operator action.
-    Internal,
-}
+// Re-export so `crate::training::Severity` continues to
+// resolve.  The canonical definition lives in `common::error`
+// (shared with the converter producer).
+pub use crate::common::error::Severity;
 
 /// Why a job ended in [`JobState::Cancelled`].  Distinguishes
 /// "operator clicked cancel" from "daemon shutdown drained the
@@ -119,8 +109,9 @@ pub enum CancelReason {
 /// `category` discriminates; the per-variant fields carry
 /// structured details the frontend uses to build hint copy
 /// without re-parsing free-form error strings.  Mirrors the
-/// existing [`TrainingError`] / [`finetune::FinetuneError`]
-/// variant set so every error path has a typed wire shape.
+/// existing [`TrainingError`] / `finetune::FinetuneError`
+/// (crate-private) variant set so every error path has a
+/// typed wire shape.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "category", rename_all = "snake_case")]
 pub enum FailPayload {
@@ -189,11 +180,12 @@ pub enum FailPayload {
 ///
 /// - **Wrapper-only** (`JobSubmitted`, `JobRunning`,
 ///   `HeadPublished`, `JobCompleted`, `JobFailed`, `JobCancelled`):
-///   emitted by [`run_job`] before / after [`finetune::run`].
+///   emitted by `run_job` before / after `finetune::run`
+///   (both crate-private).
 /// - **Algorithmic** (`PhaseStarted`, `DatasetScanned`,
 ///   `FeatureExtractCompleted`, `TrainSplit`, `EpochCompleted`,
-///   `TrainCompleted`): lifted from [`finetune::Event`] via the
-///   [`From`] impl below.
+///   `TrainCompleted`): lifted from `finetune::Event`
+///   (crate-private) via the [`From`] impl below.
 ///
 /// `#[non_exhaustive]`: the wire `kind` discriminator is open by
 /// design — future producers will add variants and external
@@ -218,11 +210,11 @@ pub enum TrainEvent {
     /// "queued -> running" transition even when the gap is
     /// sub-second.
     JobRunning,
-    /// Stage transition.  Lifted from [`finetune::Event`] via
-    /// the `From` impl below; same applies to the four
-    /// algorithmic variants that follow (`DatasetScanned`,
-    /// `FeatureExtractCompleted`, `TrainSplit`,
-    /// `EpochCompleted`, `TrainCompleted`).
+    /// Stage transition.  Lifted from `finetune::Event`
+    /// (crate-private) via the `From` impl below; same applies
+    /// to the four algorithmic variants that follow
+    /// (`DatasetScanned`, `FeatureExtractCompleted`,
+    /// `TrainSplit`, `EpochCompleted`, `TrainCompleted`).
     PhaseStarted { phase: Stage },
     /// Dataset scan completed; per-class breakdown + total.
     DatasetScanned {
@@ -297,17 +289,6 @@ pub enum TrainEvent {
     /// `phase_started` observed; `reason` distinguishes
     /// operator-initiated from shutdown-drain.
     JobCancelled { stage: Stage, reason: CancelReason },
-}
-
-/// Wire envelope for one JSONL line.  `seq` is monotonic per
-/// file (best-effort; one-line loss from a crash mid-write is
-/// tolerated by the page reader).
-#[derive(Debug, Serialize)]
-struct TrainLogLine<'a> {
-    seq: u64,
-    at: String,
-    #[serde(flatten)]
-    event: &'a TrainEvent,
 }
 
 /// Lift the algorithmic event variants from `finetune` into
@@ -445,11 +426,10 @@ fn fail_payload_from_error(
             per_class_kept: per_class_kept.clone(),
             val_split: *val_split,
         },
-        TrainingError::Finetune(F::InvalidConfig(detail)) | TrainingError::InvalidConfig(detail) => {
-            FailPayload::InvalidConfig {
-                detail: detail.clone(),
-            }
-        }
+        TrainingError::Finetune(F::InvalidConfig(detail))
+        | TrainingError::InvalidConfig(detail) => FailPayload::InvalidConfig {
+            detail: detail.clone(),
+        },
         TrainingError::Finetune(F::Model(e)) => FailPayload::ModelError {
             detail: e.to_string(),
         },
@@ -496,23 +476,12 @@ fn fail_payload_from_error(
     }
 }
 
-/// Map a [`TrainingError`] to the [`Severity`] axis the frontend
-/// uses for failure card colour.  Delegates to
-/// [`Categorized::kind`] so adding a new error variant only
-/// requires updating that single mapping; everything that isn't
-/// operator-supplied input is `Internal` from the training-card
-/// perspective (Conflict / NotFound only reach this path via
-/// `lookup_for_workspace`, which `run_job` does not call).
+/// Lift [`TrainingError`] to [`Severity`] via the shared
+/// `From<ErrorKind>` impl; the wrapper names the intent at
+/// the call site.
 fn severity_from_error(err: &TrainingError) -> Severity {
-    use crate::common::error::{Categorized, ErrorKind};
-    match err.kind() {
-        ErrorKind::UserInput => Severity::OperatorFixable,
-        ErrorKind::Conflict
-        | ErrorKind::NotFound
-        | ErrorKind::NotImplemented
-        | ErrorKind::Unavailable
-        | ErrorKind::Internal => Severity::Internal,
-    }
+    use crate::common::error::Categorized;
+    Severity::from(err.kind())
 }
 
 fn serialize_finite_or_null<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
@@ -1064,18 +1033,31 @@ async fn run_job(
     // training_logs surfaces as a typed failure (the worker's
     // `succeed`/`cancel` arms below would never see a result if
     // the log can't be opened, so the JobHandle drops as
-    // `Failed` -- the right cross-cutting state).
-    let log = match TrainJobLog::open(&workspace_dir, job_id) {
-        Ok(l) => Arc::new(Mutex::new(l)),
-        Err(e) => {
-            // No JSONL line is possible at this point; surface
-            // the failure on the cross-cutting bridge if any.
-            if let Some(h) = job_handle {
-                h.fail(e.to_string());
+    // `Failed` -- the right cross-cutting state).  Re-wrap the
+    // generic writer's `io::Error` with the canonical jsonl
+    // path so the resulting `TrainingError::Io` carries the
+    // same path context the legacy producer log open did.
+    let log =
+        match JsonlEventLog::<TrainEvent>::open(&workspace_dir, TRAINING_LOGS_DIR_NAME, job_id) {
+            Ok(l) => Arc::new(Mutex::new(l)),
+            Err(source) => {
+                let log_path = workspace_dir
+                    .join(TRAINING_LOGS_DIR_NAME)
+                    .join(format!("{job_id}.jsonl"))
+                    .display()
+                    .to_string();
+                let e = TrainingError::Io {
+                    path: log_path,
+                    source,
+                };
+                // No JSONL line is possible at this point; surface
+                // the failure on the cross-cutting bridge if any.
+                if let Some(h) = job_handle {
+                    h.fail(e.to_string());
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-    };
+        };
     let stage = Arc::new(Mutex::new(Stage::Prepare));
     // `Option<Arc<JobHandle>>`: cloned into the spawn_blocking
     // closures that need to emit append_log / update_progress
@@ -1095,12 +1077,7 @@ async fn run_job(
             backbone: backbone_basename,
         },
     );
-    emit_train_event(
-        &log,
-        handle_arc.as_deref(),
-        &stage,
-        TrainEvent::JobRunning,
-    );
+    emit_train_event(&log, handle_arc.as_deref(), &stage, TrainEvent::JobRunning);
 
     let result = run_job_inner(
         files,
@@ -1188,9 +1165,7 @@ async fn run_job(
     // `spawn_blocking` insulates the runtime from a slow
     // collect; failures are non-fatal (RSS hygiene, not
     // correctness).  No-op without `mimalloc`.
-    if let Err(err) =
-        tokio::task::spawn_blocking(crate::allocator::release_to_os).await
-    {
+    if let Err(err) = tokio::task::spawn_blocking(crate::allocator::release_to_os).await {
         tracing::debug!(
             target: "training",
             job_id = %job_id,
@@ -1209,7 +1184,7 @@ async fn run_job(
 /// failures are tracing-warned, never returned -- a failed log
 /// write must not promote a successful run to failed.
 fn emit_train_event(
-    log: &Arc<Mutex<TrainJobLog>>,
+    log: &Arc<Mutex<JsonlEventLog<TrainEvent>>>,
     handle: Option<&JobHandle>,
     stage: &Arc<Mutex<Stage>>,
     event: TrainEvent,
@@ -1242,7 +1217,7 @@ async fn run_job_inner(
     job: TrainingJob,
     progress_tx: watch::Sender<finetune::Progress>,
     cancel: Arc<AtomicU8>,
-    log: Arc<Mutex<TrainJobLog>>,
+    log: Arc<Mutex<JsonlEventLog<TrainEvent>>>,
     stage: Arc<Mutex<Stage>>,
     handle: Option<Arc<JobHandle>>,
 ) -> Result<TrainingResult, TrainingError> {
@@ -1341,7 +1316,12 @@ async fn run_job_inner(
             let _ = progress_for_run.send(p.clone());
         };
         let event_cb = |e: finetune::Event| {
-            emit_train_event(&log_for_run, handle_for_run.as_deref(), &stage_for_run, e.into());
+            emit_train_event(
+                &log_for_run,
+                handle_for_run.as_deref(),
+                &stage_for_run,
+                e.into(),
+            );
         };
         let cancel_fn = || cancel_for_run.load(Ordering::SeqCst) != CANCEL_NONE;
         finetune::run(&ft_cfg, &progress, &event_cb, &cancel_fn)
@@ -1443,83 +1423,6 @@ async fn run_job_inner(
     // (now empty) tempdir + sibling labels.txt finetune writes,
     // both safe to delete.
     Ok(result)
-}
-
-// MARK: TrainJobLog
-//
-// Per-job typed-event JSONL writer for
-// `<workspace_dir>/training_logs/<job_id>.jsonl`.  Read by the
-// unified `GET /assets/.../<job_id>.jsonl?after_seq=&limit=`
-// page surface, which is producer-agnostic (see
-// [`crate::file_mgr::log_page::LogEvent`]).
-
-/// Per-job JSONL writer for training-side typed events.  One
-/// line per [`TrainJobLog::emit`] call; best-effort flush (per-
-/// line fsync would 10x the eMMC cost for negligible recovery
-/// benefit -- a crash loses at most the trailing event).
-struct TrainJobLog {
-    file: std::fs::File,
-    seq: u64,
-}
-
-impl TrainJobLog {
-    /// Open `<workspace_dir>/training_logs/<job_id>.jsonl` for
-    /// append; creates the dir if missing.  Surfaces failures as
-    /// [`TrainingError::Io`] so an unwritable training_logs dir
-    /// fails the run loudly instead of silently losing the trace.
-    ///
-    /// After the new file is created, enforces
-    /// [`crate::file_mgr::LOG_RETENTION_KEEP_COUNT`] over the
-    /// dir's `.jsonl` files: the just-opened file is the freshest
-    /// by mtime and survives (as long as no forward-stamped
-    /// sibling outranks it); older runs over the cap are
-    /// unlinked oldest-first.  The helper publishes per-sweep
-    /// counters through its installed metrics hook itself, so
-    /// retention failures surface as a `tracing::warn!` plus a
-    /// `log_retention_failures_total` bump and do NOT fail the
-    /// open.
-    fn open(workspace_dir: &std::path::Path, job_id: JobId) -> Result<Self, TrainingError> {
-        let dir = workspace_dir.join("training_logs");
-        std::fs::create_dir_all(&dir).map_err(|e| TrainingError::Io {
-            path: dir.display().to_string(),
-            source: e,
-        })?;
-        let path = dir.join(format!("{job_id}.jsonl"));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| TrainingError::Io {
-                path: path.display().to_string(),
-                source: e,
-            })?;
-        crate::file_mgr::enforce_keep_last_n(&dir, crate::file_mgr::LOG_RETENTION_KEEP_COUNT);
-        Ok(Self { file, seq: 0 })
-    }
-
-    /// Append one JSONL line carrying a typed [`TrainEvent`].
-    /// The wire envelope is [`TrainLogLine`] (`seq` + `at` +
-    /// flattened event payload).
-    fn emit(&mut self, event: &TrainEvent) -> Result<(), TrainingError> {
-        use std::io::Write as _;
-        self.seq = self.seq.saturating_add(1);
-        let line = TrainLogLine {
-            seq: self.seq,
-            at: now_rfc3339(),
-            event,
-        };
-        let mut bytes = serde_json::to_vec(&line).map_err(|e| TrainingError::Io {
-            path: "<training_logs>".to_string(),
-            source: std::io::Error::other(e),
-        })?;
-        bytes.push(b'\n');
-        self.file.write_all(&bytes).map_err(|e| TrainingError::Io {
-            path: "<training_logs>".to_string(),
-            source: e,
-        })?;
-        let _ = self.file.flush();
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -1883,20 +1786,25 @@ mod tests {
         }
     }
 
-    /// `TrainJobLog::open` materialises
+    /// `JsonlEventLog::<TrainEvent>::open` materialises
     /// `<workspace>/training_logs/<job_id>.jsonl` and writes one
-    /// JSONL line per [`TrainJobLog::emit`] call.  Pinned
-    /// because the unified `GET /assets/training_logs/<id>.jsonl`
-    /// reader expects every line to carry `seq`, `at`, `kind`,
-    /// plus event-specific fields under the `kind`
-    /// discriminator -- a writer-side regression here would
-    /// silently break the page response.
+    /// JSONL line per `emit` call.  Pinned because the unified
+    /// `GET /assets/training_logs/<id>.jsonl` reader expects
+    /// every line to carry `seq`, `at`, `kind`, plus event-
+    /// specific fields under the `kind` discriminator -- a
+    /// writer-side regression here would silently break the
+    /// page response.  Mirrors the generic-writer test in
+    /// `file_mgr::jsonl_event_log` at the training-side
+    /// boundary; both are load-bearing because the daemon's
+    /// SSE consumer parses the same shape.
     #[test]
     fn train_job_log_writes_one_jsonl_line_per_event() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path();
         let job_id = JobId::new();
-        let mut log = TrainJobLog::open(workspace_dir, job_id).expect("open log");
+        let mut log =
+            JsonlEventLog::<TrainEvent>::open(workspace_dir, TRAINING_LOGS_DIR_NAME, job_id)
+                .expect("open log");
         log.emit(&TrainEvent::JobRunning).expect("running");
         log.emit(&TrainEvent::EpochCompleted {
             epoch: 3,
@@ -1917,7 +1825,7 @@ mod tests {
         drop(log);
 
         let path = workspace_dir
-            .join("training_logs")
+            .join(TRAINING_LOGS_DIR_NAME)
             .join(format!("{job_id}.jsonl"));
         let body = std::fs::read_to_string(&path).expect("read log");
         let lines: Vec<_> = body.lines().collect();
@@ -1945,7 +1853,7 @@ mod tests {
         assert_eq!(third["reason"], "operator");
     }
 
-    /// `TrainJobLog::open` enforces
+    /// `JsonlEventLog::<TrainEvent>::open` enforces
     /// `LOG_RETENTION_KEEP_COUNT` on
     /// `<workspace>/training_logs/` after creating the new
     /// `<job_id>.jsonl`: the just-opened file is the freshest
@@ -1958,7 +1866,7 @@ mod tests {
     fn train_job_log_open_enforces_keep_last_n() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_dir = tmp.path();
-        let dir = workspace_dir.join("training_logs");
+        let dir = workspace_dir.join(TRAINING_LOGS_DIR_NAME);
         std::fs::create_dir_all(&dir).unwrap();
         // Stage one more pre-existing log than the keep cap.
         let cap = crate::file_mgr::LOG_RETENTION_KEEP_COUNT;
@@ -1967,9 +1875,7 @@ mod tests {
             let p = dir.join(format!("00000000-0000-4000-8000-{i:012x}.jsonl"));
             std::fs::write(&p, b"{}\n").unwrap();
             let backdate = std::time::SystemTime::now()
-                .checked_sub(std::time::Duration::from_secs(
-                    (1000 - i as u64) * 60,
-                ))
+                .checked_sub(std::time::Duration::from_secs((1000 - i as u64) * 60))
                 .expect("backdate");
             let secs = backdate
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1984,7 +1890,8 @@ mod tests {
         // so it survives; the TWO oldest stale paths
         // (`stale_paths[0]` and `[1]`) are unlinked.
         let job_id = JobId::new();
-        let _log = TrainJobLog::open(workspace_dir, job_id).expect("open log");
+        let _log = JsonlEventLog::<TrainEvent>::open(workspace_dir, TRAINING_LOGS_DIR_NAME, job_id)
+            .expect("open log");
 
         let new_path = dir.join(format!("{job_id}.jsonl"));
         assert!(new_path.is_file(), "new log survived");

@@ -236,7 +236,9 @@ fn convert_request_round_2_tfjs_body_parses() {
         "labels_format": "tfjs_metadata"
     }"#;
     let req: ConvertRequest = serde_json::from_str(body).expect("body parses");
-    let ConvertRequest::Tfjs(p) = &req;
+    let ConvertRequest::Tfjs(p) = &req else {
+        panic!("expected ConvertRequest::Tfjs");
+    };
     assert_eq!(p.shards.len(), 2);
     assert_eq!(p.labels_format, LabelsFormat::TfjsMetadata);
     validate_convert_request(&req).expect("within bounds");
@@ -252,7 +254,9 @@ fn convert_request_round_2_lines_format_parses() {
         "labels_format": "lines"
     }"#;
     let req: ConvertRequest = serde_json::from_str(body).expect("body parses");
-    let ConvertRequest::Tfjs(p) = &req;
+    let ConvertRequest::Tfjs(p) = &req else {
+        panic!("expected ConvertRequest::Tfjs");
+    };
     assert_eq!(p.labels_format, LabelsFormat::Lines);
 }
 
@@ -312,7 +316,9 @@ fn convert_request_accepts_canonical_slashless_paths() {
         v[field] = serde_json::Value::String("relative/path".into());
         let body = serde_json::to_string(&v).unwrap();
         let req: ConvertRequest = serde_json::from_str(&body).expect("slashless path is canonical");
-        let ConvertRequest::Tfjs(p) = &req;
+        let ConvertRequest::Tfjs(p) = &req else {
+            panic!("expected ConvertRequest::Tfjs");
+        };
         let bound = match field {
             "model_json_path" => p.model_json_path.workspace_path().as_str(),
             "labels_path" => p.labels_path.workspace_path().as_str(),
@@ -329,7 +335,9 @@ fn convert_request_accepts_canonical_slashless_paths() {
         "labels_format": "lines"
     }"#;
     let req: ConvertRequest = serde_json::from_str(body).expect("slashless shard is canonical");
-    let ConvertRequest::Tfjs(p) = &req;
+    let ConvertRequest::Tfjs(p) = &req else {
+        panic!("expected ConvertRequest::Tfjs");
+    };
     assert_eq!(
         p.shards[0].workspace_path().as_str(),
         "converters/relative/shard"

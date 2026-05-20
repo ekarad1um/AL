@@ -372,6 +372,19 @@ pub trait FsService: Send + Sync + 'static {
         pending: crate::file_mgr::PendingHead,
     ) -> Result<crate::file_mgr::HeadRotationResult, FsError>;
 
+    /// Publish an *imported* head (from the `.alpkg` convert path)
+    /// into the workspace's head index.  Mirrors
+    /// [`Self::publish_trained_head`]'s mutex + cache cell
+    /// discipline, plus an idempotency / collision check held
+    /// under the same mutex.  See
+    /// [`crate::file_mgr::HeadImportResult`] for the three-way
+    /// success / idempotent-no-op / collision-error contract.
+    fn publish_imported_head(
+        &self,
+        ws: &WorkspaceId,
+        pending: crate::file_mgr::PendingHead,
+    ) -> Result<crate::file_mgr::HeadImportResult, FsError>;
+
     /// Register an arbitrary [`JobReference`] against the
     /// in-memory job-conflict shim.  Returns an opaque RAII guard
     /// that releases the lease on drop.  Used by the convert
@@ -742,6 +755,16 @@ impl FsService for FsServiceImpl {
     ) -> Result<crate::file_mgr::HeadRotationResult, FsError> {
         self.mgr
             .publish_trained_head_for_workspace(ws, pending)
+            .map_err(FsError::new)
+    }
+
+    fn publish_imported_head(
+        &self,
+        ws: &WorkspaceId,
+        pending: crate::file_mgr::PendingHead,
+    ) -> Result<crate::file_mgr::HeadImportResult, FsError> {
+        self.mgr
+            .publish_imported_head_for_workspace(ws, pending)
             .map_err(FsError::new)
     }
 
