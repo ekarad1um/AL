@@ -7,7 +7,8 @@
   import {
     training as trainingStore,
     TRAINING_HISTORY_MAX_PER_WS,
-    TRAINING_HISTORY_PAGE_SIZE
+    TRAINING_HISTORY_PAGE_SIZE,
+    TRAINING_INITIAL_VISIBLE
   } from '$lib/stores/training.svelte';
   import type { TrackedTrainingJob } from '$lib/stores/training.svelte';
   import type { Uuid } from '$lib/api/types';
@@ -27,9 +28,16 @@
   // backend's keep-last-N retention window is a click away:
   //
   //   - **Eager tier** (top, always visible):
-  //       active card (if any, auto-expanded) +
-  //       top `INITIAL_VISIBLE` non-hidden history rows.
-  //       Costs 1 directory listing + 2 JSONL fetches on mount.
+  //       up to `TRAINING_INITIAL_VISIBLE` rows total -- the
+  //       active card occupies the top slot when training is
+  //       in flight, and the remaining slots show the most-
+  //       recent terminal runs.  Counting active AS ONE of the
+  //       slots (vs adding on top) keeps the row count stable
+  //       across idle ↔ training ↔ terminal so the section
+  //       doesn't visibly grow/shrink on Train click -- see
+  //       the `eagerHistoryVisible` / `displacedFromEager`
+  //       derives below.  Costs 1 directory listing + 2 JSONL
+  //       fetches on mount.
   //   - **Older disclosure** (below the eager tier, collapsed
   //     by default):
   //       "▾ Show N older runs" — total non-hidden runs
@@ -71,9 +79,15 @@
   //
   // Per-item expansion lives here (a `SvelteSet<Uuid>`), not
   // on the items.  Items are stateless collapsible cards
-  // driven by `expanded={...}` + `ontoggle`.  Live entries
-  // auto-add to the set on first observation; manual collapse
-  // sticks across the active→terminal transition.
+  // driven by `expanded={...}` + `ontoggle`.  Every row --
+  // live or terminal -- starts collapsed; the operator opens
+  // the body explicitly.  Earlier revisions auto-expanded the
+  // active job's body on first observation, which made the
+  // train-pane footprint jump on every Train click; the
+  // explicit-only model keeps the row footprint stable and
+  // matches the "rows are observational" rule the surface
+  // already follows for affordances (no per-row Cancel /
+  // Re-train / Activate).
   //
   // The "older runs" accordion expansion lives on the store
   // (`olderExpandedFor`) so it survives TrainPane remounts
@@ -94,19 +108,65 @@
   const olderExpanded = $derived(trainingStore.olderExpandedFor(workspaceId));
   const loadableOlder = $derived(trainingStore.loadableOlderCountFor(workspaceId));
 
-  // Visible eager-tier items: active (if any) + the top
-  // `INITIAL_VISIBLE` history rows.  Keyed by jobId so the
-  // active→terminal transition preserves expansion + DOM
-  // identity.
-  const eagerItems = $derived<TrackedTrainingJob[]>(
-    active ? [active, ...eagerHistory] : [...eagerHistory]
+  // Visible eager-tier rows: `active` (if any) is treated as
+  // one of the `TRAINING_INITIAL_VISIBLE` slots, not added on
+  // top of them.  Without this cap, the eager `<ul>` would
+  // grow from `N` rows to `N + 1` the moment Train is pressed
+  // (active appears as an extra row) and shrink back to `N`
+  // when the job terminates and the new entry moves into
+  // history -- a visible 2→3→2 blink the operator notices on
+  // every train click.
+  //
+  // With the cap, the tier renders exactly
+  // `TRAINING_INITIAL_VISIBLE` rows across every transition:
+  //
+  //   idle      → [hist[0], hist[1]]
+  //   training  → [active,  hist[0]]   (hist[1] displaces to older)
+  //   terminal  → [hist[0], hist[1]]   (active joined history,
+  //                                      now-newest sits at [0])
+  //
+  // The displaced row stays reachable via the "Show N older
+  // runs" disclosure -- see `displacedFromEager` /
+  // `olderItems` below.  Keyed by jobId so the
+  // active→terminal transition preserves the same DOM node +
+  // expansion state.
+  const eagerHistoryVisible = $derived<readonly TrackedTrainingJob[]>(
+    active
+      ? eagerHistory.slice(0, TRAINING_INITIAL_VISIBLE - 1)
+      : eagerHistory.slice(0, TRAINING_INITIAL_VISIBLE)
   );
+  const eagerItems = $derived<TrackedTrainingJob[]>(
+    active ? [active, ...eagerHistoryVisible] : [...eagerHistoryVisible]
+  );
+
+  // History rows pushed out of the eager tier by the active
+  // slot.  Non-empty only while training is in flight AND
+  // `eagerHistory` already filled its share of `INITIAL_VISIBLE`
+  // before the active appeared.  Prepended onto the visible
+  // older list so the operator can still reach the row.
+  const displacedFromEager = $derived<readonly TrackedTrainingJob[]>(
+    active ? eagerHistory.slice(TRAINING_INITIAL_VISIBLE - 1, TRAINING_INITIAL_VISIBLE) : []
+  );
+
+  // Older-tier rows for display: displaced eager row first
+  // (when training is in flight), then the regular older
+  // history.  Distinct from the store's `olderHistoryFor` so
+  // the displacement is presentation-only and the store
+  // accessors stay loop-free.
+  const olderItems = $derived<readonly TrackedTrainingJob[]>([
+    ...displacedFromEager,
+    ...olderHistory
+  ]);
 
   // Count of "older runs" still accessible to the operator
   // (loaded into history beyond the eager tier + still
   // discoverable but not yet loaded).  Drives the "Show N
-  // older runs" disclosure button when collapsed.
-  const olderTotal = $derived(olderHistory.length + loadableOlder);
+  // older runs" disclosure button when collapsed.  Uses
+  // `olderItems` (not the store's `olderHistory` directly)
+  // so the displaced-from-eager row is counted while training
+  // is in flight, keeping the disclosure label honest about
+  // what the operator will see when they expand.
+  const olderTotal = $derived(olderItems.length + loadableOlder);
 
   // True when this surface has nothing to render and nothing
   // to fetch -- distinct from "loading", which renders
@@ -119,25 +179,42 @@
       loadableOlder === 0
   );
 
-  // Exact skeleton-row count for the eager `<ul>`.  Non-zero
-  // in two states (combined by the store accessor):
-  //   * Initial hydration is still running -- the eager tier
-  //     is being populated for the first time.  History is
-  //     typically empty here, so the count is `INITIAL_VISIBLE`
-  //     and the placeholders reserve the section's height so
-  //     the older disclosure / hyperparameters / heads list
-  //     below don't jump on first paint.
-  //   * An auto-refill from a recent delete is awaiting its
-  //     backfill fetch -- the eager tier has shrunk by one
-  //     row and the store is in the middle of pulling the
-  //     next discovered entry in.  The placeholder reserves
-  //     the slot the deleted row occupied so the eager list
-  //     doesn't visibly shrink and then re-grow when the
-  //     fetched entry lands.
-  // The store accessor (`eagerSkeletonCountFor`) folds the
-  // two cases into one number; the rendering below stays a
-  // single `{#each Array(count)}` loop.
-  const eagerSkeletonCount = $derived(trainingStore.eagerSkeletonCountFor(workspaceId));
+  // Exact skeleton-row count for the eager `<ul>`.  Mirrors
+  // the store's `eagerSkeletonCountFor` gating (skeletons only
+  // paint while a load is incoming -- initial hydration OR
+  // post-delete auto-refill) but folds `active` into the
+  // arithmetic so a row being held by the active slot doesn't
+  // get over-filled with a skeleton.  Non-zero in:
+  //
+  //   * Initial hydration -- placeholders reserve the
+  //     section's height so the older disclosure /
+  //     hyperparameters / heads list below don't jump on
+  //     first paint.  If the operator hits Train during
+  //     hydration (rare), `active` takes one slot and the
+  //     skeleton count drops by 1 accordingly.
+  //   * Auto-refill after a delete drained the eager tier
+  //     under `INITIAL_VISIBLE` -- placeholder reserves the
+  //     drained slot until the backfill fetch lands.  Cannot
+  //     coexist with `active` (the daemon's `JobConflict`
+  //     gate blocks delete while training is in flight; see
+  //     `buildMenu`), so the `active` correction is a no-op
+  //     for this branch in practice.
+  //
+  // Without the gating, a normally-hydrated workspace with
+  // `history.length < INITIAL_VISIBLE` (e.g., one finished
+  // run and no active) would render perpetual skeletons next
+  // to the real rows.  The store accessor returns 0 in that
+  // state; we mirror that to keep behavior identical to the
+  // pre-fix path outside the active-cap concern.
+  const activeContribution = $derived(active ? 1 : 0);
+  const skeletonsArePainting = $derived(
+    trainingStore.hydratingFor(workspaceId) || trainingStore.autoRefillingFor(workspaceId)
+  );
+  const eagerSkeletonCount = $derived(
+    skeletonsArePainting
+      ? Math.max(0, TRAINING_INITIAL_VISIBLE - activeContribution - eagerHistoryVisible.length)
+      : 0
+  );
 
   // Exact skeleton-row count for the older-tier `<ul>`.
   // Snapshotted in the store at click-time on "Show N older
@@ -190,48 +267,31 @@
   // ── Expansion bookkeeping (per-item, ephemeral) ─────────────
 
   const expanded = new SvelteSet<Uuid>();
-  const autoExpandedSeen = new SvelteSet<Uuid>();
   // Job ids we've already observed in the older tier.  Used to
   // detect the eager→older transition exactly once per id so a
-  // run that was expanded while in the eager tier (typically
-  // because it was the live job that just terminated) auto-
-  // collapses the first time it gets pushed past
-  // `INITIAL_VISIBLE`.  Subsequent shifts within older don't
-  // re-collapse a manually re-expanded row.
+  // row that was manually expanded while in the eager tier auto-
+  // collapses the first time it gets pushed past `INITIAL_VISIBLE`.
+  // Subsequent shifts within older don't re-collapse a manually
+  // re-expanded row.
   const seenInOlder = new SvelteSet<Uuid>();
 
-  // Workspace-navigation reset.  The three sets above are
+  // Workspace-navigation reset.  The two sets above are
   // component-instance scoped and survive `[id]` param changes
   // because SvelteKit re-uses `+page.svelte` across workspace
   // navigation (no `{#key}` wrapper).  Without this reset,
   // stale jobId entries accumulate across visits -- and
-  // `expanded` / `autoExpandedSeen` / `seenInOlder` from
-  // workspace A could (in the astronomical UUID-collision
-  // case) interfere with workspace B's auto-expand and
-  // auto-collapse decisions.  Plain `let` for the cursor
-  // because no consumer outside this effect needs to track
-  // it; writes shouldn't drive reactivity.
-  //
-  // Placed BEFORE the auto-expand effect so a workspace flip
-  // clears first; then the auto-expand re-populates for the
-  // new workspace's active job in the same tick.  Effect
-  // declaration order is the run order in Svelte 5.
+  // `expanded` / `seenInOlder` from workspace A could (in the
+  // astronomical UUID-collision case) interfere with workspace
+  // B's auto-collapse decisions.  Plain `let` for the cursor
+  // because no consumer outside this effect needs to track it;
+  // writes shouldn't drive reactivity.
   let lastWorkspaceIdSeen: Uuid | null = null;
   $effect(() => {
     const ws = workspaceId;
     if (lastWorkspaceIdSeen === ws) return;
     lastWorkspaceIdSeen = ws;
     expanded.clear();
-    autoExpandedSeen.clear();
     seenInOlder.clear();
-  });
-
-  $effect(() => {
-    const a = active;
-    if (!a) return;
-    if (autoExpandedSeen.has(a.jobId)) return;
-    autoExpandedSeen.add(a.jobId);
-    expanded.add(a.jobId);
   });
 
   // Auto-collapse on eager→older transition.  The user's typical
@@ -671,9 +731,9 @@
                  introduced a layout shift between
                  placeholder-as-div (40 px) and ul-of-N-rows
                  (N × 40 px + gaps). -->
-            {#if olderHistory.length > 0 || olderSkeletonCount > 0}
+            {#if olderItems.length > 0 || olderSkeletonCount > 0}
               <ul class="flex flex-col gap-2">
-                {#each olderHistory as job (job.jobId)}
+                {#each olderItems as job (job.jobId)}
                   <TrainHistoryItem
                     {job}
                     isLive={false}

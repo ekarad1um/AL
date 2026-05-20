@@ -52,11 +52,19 @@
   class:opacity-60={isDeleting}
 >
   {#if editing}
-    <div class="flex items-center gap-3 px-4 py-3">
+    <!-- Edit row: `py-2` (8+8 = 16 px) outer padding instead of
+         the static `<a>`'s `py-3` (12+12 = 24 px), so the 8-px
+         growth from `InlineName`'s `h-7` padded pill (vs the
+         static `<h2>`'s 20-px line box) exactly cancels and the
+         total row height stays pinned at 44 px on toggle.  See
+         InlineName's docblock for the full layout contract.
+         `min-w-0 flex-1` lets the input claim the same
+         horizontal slot the `<h2>` does and keeps the trailing
+         `created ...` strip pinned to the right. -->
+    <div class="flex items-center gap-3 px-4 py-2">
       <div class="min-w-0 flex-1">
         <InlineName
           value={workspace.name}
-          size="sm"
           ariaLabel="Rename workspace {workspace.name}"
           onsave={saveName}
           oncancel={onendedit}

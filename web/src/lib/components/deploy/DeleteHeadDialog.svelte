@@ -64,7 +64,7 @@
       class="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs text-zinc-900 wrap-break-word"
     >
       <p class="font-mono text-sm font-semibold text-zinc-900" title={head.head_id}>
-        {head.head_id.slice(0, 8)}…
+        {head.head_id.slice(0, 8)}
       </p>
       <p class="mt-0.5 text-[11px] text-zinc-500">
         {formatBytes(head.size_bytes)} · {head.n_classes}

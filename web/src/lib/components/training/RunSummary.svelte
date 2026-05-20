@@ -1,6 +1,7 @@
 <script lang="ts">
   import { formatDurationHuman } from '$lib/utils/format';
   import { STAGE_LABEL } from './labels';
+  import { formatLabelsList } from '$lib/components/category/labels';
   import type { EpochMetrics, TrainingJobView } from '$lib/api/types';
 
   // Structured terminal-run summary card.  Renders the
@@ -174,7 +175,12 @@
         {/if}
       </dd>
     </div>
-    <div class="text-center">
+    <div
+      class="text-center"
+      title={view.result && view.result.classes.length > 0
+        ? formatLabelsList(view.result.classes)
+        : undefined}
+    >
       <dt class="text-[10px] uppercase tracking-wider text-zinc-500">Classes</dt>
       <dd class="mt-0.5 font-mono text-sm tabular-nums text-zinc-900">
         {view.result?.n_classes ?? '—'}

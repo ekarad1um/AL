@@ -26,7 +26,7 @@
   //   │ <Hyperparameters disclosure (closed by default)>        │
   //   │                                                         │
   //   │ <Training history list (always-present)>                │
-  //   │   - live run on top, auto-expanded                      │
+  //   │   - live run on top, collapsed by default               │
   //   │   - terminal runs below, collapsed by default           │
   //   └─────────────────────────────────────────────────────────┘
   //
@@ -58,7 +58,8 @@
   //
   // The redesign collapses all three banners into one
   // always-present primitive: the training-history list.  The
-  // live run is just the top card (auto-expanded), and on
+  // live run is just the top card (collapsed by default,
+  // operator expands on demand to inspect progress), and on
   // terminal the same card stays in place -- only its state
   // word morphs.  Activation is owned by the Heads section
   // below; no per-row Activate affordance lives inside the
@@ -583,11 +584,14 @@
   </div>
 
   <!-- Training history.  Always present; renders the live
-       run as the top item (auto-expanded) and the workspace's
-       terminal history below (newest-first, collapsed by
-       default).  This is the load-bearing piece of the
+       run as the top item and the workspace's terminal history
+       below (newest-first).  Every row -- live or terminal --
+       is collapsed by default; the operator expands the body
+       on demand to inspect epoch progress / log scrollback /
+       run summary.  This is the load-bearing piece of the
        redesign: the layout below the header is stable across
        idle, running, and just-finished states because the
-       history list is always rendered. -->
+       history list is always rendered AND the per-row
+       footprint doesn't jump on Train-button press. -->
   <TrainHistory {workspaceId} />
 </section>

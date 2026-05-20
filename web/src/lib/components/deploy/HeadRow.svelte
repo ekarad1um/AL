@@ -122,7 +122,7 @@
            hover-reveal; the 8-char prefix is the typical short form
            operators use to disambiguate across a workspace's heads. -->
       <p class="font-mono text-sm font-semibold text-zinc-900" title={head.head_id}>
-        {head.head_id.slice(0, 8)}…
+        {head.head_id.slice(0, 8)}
       </p>
       {#if isLatest}
         <!-- Latest pill: conditional, mounts only on the single
@@ -208,8 +208,8 @@
         onclick={onExportClick}
         disabled={deploying || busy}
         aria-label={isExporting
-          ? `Exporting head ${head.head_id.slice(0, 8)}…`
-          : `Export head ${head.head_id.slice(0, 8)}…`}
+          ? `Exporting head ${head.head_id.slice(0, 8)}`
+          : `Export head ${head.head_id.slice(0, 8)}`}
         class="pointer-events-none inline-flex shrink-0 items-center justify-center rounded-md p-1.5 text-zinc-300 opacity-0 transition duration-200 ease-out group-hover/row:pointer-events-auto group-hover/row:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-blue-200 focus-visible:outline-none enabled:hover:text-blue-600 disabled:cursor-not-allowed disabled:text-zinc-200 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
         class:enabled:hover:bg-blue-50={!isDeployed}
         class:enabled:hover:bg-blue-100={isDeployed}

@@ -133,6 +133,27 @@ textarea:focus-visible,
   box-shadow: 0 0 0 3px rgb(59 130 246 / 0.18);
 }
 
+/* Invalid-state focus override.  Same halo geometry, rose tinting,
+   so an `aria-invalid="true"` input keeps the focus indicator
+   visible AS an error rather than the calm blue.  Lives here (in
+   the unlayered base CSS) because the calm blue rule above is
+   also unlayered, and per the CSS cascade spec unlayered styles
+   beat layered ones for normal weight regardless of specificity --
+   a Tailwind `focus-visible:border-rose-*` utility (which lands
+   in `@layer utilities`) would never win against the blue rule
+   above without this in-kind override.  The attribute selector
+   adds one specificity step over `input:focus-visible` so this
+   rule wins for invalid inputs.  Every input that pairs
+   `aria-invalid={hasError ? true : undefined}` with the
+   `inputClass(true)` palette (or the InlineName editor) now
+   automatically gets the rose focus indicator without per-call-
+   site `focus-visible:` overrides. */
+input[aria-invalid='true']:focus-visible,
+textarea[aria-invalid='true']:focus-visible {
+  border-color: rgb(244 63 94); /* rose-500 */
+  box-shadow: 0 0 0 3px rgb(244 63 94 / 0.18);
+}
+
 /* Range inputs (sliders) bring their own focus treatment via the
    thumb pseudo-elements; the global outline would render around the
    whole hit-area and read as visual noise. */

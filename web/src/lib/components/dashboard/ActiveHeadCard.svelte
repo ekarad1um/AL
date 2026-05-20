@@ -2,6 +2,7 @@
   import { config } from '$lib/stores/config.svelte';
   import { workspaces as wsApi } from '$lib/api/endpoints';
   import { formatRelativeShort } from '$lib/utils/time';
+  import { formatLabelsList } from '$lib/components/category/labels';
 
   // Narrowed view of the active record's `head` variant.  Threading
   // the union through a derived (instead of repeatedly checking
@@ -21,6 +22,10 @@
 
   let origin = $derived(config.active?.origin ?? null);
   let nClasses = $derived(config.active?.n_classes ?? null);
+  // Labels are inline on `ActiveBase` (runtime contract), so the
+  // class-count tile can surface every label name on hover
+  // without any per-head GET.  `null` when no head is active.
+  let classLabels = $derived(config.active?.labels ?? null);
   let activatedAt = $derived(config.active?.activated_at ?? null);
 
   // Workspace-name resolution for the source workspace.  The daemon
@@ -325,7 +330,10 @@
         </div>
         <div class="mt-1 text-[10px] text-zinc-400">activated</div>
       </div>
-      <div class="pl-3 text-center">
+      <div
+        class="pl-3 text-center"
+        title={classLabels && classLabels.length > 0 ? formatLabelsList(classLabels) : undefined}
+      >
         <div class="text-xl font-semibold tabular-nums text-zinc-900">
           {#if nClasses !== null}{nClasses}{:else}<span class="text-zinc-400">—</span>{/if}
         </div>

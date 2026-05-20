@@ -4,7 +4,6 @@
   import AddCategoryDialog from './AddCategoryDialog.svelte';
   import DeleteCategoryDialog from './DeleteCategoryDialog.svelte';
   import Button from '$lib/components/ui/Button.svelte';
-  import PlusIcon from '$lib/components/ui/PlusIcon.svelte';
   import LoadingRow from '$lib/components/LoadingRow.svelte';
   import ContextMenu, { type MenuSection } from '$lib/components/ui/ContextMenu.svelte';
   import { categories, type Category } from '$lib/stores/categories.svelte';
@@ -166,10 +165,7 @@
         Each category becomes a class label the trainer learns — Background Noise is required.
       </p>
     </div>
-    <Button onclick={() => (addOpen = true)} ariaLabel="Add category">
-      <PlusIcon />
-      Add category
-    </Button>
+    <Button onclick={() => (addOpen = true)} ariaLabel="Add category">Add category</Button>
   </header>
 
   {#if !slice.loaded}

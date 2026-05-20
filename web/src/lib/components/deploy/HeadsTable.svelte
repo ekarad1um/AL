@@ -271,7 +271,7 @@
       ? null
       : previousActive.origin === 'default'
         ? 'Revert to default'
-        : `Revert to ${previousActive.source_head_id.slice(0, 8)}…`
+        : `Revert to ${previousActive.source_head_id.slice(0, 8)}`
   );
 
   // Hide the revert affordance when it would re-deploy the
@@ -700,12 +700,12 @@
           {#if err.kind === 'deploy-head'}
             Could not deploy head
             <span class="font-mono text-[10px]" title={err.headId}>
-              {err.headId.slice(0, 8)}…
+              {err.headId.slice(0, 8)}
             </span>
           {:else if err.kind === 'export-head'}
             Could not export head
             <span class="font-mono text-[10px]" title={err.headId}>
-              {err.headId.slice(0, 8)}…
+              {err.headId.slice(0, 8)}
             </span>
           {:else}
             Could not deploy default head

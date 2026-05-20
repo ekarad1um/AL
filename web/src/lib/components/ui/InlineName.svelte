@@ -1,37 +1,85 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { inputClass } from '$lib/components/ui/inputClass';
   import { validateWorkspaceName } from '$lib/components/workspace/name-validate';
-  import { errorCopy } from '$lib/utils/error-copy';
-  import Spinner from '$lib/components/Spinner.svelte';
 
-  // Inline-editable name input.  Used in place of a modal Rename
-  // dialog -- the operator clicks the pencil affordance on a card
-  // (or the detail-page header), the label collapses, this input
-  // takes its place, and on Enter / blur the change commits via
-  // the owner's `onsave` callback.
+  // Inline-editable name input.  Replaces a card's static `<h2>`
+  // when the operator picks "Rename" from the row's right-click
+  // menu.
   //
-  // Validation mirrors the modal path -- live, `$derived` from the
-  // current draft, drives the input's red-border state and the
-  // inline error message.  An invalid blur reverts; only a valid
-  // changed draft commits.
+  // ## Layout-stable design
+  //
+  // The input + outer wrapper combine to occupy the SAME 44-px
+  // row height as the static `<h2>` it replaces.  Keys:
+  //
+  //   * Input is `h-7` (28 px, box-sizing border-box default)
+  //     with `px-2 py-1` so the typed text sits inside a small
+  //     "input field" pill with breathing room around it rather
+  //     than reading as raw inline text.  Border is included
+  //     in the box, so the always-present 1-px border never
+  //     grows or shrinks it across the valid<->invalid swap.
+  //   * The owning card flips its outer padding from `py-3`
+  //     (the static row's 12+12 = 24 px) to `py-2` (the edit
+  //     row's 8+8 = 16 px), which exactly cancels the 8-px
+  //     growth from `h-5` (the bare line box) to `h-7` (the
+  //     padded pill).  Net row height stays at 44 px on toggle.
+  //   * Border is `border-transparent` by default and flips
+  //     `border-rose-500` on policy violation -- the Tailwind
+  //     utility is what paints when the input isn't focused
+  //     (briefly during save, when `disabled` removes focus).
+  //     The valid<->invalid transition is a 0-px layout swap
+  //     because the 1-px border slot is always reserved.
+  //   * The focused-state rose border + rose halo (the actual
+  //     `:focus-visible` paint, which is the only state the
+  //     operator sees once typing starts) come from the global
+  //     `input[aria-invalid='true']:focus-visible` rule in
+  //     `app.css`, gated by the `aria-invalid={hasError}`
+  //     attribute on the element below.  Doing it in the
+  //     global rule (unlayered) is load-bearing: Tailwind
+  //     utilities sit in `@layer utilities` and would lose to
+  //     the unlayered blue-focus rule via cascade-layer
+  //     precedence regardless of selector specificity.  See
+  //     the app.css comment block for the full cascade
+  //     reasoning.
+  //   * `bg-zinc-50` (lifted to `bg-zinc-100` while saving)
+  //     gives the input a faint fill so the padding the
+  //     operator just claimed is visible -- otherwise the
+  //     `px-2 py-1` would read as wasted whitespace.
+  //   * `font-semibold` matches the `<h2>` so the typed
+  //     character widths and glyph weight render identically.
+  //
+  // ## No inline message line
+  //
+  // The component intentionally renders NO error / saving text.
+  // The red border is the only validation signal; for an unclear
+  // rejection the operator's recourse is Escape (revert) or
+  // moving to the detail-page modal (`RenameWorkspaceDialog`)
+  // where full error chrome lives.  The trade-off chosen here
+  // is simplicity + no layout shift over richer in-place
+  // diagnostics -- the inline path is the "quick rename"
+  // affordance, not the explanatory one.
+  //
+  // ## Backend-reject handling
+  //
+  // A rare backend reject (name conflict, workspace-deleted
+  // race) stamps the same red border as a client-side validation
+  // failure.  The input stays mounted + refocused so the
+  // operator can amend without losing their typed draft.
+  // Typing anything clears the backend-error stamp so the
+  // border returns to transparent the moment they react.
+  //
+  // ## Save-in-flight feedback
+  //
+  // While `onsave` is pending the input is `disabled` (browser
+  // adds the cursor-wait pointer) and the background steps from
+  // `bg-zinc-50` to `bg-zinc-100`.  No spinner, no text -- the
+  // disabled + deeper tint is the entire feedback.
   interface Props {
     value: string;
-    // Text-size tier: matches the surrounding label so the input
-    // doesn't visually jump on toggle.  `sm` for cards, `lg` for
-    // the detail page h1, `md` for general-purpose forms.
-    size?: 'sm' | 'md' | 'lg';
-    // Optional placeholder when the input is empty.  We rarely
-    // start empty (inline edit seeds from the current name) but
-    // a defensive placeholder makes the empty-blur cancel path
-    // visually unambiguous.
     placeholder?: string;
-    // Hint surfaced to screen readers when the visual context
-    // (a card name on hover) isn't enough on its own.
     ariaLabel?: string;
     // Called with the trimmed, validated, changed draft.  May
-    // throw -- the error is caught and surfaced inline; the
-    // component stays in edit mode so the operator can amend.
+    // throw -- the error stamps a red border + keeps the input
+    // mounted so the operator can amend.
     onsave: (newValue: string) => Promise<void>;
     // Called when the operator dismisses without committing
     // (Escape, invalid-then-blur, empty-then-blur, unchanged-
@@ -39,33 +87,36 @@
     // off so this component unmounts.
     oncancel: () => void;
   }
-  let { value, size = 'sm', placeholder, ariaLabel, onsave, oncancel }: Props = $props();
+  let { value, placeholder, ariaLabel, onsave, oncancel }: Props = $props();
 
-  // Seed `draft` from `value` on mount only.  Initialising `$state`
-  // directly from a prop warns about capturing only the initial
-  // value, but capture-once is what we want here -- subsequent
-  // value-prop changes (an external rename, say) shouldn't blow
-  // away the operator's in-progress draft.
+  // Seed `draft` from `value` on mount only.  Initialising
+  // `$state` directly from a prop warns about capturing only
+  // the initial value, but capture-once is what we want here --
+  // subsequent value-prop changes (an external rename, say)
+  // shouldn't blow away the operator's in-progress draft.
   let draft = $state('');
   onMount(() => {
     draft = value;
   });
 
   let saving = $state(false);
-  let backendError = $state<string | null>(null);
+  let backendError = $state(false);
   // Set by the Escape path so the trailing blur (focus left the
   // input as part of Esc handling) doesn't commit the discard.
   let cancelled = $state(false);
 
   // Live validation derived from the draft.  Empty / unchanged
-  // strings aren't errors -- they just become no-op cancels on
-  // blur -- so the visual error only triggers when the operator
-  // typed something that won't pass the daemon's rules.
+  // drafts aren't errors -- they're no-op cancels on blur -- so
+  // the visual error only triggers when the operator typed
+  // something that won't pass the daemon's rules.
   const trimmed = $derived(draft.trim());
   const unchanged = $derived(trimmed === value);
   const localError = $derived(
     trimmed.length > 0 && !unchanged ? validateWorkspaceName(trimmed) : null
   );
+  // Single border-colour gate: client validation OR backend
+  // reject.  Either flips the same red border.
+  const hasError = $derived(localError !== null || backendError);
 
   let inputEl = $state<HTMLInputElement | undefined>();
   $effect(() => {
@@ -85,19 +136,24 @@
       oncancel();
       return;
     }
-    if (localError) {
-      // Stay in edit mode; the red border + inline message
-      // already tell the operator why.
+    if (localError !== null) {
+      // Stay in edit mode; the red border already tells the
+      // operator the draft can't commit.
       return;
     }
     saving = true;
-    backendError = null;
+    backendError = false;
     try {
       await onsave(trimmed);
       // Success: the owner unmounts us by flipping the edit flag.
-    } catch (e) {
-      backendError = errorCopy(e);
-      // Re-focus so the operator can amend without an extra click.
+    } catch {
+      // Backend reject (name conflict, daemon error).  Flip the
+      // same red border the client validator uses and refocus
+      // so the operator can edit + retry without losing their
+      // draft.  Specific error copy is intentionally not
+      // surfaced here -- the inline path stays minimal; the
+      // detail-page modal is where rich errors live.
+      backendError = true;
       queueMicrotask(() => {
         inputEl?.focus();
         inputEl?.select();
@@ -125,7 +181,7 @@
 
   function onBlur(): void {
     if (saving || cancelled) return;
-    if (trimmed.length === 0 || unchanged || localError) {
+    if (trimmed.length === 0 || unchanged || localError !== null) {
       // Blurring with an unsavable draft reverts -- the Notion
       // pattern.  Only an explicit, valid, changed blur commits.
       cancel();
@@ -134,37 +190,31 @@
     void commit();
   }
 
-  const SIZE_TEXT: Readonly<Record<NonNullable<Props['size']>, string>> = {
-    sm: 'text-sm',
-    md: 'text-base',
-    lg: 'text-lg font-semibold'
-  };
+  // Clear the backend-error stamp on any keystroke -- the
+  // operator is actively amending, so the stale rejection
+  // shouldn't keep colouring the border.  `localError` will
+  // re-light immediately if their amend introduces a client-
+  // side violation, so the visual signal stays load-bearing.
+  function onInput(): void {
+    if (backendError) backendError = false;
+  }
 </script>
 
-<div class="flex flex-col gap-1">
-  <input
-    bind:this={inputEl}
-    type="text"
-    bind:value={draft}
-    onkeydown={onKey}
-    onblur={onBlur}
-    disabled={saving}
-    autocomplete="off"
-    spellcheck="false"
-    maxlength="128"
-    {placeholder}
-    aria-label={ariaLabel}
-    aria-invalid={localError ? true : undefined}
-    class="{inputClass(!!localError)} {SIZE_TEXT[size]}"
-  />
-  {#if localError}
-    <p class="text-xs text-rose-700" role="alert">{localError}</p>
-  {:else if backendError}
-    <p class="text-xs text-rose-700" role="alert">{backendError}</p>
-  {:else if saving}
-    <p class="flex items-center gap-1 text-xs text-zinc-500">
-      <Spinner class="h-3 w-3 text-zinc-500" />
-      <span>saving…</span>
-    </p>
-  {/if}
-</div>
+<input
+  bind:this={inputEl}
+  type="text"
+  bind:value={draft}
+  oninput={onInput}
+  onkeydown={onKey}
+  onblur={onBlur}
+  disabled={saving}
+  autocomplete="off"
+  spellcheck="false"
+  maxlength="128"
+  {placeholder}
+  aria-label={ariaLabel}
+  aria-invalid={hasError ? true : undefined}
+  class="block h-7 w-full rounded-md border bg-zinc-50 px-2 py-1 text-sm font-semibold text-zinc-900 outline-none disabled:cursor-wait disabled:bg-zinc-100 {hasError
+    ? 'border-rose-500'
+    : 'border-transparent'}"
+/>

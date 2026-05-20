@@ -115,6 +115,7 @@ import { TrainingSubscriber } from '$lib/api/training-subscriber';
 import { TrainingLogTail } from '$lib/api/training-log-tail';
 import { capFirst, errorCopy } from '$lib/utils/error-copy';
 import { STAGE_LABEL, TERMINAL_TRAINING_STATES } from '$lib/components/training/labels';
+import { formatLabelsList } from '$lib/components/category/labels';
 import { formatBytes } from '$lib/utils/format';
 import type {
   EpochMetrics,
@@ -210,7 +211,17 @@ const MAX_HISTORY_PER_WS = TRAINING_HISTORY_MAX_PER_WS;
 // directory listing + 2 JSONL fetches in parallel).  Older
 // runs sit behind an "Show {N} older runs" disclosure until
 // the operator asks for them.
-const INITIAL_VISIBLE = 2;
+//
+// Exported so the TrainHistory component can count `active`
+// as one of these slots (vs adding on top, which would grow
+// the eager tier from N to N+1 the moment Train is pressed
+// and shrink it back when the run terminates -- a visible
+// blink).  The component caps `[active, ...eagerHistory]` to
+// this constant and displaces the overflow into the older
+// tier display so the visible row count stays stable across
+// the idle <-> training <-> terminal transitions.
+export const TRAINING_INITIAL_VISIBLE = 2;
+const INITIAL_VISIBLE = TRAINING_INITIAL_VISIBLE;
 
 // Per-click cap for the "Load N more" affordance (and for
 // the auto-load that fires on the first disclosure expand).
@@ -2154,8 +2165,21 @@ function renderEvent(event: TrainLogLine): { phase: Stage; message: string } | n
         phase: 'publish',
         message: `Head published · ${event.head_id} · ${formatBytes(event.size_bytes)} · ${event.n_classes} ${event.n_classes === 1 ? 'class' : 'classes'} · rev ${event.workspace_revision.id}`
       };
-    case 'job_completed':
-      return { phase: 'publish', message: 'Job completed' };
+    case 'job_completed': {
+      // Terminal summary line.  Surface the labels list so an
+      // operator scanning the scrollback after the fact can see
+      // which classes the published head learned without
+      // expanding the RunSummary card.  Full list (no truncation):
+      // the log scrollback already uses `whitespace-pre-wrap` so a
+      // long list wraps cleanly, and the log is the authoritative
+      // archive for the run's facts.  `formatLabelsList` routes
+      // reserved synthetics (`_unknown_`) through the pretty
+      // form so the scrollback reads with the same vocabulary as
+      // the surrounding UI.
+      const labelsPart =
+        event.result.classes.length > 0 ? ` · ${formatLabelsList(event.result.classes)}` : '';
+      return { phase: 'publish', message: `Job completed${labelsPart}` };
+    }
     case 'job_failed':
       return {
         phase: event.stage,

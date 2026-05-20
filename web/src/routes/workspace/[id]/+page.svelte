@@ -4,15 +4,16 @@
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
   import { workspaces as wsApi } from '$lib/api/endpoints';
-  import { workspaces as wsStore } from '$lib/stores/workspaces.svelte';
   import { errorCopy, isNotFound } from '$lib/utils/error-copy';
-  import type { WorkspaceDetail } from '$lib/api/types';
+  import type { WorkspaceDetail, WorkspaceMutationResp } from '$lib/api/types';
   import LoadingRow from '$lib/components/LoadingRow.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import EmptyState from '$lib/components/ui/EmptyState.svelte';
-  import InlineName from '$lib/components/ui/InlineName.svelte';
   import ContextMenu, { type MenuSection } from '$lib/components/ui/ContextMenu.svelte';
   import DeleteWorkspaceDialog from '$lib/components/workspace/DeleteWorkspaceDialog.svelte';
+  import RenameWorkspaceDialog from '$lib/components/workspace/RenameWorkspaceDialog.svelte';
+  import WorkspaceToolIsland from '$lib/components/workspace/WorkspaceToolIsland.svelte';
+  import WorkspaceExportDialog from '$lib/components/workspace/WorkspaceExportDialog.svelte';
   import { formatRelative } from '$lib/utils/time';
   // Dataset Management surface per [ARCHITECTURE.md] §A.4
   // "Extra Notes": per-workspace category accordion with per-category
@@ -215,7 +216,8 @@
     if (t?.view?.state === 'completed') void refreshDetail();
   });
 
-  let editingName = $state(false);
+  let renameOpen = $state(false);
+  let exportOpen = $state(false);
   let deleteOpen = $state(false);
   // Right-click menu for the detail page.  The top-right Delete
   // button used to live here; we hid it because deletion from
@@ -231,13 +233,12 @@
     void goto(resolve('/workspace'));
   }
 
-  async function saveName(newValue: string): Promise<void> {
+  function onRenamed(resp: WorkspaceMutationResp): void {
+    // PATCH lands on metadata only -- the daemon does NOT advance
+    // workspace_revision, so we just splice the fresh `name` back
+    // into `detail` (no need to refetch heads / categories).
     if (!detail) return;
-    // Daemon docs: PATCH on metadata (name / tags) does NOT advance
-    // workspace_revision -- only `name` needs to flow back here.
-    const resp = await wsStore.patch(detail.id, { name: newValue });
     detail.name = resp.name;
-    editingName = false;
   }
 
   function onPageContextMenu(e: MouseEvent): void {
@@ -251,8 +252,8 @@
       {
         items: [
           {
-            label: 'Rename',
-            onclick: () => (editingName = true)
+            label: 'Rename…',
+            onclick: () => (renameOpen = true)
           },
           {
             label: 'Delete this workspace…',
@@ -312,74 +313,62 @@
 {:else if detail}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div oncontextmenu={onPageContextMenu}>
-    <header class="mb-6">
-      {#if editingName}
-        <InlineName
-          value={detail.name}
-          size="lg"
-          ariaLabel="Rename workspace"
-          onsave={saveName}
-          oncancel={() => (editingName = false)}
-        />
-      {:else}
-        <!-- `translate-y-0.5` (2 px down) is an optical-centre
-             correction: text x-height sits ~1.4 px below the line
-             box centre at text-lg, and the pencil SVG is top-heavy
-             (tip at y=3.5, eraser at y=20).  Net ~1.7 px, rounded
-             to the nearest integer-px landing. -->
-        <div class="flex items-center gap-2">
-          <h1
-            class="truncate text-lg leading-tight font-semibold text-zinc-900"
-            title={detail.name}
+    <!-- Page header.  Single flex row that pairs the workspace
+         title block (name + description in a vstack) against
+         the tool-island on the right.  `items-center` vertically
+         balances the island against the full vstack height
+         rather than just the title baseline, so the cluster
+         reads as the header's right-side counterweight.
+         `min-w-0` on the vstack lets a long name truncate
+         without crowding the island; `flex-1` claims the
+         remaining width so the description's relative
+         timestamps wrap inside the column rather than under
+         the island. -->
+    <header class="mb-6 flex items-center justify-between gap-3">
+      <div class="min-w-0 flex-1">
+        <!-- Title is always an immutable `<h1>` now -- the
+             in-place `InlineName` editor was retired in favour
+             of a modal popup so rename matches the create flow's
+             affordance shape (one consistent "modify workspace
+             metadata" UX), and the title row gets to keep its
+             vstack alignment with the description without an
+             input field swapping in/out of the layout. -->
+        <h1 class="truncate text-lg leading-tight font-semibold text-zinc-900" title={detail.name}>
+          {detail.name}
+        </h1>
+        <!-- Description strip: created · rev · modified, with
+             the upload-receipt "live" badge trailing the
+             modified timestamp it freshened.  Inline `·`
+             separators match the HeadCard pattern; each
+             timestamp keeps its own `title` so the absolute
+             ISO is one hover away.  The `·` separators sit
+             OUTSIDE every span so hovering a separator never
+             fires an adjacent field's tooltip -- hover-
+             affordance maps 1:1 to the visible label. -->
+        <p class="mt-1 text-[11px] text-zinc-500">
+          <span title={detail.created_at}>created {formatRelative(detail.created_at)}</span>
+          · rev {liveRevision} ·
+          <span title={detail.workspace_revision.at}
+            >modified {formatRelative(detail.workspace_revision.at)}</span
           >
-            {detail.name}
-          </h1>
-          <button
-            type="button"
-            class="shrink-0 translate-y-0.5 rounded-md p-1.5 text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-900"
-            title="Rename"
-            aria-label="Rename workspace"
-            onclick={() => (editingName = true)}
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              class="h-3.5 w-3.5"
-              aria-hidden="true"
+          {#if revisionAdvanced}
+            <span
+              class="ml-1 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-800"
+              title="Advanced by recent upload(s); reload to refresh modified timestamp."
             >
-              <path d="M12 20h9" />
-              <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
-            </svg>
-          </button>
-        </div>
-      {/if}
-      <!-- Description strip: created · rev · modified, with the
-           upload-receipt "live" badge trailing the modified
-           timestamp it freshened.  Inline `·` separators match
-           the HeadCard pattern; each timestamp keeps its own
-           `title` so the absolute ISO is one hover away.  The
-           `·` separators sit OUTSIDE every span so hovering a
-           separator never fires an adjacent field's tooltip --
-           hover-affordance maps 1:1 to the visible label. -->
-      <p class="mt-1 text-[11px] text-zinc-500">
-        <span title={detail.created_at}>created {formatRelative(detail.created_at)}</span>
-        · rev {liveRevision} ·
-        <span title={detail.workspace_revision.at}
-          >modified {formatRelative(detail.workspace_revision.at)}</span
-        >
-        {#if revisionAdvanced}
-          <span
-            class="ml-1 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-800"
-            title="Advanced by recent upload(s); reload to refresh modified timestamp."
-          >
-            live
-          </span>
-        {/if}
-      </p>
+              live
+            </span>
+          {/if}
+        </p>
+      </div>
+      <!-- Tool island.  Rename now opens a modal (no inline
+           edit state on the title), so the island stays
+           uniformly enabled while the dialog is open -- the
+           Modal's own backdrop + Escape handle dismissal. -->
+      <WorkspaceToolIsland
+        onrename={() => (renameOpen = true)}
+        onexport={() => (exportOpen = true)}
+      />
     </header>
 
     <!-- Dataset section.  CategoryList self-mounts: refreshes from
@@ -427,6 +416,22 @@
     workspaceName={detail.name}
     onclose={() => (deleteOpen = false)}
     ondeleted={backToList}
+  />
+
+  <RenameWorkspaceDialog
+    open={renameOpen}
+    workspaceId={detail.id}
+    currentName={detail.name}
+    onclose={() => (renameOpen = false)}
+    onsaved={onRenamed}
+  />
+
+  <WorkspaceExportDialog
+    open={exportOpen}
+    workspaceId={detail.id}
+    workspaceName={detail.name}
+    heads={detail.heads}
+    onclose={() => (exportOpen = false)}
   />
 
   <ContextMenu

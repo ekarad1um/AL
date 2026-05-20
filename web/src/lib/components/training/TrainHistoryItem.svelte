@@ -4,6 +4,7 @@
   import JobProgress from './JobProgress.svelte';
   import { formatRelative } from '$lib/utils/time';
   import { STAGE_LABEL, TRAINING_STATE_LABEL } from './labels';
+  import { formatLabelsList } from '$lib/components/category/labels';
   import type { TrackedTrainingJob } from '$lib/stores/training.svelte';
 
   // One row in the training-history list.  Sized to look the
@@ -181,25 +182,43 @@
   // run we attempted would have produced N classes if it
   // hadn't died") and threading it through the store would add
   // a code path with no operator question behind it.
-  const trailingDetail = $derived.by<readonly string[]>(() => {
+  // Trailing detail tokens.  Each carries the visible text + an
+  // optional `title` tooltip; only the "N classes" token on
+  // `completed` runs uses the tooltip slot (to surface every
+  // label name on hover — the result row's class count alone
+  // doesn't reveal which classes the run produced).
+  interface TrailingToken {
+    text: string;
+    title?: string;
+  }
+  const trailingDetail = $derived.by<readonly TrailingToken[]>(() => {
     const v = job.view;
     if (!v) return [];
     if (v.state === 'running') {
       if (v.progress.phase === 'train' && v.progress.total > 0) {
-        return [`epoch ${v.progress.current}/${v.progress.total}`];
+        return [{ text: `epoch ${v.progress.current}/${v.progress.total}` }];
       }
-      return [STAGE_LABEL[v.progress.phase].toLowerCase()];
+      return [{ text: STAGE_LABEL[v.progress.phase].toLowerCase() }];
     }
     if (v.state === 'completed') {
-      const tokens: string[] = [];
+      const tokens: TrailingToken[] = [];
       const nClasses = v.result?.n_classes ?? 0;
       if (nClasses > 0) {
-        tokens.push(`${nClasses} class${nClasses === 1 ? '' : 'es'}`);
+        const classes = v.result?.classes ?? [];
+        tokens.push({
+          text: `${nClasses} class${nClasses === 1 ? '' : 'es'}`,
+          // Tooltip lists every label so an operator hovering
+          // the count sees the run's full class vocabulary
+          // without expanding the row.  Routed through
+          // `formatLabelsList` for the reserved-synthetic
+          // pretty-form (`_unknown_` → "Unknown" etc).
+          title: classes.length > 0 ? formatLabelsList(classes) : undefined
+        });
       }
       if (bestValAcc !== null) {
-        tokens.push(`val ${(bestValAcc * 100).toFixed(1)}%`);
+        tokens.push({ text: `val ${(bestValAcc * 100).toFixed(1)}%` });
       } else if (v.result && Number.isFinite(v.result.final_train_acc)) {
-        tokens.push(`train ${(v.result.final_train_acc * 100).toFixed(1)}%`);
+        tokens.push({ text: `train ${(v.result.final_train_acc * 100).toFixed(1)}%` });
       }
       return tokens;
     }
@@ -209,7 +228,7 @@
     // "stopped at <stage>" verdict -- failure colour vs
     // operator-cancel colour is carried by the row's
     // left-border accent, so the header copy is identical.
-    return [`stopped at ${STAGE_LABEL[v.progress.phase].toLowerCase()}`];
+    return [{ text: `stopped at ${STAGE_LABEL[v.progress.phase].toLowerCase()}` }];
   });
 
   // Full head_id when the run is `completed`, else null.
@@ -348,10 +367,10 @@
       <span class="shrink-0 text-zinc-500" title={timeTitle}>
         {timeLabel}
       </span>
-      {#each trailingDetail as token (token)}
+      {#each trailingDetail as tok, i (i)}
         <span aria-hidden="true" class="shrink-0 text-zinc-300">·</span>
-        <span class="shrink-0 font-mono text-[11px] tabular-nums text-zinc-500">
-          {token}
+        <span class="shrink-0 font-mono text-[11px] tabular-nums text-zinc-500" title={tok.title}>
+          {tok.text}
         </span>
       {/each}
       {#if completedHeadId}
@@ -359,7 +378,7 @@
           class="ml-auto shrink-0 font-mono text-[11px] tabular-nums text-zinc-500"
           title={completedHeadId}
         >
-          {completedHeadId.slice(0, 8)}…
+          {completedHeadId.slice(0, 8)}
         </span>
       {/if}
     </span>
